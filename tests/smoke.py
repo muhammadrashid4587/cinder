@@ -94,13 +94,14 @@ def wait_for_port(port, proc, timeout=10):
     raise RuntimeError("server did not start listening in time")
 
 
-def start_server():
-    shutil.rmtree(DATA_DIR, ignore_errors=True)
+def start_server(extra_args=None, port=PORT, data_dir=DATA_DIR, fresh=True):
+    if fresh:
+        shutil.rmtree(data_dir, ignore_errors=True)
     proc = subprocess.Popen(
-        [BIN, "--port", str(PORT), "--data-dir", DATA_DIR],
+        [BIN, "--port", str(port), "--data-dir", data_dir] + (extra_args or []),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
-    wait_for_port(PORT, proc)
+    wait_for_port(port, proc)
     return proc
 
 
@@ -142,6 +143,7 @@ def main():
         check("SET persist", c.cmd("SET", "durable", "yes"), "OK")
         info = c.cmd("INFO")
         check("INFO has keys", "keys:4" in info, True)
+        check("INFO default fsync policy", "aof_fsync_policy:always" in info, True)
         check("unknown cmd", c.cmd("NOPE"), ("error", "ERR unknown command"))
         check("FLUSHALL", c.cmd("FLUSHALL"), "OK")
         check("DBSIZE after flush", c.cmd("DBSIZE"), 0)
@@ -171,6 +173,48 @@ def main():
         if proc.poll() is None:
             proc.terminate()
             proc.wait(timeout=5)
+
+    # everysec policy: writes reach the AOF immediately (only the fsync
+    # is deferred), INFO reports the policy, and data survives a SIGKILL
+    # + restart because the records are already in the file.
+    es_dir = "/tmp/cinder-smoke-everysec"
+    proc = start_server(["--aof-fsync", "everysec"], data_dir=es_dir)
+    try:
+        c = Client(PORT)
+        check("everysec INFO policy", "aof_fsync_policy:everysec" in c.cmd("INFO"), True)
+        check("everysec SET", c.cmd("SET", "eskey", "esval"), "OK")
+        check("everysec GET", c.cmd("GET", "eskey"), "esval")
+        with open(os.path.join(es_dir, "appendonly.aof"), "rb") as f:
+            aof = f.read()
+        check("everysec AOF has record", b"eskey" in aof and b"esval" in aof, True)
+        check("everysec SAVE", c.cmd("SAVE"), "OK")
+        c.close()
+        proc.kill()  # unclean shutdown: no graceful flush
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+    proc = start_server(["--aof-fsync", "everysec"], data_dir=es_dir, fresh=False)
+    try:
+        c = Client(PORT)
+        check("everysec replay after SIGKILL", c.cmd("GET", "eskey"), "esval")
+        c.cmd("SHUTDOWN")
+        c.close()
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    # Unknown policy is a startup error, not a silent default.
+    bad = subprocess.run(
+        [BIN, "--port", str(PORT), "--data-dir", "/tmp/cinder-smoke-bad",
+         "--aof-fsync", "bogus"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10,
+    )
+    check("bad policy exits nonzero", bad.returncode != 0, True)
+    check("bad policy message", "unknown AOF fsync policy" in bad.stdout, True)
 
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")

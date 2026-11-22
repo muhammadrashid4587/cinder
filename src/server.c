@@ -28,7 +28,7 @@
 #include "resp.h"
 #include "store.h"
 
-#define CINDER_VERSION "0.1.0"
+#define CINDER_VERSION "0.2.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -271,6 +271,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_putf(&info, "# Keyspace\r\n");
         dbuf_putf(&info, "keys:%zu\r\n", store_size(g_store));
         dbuf_putf(&info, "max_entries:%zu\r\n", g_max_entries);
+        dbuf_putf(&info, "aof_fsync_policy:%s\r\n", aof_policy_name());
         dbuf_bulk(reply, info.data ? info.data : "", info.len);
         free(info.data);
         return 0;
@@ -285,7 +286,9 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         return 0;
     }
     if (strcasecmp(cmd, "SAVE") == 0) {
-        /* AOF is always on, so SAVE just forces the log to disk. */
+        /* Force the AOF to disk. Under the everysec policy this flushes
+           up to a second of pending writes immediately. */
+        aof_fsync();
         dbuf_simple(reply, "OK");
         return 0;
     }
@@ -371,10 +374,11 @@ static void replay_aof(const char *path) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s [--port N] [--data-dir DIR] [--max-entries N]\n"
+        "Usage: %s [--port N] [--data-dir DIR] [--max-entries N] [--aof-fsync POLICY]\n"
         "  --port        TCP port to listen on (default 6379)\n"
         "  --data-dir    directory for the append-only log (default ./data)\n"
-        "  --max-entries evict approximately-LRU keys past this many (default 0 = unlimited)\n",
+        "  --max-entries evict approximately-LRU keys past this many (default 0 = unlimited)\n"
+        "  --aof-fsync   AOF fsync policy: always (default) or everysec\n",
         prog);
 }
 
@@ -385,15 +389,23 @@ int main(int argc, char **argv) {
         {"port", required_argument, NULL, 'p'},
         {"data-dir", required_argument, NULL, 'd'},
         {"max-entries", required_argument, NULL, 'm'},
+        {"aof-fsync", required_argument, NULL, 'f'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:d:m:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:m:f:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': port = atoi(optarg); break;
         case 'd': data_dir = optarg; break;
         case 'm': g_max_entries = (size_t)atoll(optarg); break;
+        case 'f':
+            if (aof_set_policy(optarg) < 0) {
+                fprintf(stderr, "cinder: unknown AOF fsync policy %s (want always or everysec)\n",
+                        optarg);
+                return 1;
+            }
+            break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -448,8 +460,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     set_nonblocking(listener);
-    printf("cinder %s listening on port %d (data dir %s, max entries %zu)\n",
-           CINDER_VERSION, port, data_dir, g_max_entries);
+    printf("cinder %s listening on port %d (data dir %s, max entries %zu, aof fsync %s)\n",
+           CINDER_VERSION, port, data_dir, g_max_entries, aof_policy_name());
     fflush(stdout);
 
     long long loop = 0;
@@ -544,6 +556,8 @@ int main(int argc, char **argv) {
             else i++;
         }
         free(pfds);
+        /* everysec AOF policy: flush pending writes once a second. */
+        aof_tick();
         if ((++loop % 100) == 0) store_expire_scan(g_store, 20);
     }
 

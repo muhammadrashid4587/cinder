@@ -15,8 +15,14 @@ behind a framework.
 
 ```sh
 make
-./cinder --port 6379 --data-dir ./data
+./cinder --port 6379 --data-dir ./data --aof-fsync everysec
 ```
+
+`--aof-fsync` is `always` (default) or `everysec`: under `always` every
+mutating command is `fdatasync`ed before it is acknowledged, under
+`everysec` writes go to the log immediately and the file is synced at
+most once a second, so up to a second of acknowledged writes can be
+lost on a machine crash. `SAVE` forces a sync under either policy.
 
 Then, with `redis-cli` (or any RESP client):
 
@@ -44,7 +50,7 @@ OK
 | `INCR`, `DECR`, `INCRBY`, `DECRBY` | Integer counters; preserves TTL |
 | `KEYS pattern` | Glob match (`*` and `?`) |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
-| `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` forces the log to disk |
+| `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` forces the AOF to disk |
 | `QUIT`, `SHUTDOWN` | Close connection / stop the server |
 
 ## Architecture
@@ -54,7 +60,8 @@ src/
   server.c   TCP listener, poll() event loop, command dispatch
   store.c    hash table (djb2, chaining, resize at 0.75 load), TTLs
   resp.c     RESP parser (array + inline commands) and encoders
-  aof.c      append-only log: every mutation is a RESP array, replayed on start
+  aof.c      append-only log: every mutation is a RESP array, replayed on start;
+             fsync policy `always` or `everysec`
 ```
 
 - **Store**: chained hash table, doubling resize, lazy expiry on access plus
@@ -62,9 +69,11 @@ src/
 - **Eviction**: Redis-style approximate LRU. When `--max-entries` is set, the
   server samples 5 entries and evicts the least recently used of the sample.
 - **Durability**: every mutating command is appended to `appendonly.aof` as a
-  RESP array and `fdatasync`ed (fsync policy: always). On startup the file is
-  replayed through the same dispatcher live clients use, so the log is the
-  dataset.
+  RESP array and synced according to `--aof-fsync`: `always` (the default)
+  `fdatasync`s after every write; `everysec` writes immediately and syncs at
+  most once a second via a timer in the event loop, and always syncs on a
+  clean shutdown or `SAVE`. On startup the file is replayed through the
+  same dispatcher live clients use, so the log is the dataset.
 - **Event loop**: one thread, non-blocking sockets, per-client input/output
   buffers. A slow client never blocks other clients.
 
@@ -78,20 +87,29 @@ policy `always`:
 | `SET` | ~25,000 ops/sec |
 | `GET` | ~34,000 ops/sec |
 
-`SET` pays one `fdatasync` per write under the `always` policy; pipelined
-clients and an `everysec` policy would both be substantially faster.
+`SET` pays one `fdatasync` per write under the `always` policy. On this
+dev VM `fdatasync` is cheap, so sequential single-client throughput is
+about the same under `everysec` (~22k–33k SET/s either way); the policy
+still matters where fsync is expensive, and the sync count is the real
+difference — verified with `strace`, 200 sequential SETs cost 201
+`fdatasync`s under `always` and 2 under `everysec` (one at the first
+write, one on shutdown). Pipelined clients would be substantially
+faster under either policy.
 
 ## Tests
 
 ```sh
-make test   # builds, then runs tests/smoke.py: 30+ RESP checks plus an
-            # AOF restart test (data survives a SHUTDOWN and reloads)
+make test   # builds, then runs tests/smoke.py: 30+ RESP checks, an
+            # AOF restart test (data survives a SHUTDOWN and reloads),
+            # and everysec-policy checks (INFO reports the policy, the
+            # AOF holds the record before any sync, data survives a
+            # SIGKILL + restart, unknown policy is a startup error)
 ```
 
 ## Roadmap
 
 - [ ] Lists, sets, and hashes (data structures beyond strings)
-- [ ] `everysec` AOF fsync policy
+- [x] `everysec` AOF fsync policy
 - [ ] RDB-style snapshots alongside the AOF
 - [ ] Replication (primary/replica over RESP)
 - [ ] `epoll` backend and a thread pool for the event loop
