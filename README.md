@@ -1,12 +1,12 @@
 # cinder
 
 A Redis-compatible in-memory key-value store, written in C from scratch.
-Single-threaded, `poll()`-based event loop, RESP protocol, strings and
-lists with TTLs, approximate LRU eviction, and an append-only file for
+Single-threaded, `poll()`-based event loop, RESP protocol, strings, lists
+and sets with TTLs, approximate LRU eviction, and an append-only file for
 durability. No dependencies beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.3.0.
+Version 0.4.0.
 
 ## Why
 
@@ -55,6 +55,11 @@ OK
 | `LPOP key`, `RPOP key` | Pop from head / tail; popping the last element deletes the key |
 | `LLEN key` | List length (`0` when missing) |
 | `LRANGE key start stop` | Elements, inclusive, negative indexes from the end |
+| `SADD key member [member ...]` | Add to set; returns number added (duplicates ignored); creates the set |
+| `SREM key member [member ...]` | Remove from set; returns number removed; emptying the set deletes the key |
+| `SMEMBERS key` | All members (insertion order) |
+| `SISMEMBER key member` | `1` if member, `0` if not |
+| `SCARD key` | Set size (`0` when missing) |
 | `KEYS pattern` | Glob match (`*` and `?`) |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
 | `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` forces the AOF to disk |
@@ -66,7 +71,8 @@ OK
 src/
   server.c   TCP listener, poll() event loop, command dispatch
   store.c    hash table (djb2, chaining, resize at 0.75 load), TTLs,
-             strings and lists (circular-buffer lists, O(1) push/pop)
+             strings, lists (circular-buffer lists, O(1) push/pop) and
+             sets (unordered member arrays, dedup on insert)
   resp.c     RESP parser (array + inline commands) and encoders
   aof.c      append-only log: every mutation is a RESP array, replayed on start;
              fsync policy `always` or `everysec`
@@ -109,9 +115,11 @@ faster under either policy.
 ```sh
 make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # checks (push/pop both ends, length, range with negative
-            # indexes, wrong-type errors, list TTL expiry), an AOF
-            # restart test (data and a list survive a SHUTDOWN and
-            # reload), and everysec-policy checks (INFO reports the
+            # indexes, wrong-type errors, list TTL expiry), set checks
+            # (add/dedup, membership, remove, wrong-type errors, set
+            # TTL expiry, emptying a set deletes the key), an AOF
+            # restart test (data, a list and a set survive a SHUTDOWN
+            # and reload), and everysec-policy checks (INFO reports the
             # policy, the AOF holds the record before any sync, data
             # survives a SIGKILL + restart, unknown policy is a
             # startup error)
@@ -120,7 +128,8 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
 ## Roadmap
 
 - [x] Lists (`LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LRANGE`, AOF-persisted, TTLs)
-- [ ] Sets and hashes (data structures beyond strings and lists)
+- [x] Sets (`SADD`/`SREM`/`SMEMBERS`/`SISMEMBER`/`SCARD`, AOF-persisted, TTLs)
+- [ ] Hashes (data structure beyond strings, lists and sets)
 - [x] `everysec` AOF fsync policy
 - [ ] RDB-style snapshots alongside the AOF
 - [ ] Replication (primary/replica over RESP)

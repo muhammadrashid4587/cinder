@@ -5,6 +5,7 @@
 
 #define ENTRY_STRING 0
 #define ENTRY_LIST 1
+#define ENTRY_SET 2
 
 /* A list value: circular buffer of malloc'd strings, so push/pop at
    either end is O(1) amortised. */
@@ -15,11 +16,21 @@ typedef struct List {
     size_t len;
 } List;
 
+/* A set value: unordered array of malloc'd strings, membership by
+   linear scan. Simple and fast enough at this scale; a hash table
+   would be the next step if sets grow large. */
+typedef struct Set {
+    char **members;
+    size_t cap;
+    size_t len;
+} Set;
+
 typedef struct Entry {
     char *key;
-    int type; /* ENTRY_STRING or ENTRY_LIST */
+    int type; /* ENTRY_STRING, ENTRY_LIST or ENTRY_SET */
     char *value; /* string values (type == ENTRY_STRING) */
     List *list; /* list values (type == ENTRY_LIST) */
+    Set *set; /* set values (type == ENTRY_SET) */
     long long expire_at; /* ms since epoch, -1 = no expiry */
     unsigned long long last_access; /* logical clock, for approximate LRU */
     struct Entry *next;
@@ -58,7 +69,7 @@ size_t store_evict_lru(Store *s, size_t max_entries);
    (NULL and 0 when nothing matches). Caller frees both. */
 size_t store_keys_matching(Store *s, const char *pattern, char ***keys_out);
 
-/* 0 = no such key, 1 = string, 2 = list. */
+/* 0 = no such key, 1 = string, 2 = list, 3 = set. */
 int store_type(Store *s, const char *key);
 
 /* Push one element. Returns the new length, -1 = key holds a string,
@@ -78,5 +89,23 @@ long long store_llen(Store *s, const char *key);
    the caller frees both. */
 int store_lrange(Store *s, const char *key, long long start, long long stop,
                  char ***out, size_t *n_out);
+
+/* Add one member. Returns the number added (1 new, 0 already present),
+   -1 = key holds a string or list, -2 = out of memory. Creates the set
+   when the key is missing. */
+long long store_sadd(Store *s, const char *key, const char *member);
+/* Remove one member. Returns 1 if removed, 0 if absent or key missing,
+   -1 = key holds a string or list. Removing the last member deletes
+   the key, as in Redis. */
+long long store_srem(Store *s, const char *key, const char *member);
+/* 1 = member present, 0 = absent or key missing, -1 = wrong type. */
+int store_sismember(Store *s, const char *key, const char *member);
+/* Number of members: 0 when missing, -1 when the key holds a string
+   or list. */
+long long store_scard(Store *s, const char *key);
+/* All members, in insertion order. Returns 0 on success (out may be
+   empty), -1 = wrong type, -2 = out of memory. *out is a malloc'd
+   array of malloc'd strings; the caller frees both. */
+int store_smembers(Store *s, const char *key, char ***out, size_t *n_out);
 
 #endif

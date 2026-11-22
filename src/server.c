@@ -28,7 +28,7 @@
 #include "resp.h"
 #include "store.h"
 
-#define CINDER_VERSION "0.3.0"
+#define CINDER_VERSION "0.4.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -168,7 +168,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
     }
     if (strcasecmp(cmd, "GET") == 0) {
         if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'get' command"), 0;
-        if (store_type(g_store, argv[1]) == 2)
+        if (store_type(g_store, argv[1]) > 1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         char *v = store_get(g_store, argv[1]);
         if (!v) return dbuf_null(reply), 0;
@@ -219,7 +219,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         } else if (argc != 2) {
             return dbuf_error(reply, "wrong number of arguments"), 0;
         }
-        if (store_type(g_store, argv[1]) == 2)
+        if (store_type(g_store, argv[1]) > 1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         char *cur = store_get(g_store, argv[1]);
         long long v = 0;
@@ -260,7 +260,8 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
     if (strcasecmp(cmd, "LPUSH") == 0 || strcasecmp(cmd, "RPUSH") == 0) {
         if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'lpush' command"), 0;
         int at_head = strcasecmp(cmd, "LPUSH") == 0;
-        if (store_type(g_store, argv[1]) == 1)
+        int t = store_type(g_store, argv[1]);
+        if (t != 0 && t != 2)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         long long len = 0;
         for (int i = 2; i < argc; i++) {
@@ -316,6 +317,66 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(elems);
         return 0;
     }
+    if (strcasecmp(cmd, "SADD") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'sadd' command"), 0;
+        long long added = 0;
+        for (int i = 2; i < argc; i++) {
+            long long rc = store_sadd(g_store, argv[1], argv[i]);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == -2)
+                return dbuf_error(reply, "out of memory"), 0;
+            added += rc;
+        }
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_int(reply, added);
+        return added > 0 ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "SREM") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'srem' command"), 0;
+        long long removed = 0;
+        for (int i = 2; i < argc; i++) {
+            long long rc = store_srem(g_store, argv[1], argv[i]);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            removed += rc;
+        }
+        dbuf_int(reply, removed);
+        return removed > 0 ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "SMEMBERS") == 0) {
+        if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'smembers' command"), 0;
+        char **members = NULL;
+        size_t n = 0;
+        int rc = store_smembers(g_store, argv[1], &members, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_array_header(reply, (long long)n);
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, members[i], strlen(members[i]));
+            free(members[i]);
+        }
+        free(members);
+        return 0;
+    }
+    if (strcasecmp(cmd, "SISMEMBER") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'sismember' command"), 0;
+        int rc = store_sismember(g_store, argv[1], argv[2]);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_int(reply, rc);
+        return 0;
+    }
+    if (strcasecmp(cmd, "SCARD") == 0) {
+        if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'scard' command"), 0;
+        long long n = store_scard(g_store, argv[1]);
+        if (n == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_int(reply, n);
+        return 0;
+    }
     if (strcasecmp(cmd, "FLUSHALL") == 0) {
         store_flush(g_store);
         dbuf_simple(reply, "OK");
@@ -343,6 +404,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         static const char *names[] = {"PING", "ECHO", "QUIT", "SHUTDOWN", "SET", "GET",
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
+            "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE"};
         dbuf_array_header(reply, (long long)(sizeof(names) / sizeof(names[0])));
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)

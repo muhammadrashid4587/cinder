@@ -48,11 +48,68 @@ static void list_free(List *l) {
     free(l);
 }
 
+static void set_free(Set *st) {
+    if (!st) return;
+    for (size_t i = 0; i < st->len; i++)
+        free(st->members[i]);
+    free(st->members);
+    free(st);
+}
+
 static void entry_free(Entry *e) {
     free(e->key);
     if (e->type == ENTRY_LIST) list_free(e->list);
+    else if (e->type == ENTRY_SET) set_free(e->set);
     else free(e->value);
     free(e);
+}
+
+static Set *set_new(void) {
+    Set *st = calloc(1, sizeof(Set));
+    if (!st) return NULL;
+    st->cap = 8;
+    st->members = calloc(st->cap, sizeof(char *));
+    if (!st->members) {
+        free(st);
+        return NULL;
+    }
+    return st;
+}
+
+/* Index of member, or -1 when absent. */
+static long long set_find(Set *st, const char *member) {
+    for (size_t i = 0; i < st->len; i++)
+        if (strcmp(st->members[i], member) == 0) return (long long)i;
+    return -1;
+}
+
+/* Add member if absent. Returns 1 added, 0 already present, -1 = OOM. */
+static int set_add(Set *st, const char *member) {
+    if (set_find(st, member) >= 0) return 0;
+    char *m = strdup(member);
+    if (!m) return -1;
+    if (st->len == st->cap) {
+        size_t ncap = st->cap * 2;
+        char **nm = realloc(st->members, ncap * sizeof(char *));
+        if (!nm) {
+            free(m);
+            return -1;
+        }
+        st->members = nm;
+        st->cap = ncap;
+    }
+    st->members[st->len++] = m;
+    return 1;
+}
+
+/* Remove member if present. Returns 1 removed, 0 absent. */
+static int set_remove(Set *st, const char *member) {
+    long long idx = set_find(st, member);
+    if (idx < 0) return 0;
+    free(st->members[idx]);
+    st->members[idx] = st->members[--st->len];
+    st->members[st->len] = NULL;
+    return 1;
 }
 
 static List *list_new(void) {
@@ -181,6 +238,10 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
             /* SET replaces the key wholesale, whatever it held. */
             list_free(e->list);
             e->list = NULL;
+            e->type = ENTRY_STRING;
+        } else if (e->type == ENTRY_SET) {
+            set_free(e->set);
+            e->set = NULL;
             e->type = ENTRY_STRING;
         }
         free(e->value);
@@ -376,7 +437,9 @@ size_t store_evict_lru(Store *s, size_t max_entries) {
 int store_type(Store *s, const char *key) {
     Entry *e = store_find(s, key, NULL);
     if (!e) return 0;
-    return e->type == ENTRY_LIST ? 2 : 1;
+    if (e->type == ENTRY_LIST) return 2;
+    if (e->type == ENTRY_SET) return 3;
+    return 1;
 }
 
 /* Push onto an existing list, or create the list when the key is missing. */
@@ -491,5 +554,97 @@ int store_lrange(Store *s, const char *key, long long start, long long stop,
     }
     *out = res;
     *n_out = n;
+    return 0;
+}
+
+/* ---------- sets ---------- */
+
+long long store_sadd(Store *s, const char *key, const char *member) {
+    Entry *e = store_find(s, key, NULL);
+    if (e) {
+        if (e->type != ENTRY_SET) return -1;
+        int rc = set_add(e->set, member);
+        if (rc < 0) return -2;
+        if (rc) e->last_access = ++s->clock;
+        return rc;
+    }
+    if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+        store_resize(s);
+    e = calloc(1, sizeof(Entry));
+    if (!e) return -2;
+    e->key = strdup(key);
+    e->set = set_new();
+    if (!e->key || !e->set) {
+        entry_free(e);
+        return -2;
+    }
+    e->type = ENTRY_SET;
+    e->expire_at = -1;
+    e->last_access = ++s->clock;
+    if (set_add(e->set, member) < 0) {
+        entry_free(e);
+        return -2;
+    }
+    size_t idx = hash_key(key) % s->cap;
+    e->next = s->buckets[idx];
+    s->buckets[idx] = e;
+    s->count++;
+    return 1;
+}
+
+long long store_srem(Store *s, const char *key, const char *member) {
+    Entry **pp = NULL;
+    Entry *e = store_find(s, key, &pp);
+    if (!e) return 0;
+    if (e->type != ENTRY_SET) return -1;
+    if (!set_remove(e->set, member)) return 0;
+    if (e->set->len == 0) {
+        /* A set emptied by removing is gone, as in Redis. */
+        *pp = e->next;
+        entry_free(e);
+        s->count--;
+    } else {
+        e->last_access = ++s->clock;
+    }
+    return 1;
+}
+
+int store_sismember(Store *s, const char *key, const char *member) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_SET) return -1;
+    e->last_access = ++s->clock;
+    return set_find(e->set, member) >= 0 ? 1 : 0;
+}
+
+long long store_scard(Store *s, const char *key) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_SET) return -1;
+    e->last_access = ++s->clock;
+    return (long long)e->set->len;
+}
+
+int store_smembers(Store *s, const char *key, char ***out, size_t *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_SET) return -1;
+    e->last_access = ++s->clock;
+    Set *st = e->set;
+    if (st->len == 0) return 0;
+    char **res = malloc(st->len * sizeof(char *));
+    if (!res) return -2;
+    for (size_t i = 0; i < st->len; i++) {
+        res[i] = strdup(st->members[i]);
+        if (!res[i]) {
+            for (size_t j = 0; j < i; j++) free(res[j]);
+            free(res);
+            return -2;
+        }
+    }
+    *out = res;
+    *n_out = st->len;
     return 0;
 }
