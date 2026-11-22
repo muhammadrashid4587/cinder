@@ -425,6 +425,74 @@ def main():
         check("repl streamed writes arrived", streamed, True)
         check("repl streamed list", r.cmd("LRANGE", "replist", "0", "-1"),
               ["front", "x", "y", "z"])
+        # Replication offsets: the primary counts forwarded stream bytes,
+        # the replica tracks the same position, and PSYNC answers
+        # FULLRESYNC (no backlog yet) then a full sync.
+        def info_field(info, name):
+            for line in info.split("\r\n"):
+                if line.startswith(name + ":"):
+                    return line[len(name) + 1:]
+            return None
+
+        def resp_len(args):
+            n = len(f"*{len(args)}\r\n".encode())
+            for a in args:
+                b = a if isinstance(a, bytes) else str(a).encode()
+                n += len(f"${len(b)}\r\n".encode()) + len(b) + 2
+            return n
+
+        pinfo = p.cmd("INFO")
+        replid = info_field(pinfo, "master_replid")
+        check("repl INFO master_replid 40 hex",
+              len(replid or "") == 40 and
+              all(ch in "0123456789abcdef" for ch in replid), True)
+        off_before = int(info_field(pinfo, "master_repl_offset"))
+        check("repl offset SET", p.cmd("SET", "offkey", "offval"), "OK")
+        off_after = int(info_field(p.cmd("INFO"), "master_repl_offset"))
+        check("repl offset grows by command bytes", off_after - off_before,
+              resp_len(["SET", "offkey", "offval"]))
+        # The replica's slave offset catches up to the primary's.
+        deadline = time.time() + 5
+        caught_up = False
+        while time.time() < deadline:
+            rinfo = r.cmd("INFO")
+            if (info_field(rinfo, "slave_repl_offset") == str(off_after) and
+                    info_field(rinfo, "master_replid") == replid):
+                caught_up = True
+                break
+            time.sleep(0.1)
+        check("repl slave offset catches up", caught_up, True)
+        check("repl INFO replica line",
+              "replica0:ip=127.0.0.1,port=" in p.cmd("INFO") and
+              f",offset={off_after}" in p.cmd("INFO"), True)
+        # PSYNC: the primary answers +FULLRESYNC with its run id and
+        # offset, then streams a full sync; even a resume offset gets
+        # a full sync, because there is no backlog yet.
+        ps = Client(PORT)
+        ps.s.sendall(b"PSYNC ? -1\r\n")
+        line = ps._read_line()
+        check("psync fullresync line",
+              line.startswith(b"+FULLRESYNC ") and replid.encode() in line, True)
+        check("psync fullresync offset",
+              line.decode().rsplit(" ", 1)[1] == str(off_after), True)
+        dump = []
+        while True:
+            item = ps._read_reply()
+            if item == "FULLSYNC OK":
+                break
+            dump.append(item)
+        check("psync dump starts with FLUSHALL", dump[0], ["FLUSHALL"])
+        check("psync dump has live key", ["SET", "newkey", "live"] in dump, True)
+        check("psync dump has offset key", ["SET", "offkey", "offval"] in dump, True)
+        ps.close()
+        deadline = time.time() + 5
+        back_to_one = False
+        while time.time() < deadline:
+            if "connected_replicas:1" in p.cmd("INFO"):
+                back_to_one = True
+                break
+            time.sleep(0.1)
+        check("repl INFO replicas back to 1", back_to_one, True)
         # Detach: writes stop flowing, and the replica keeps its data.
         check("repl REPLICAOF NO ONE", r.cmd("REPLICAOF", "NO", "ONE"), "OK")
         check("repl INFO back to primary", "role:primary" in r.cmd("INFO"), True)

@@ -31,7 +31,7 @@
 #include "resp.h"
 #include "store.h"
 
-#define CINDER_VERSION "0.7.0"
+#define CINDER_VERSION "0.8.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -40,6 +40,19 @@ static long long g_start_ms;
 static long long g_commands_processed;
 static size_t g_max_entries; /* 0 = unlimited */
 static int g_replaying;
+
+/* Replication offsets. The primary counts every byte of the live
+   write stream it forwards (g_master_repl_offset) under its run id
+   (g_replid, fresh per process); a replica learns the primary's run
+   id and offset from the +FULLRESYNC line and counts the stream bytes
+   it applies (g_slave_repl_offset). There is no backlog yet, so a
+   PSYNC always answers FULLRESYNC and takes a full sync. */
+static char g_replid[41];
+static long long g_master_repl_offset;
+static char g_primary_replid[41];
+static long long g_slave_repl_offset;
+static char g_master_host[256];
+static long long g_master_port;
 static volatile sig_atomic_t g_running = 1;
 
 static void on_signal(int sig) {
@@ -126,6 +139,7 @@ static Client *g_clients;
 static size_t g_nclients;
 static int repl_is_replica(void);
 static size_t repl_connected_replicas(void);
+static void repl_info_replicas(Dbuf *info);
 
 static int dispatch(char **argv, int argc, Dbuf *reply) {
     const char *cmd = argv[0];
@@ -485,7 +499,20 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_putf(&info, "aof_fsync_policy:%s\r\n", aof_policy_name());
         dbuf_putf(&info, "# Replication\r\n");
         dbuf_putf(&info, "role:%s\r\n", repl_is_replica() ? "replica" : "primary");
+        if (repl_is_replica()) {
+            dbuf_putf(&info, "master_host:%s\r\n", g_master_host);
+            dbuf_putf(&info, "master_port:%lld\r\n", g_master_port);
+            dbuf_putf(&info, "master_link_status:up\r\n");
+            dbuf_putf(&info, "master_replid:%s\r\n",
+                      g_primary_replid[0] ? g_primary_replid : "?");
+            dbuf_putf(&info, "master_repl_offset:%lld\r\n", g_slave_repl_offset);
+            dbuf_putf(&info, "slave_repl_offset:%lld\r\n", g_slave_repl_offset);
+        } else {
+            dbuf_putf(&info, "master_replid:%s\r\n", g_replid);
+            dbuf_putf(&info, "master_repl_offset:%lld\r\n", g_master_repl_offset);
+        }
         dbuf_putf(&info, "connected_replicas:%zu\r\n", repl_connected_replicas());
+        repl_info_replicas(&info);
         dbuf_bulk(reply, info.data ? info.data : "", info.len);
         free(info.data);
         return 0;
@@ -497,7 +524,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE",
-            "SYNC", "REPLICAOF"};
+            "SYNC", "PSYNC", "REPLICAOF"};
         dbuf_array_header(reply, (long long)(sizeof(names) / sizeof(names[0])));
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
             dbuf_bulk(reply, names[i], strlen(names[i]));
@@ -532,6 +559,12 @@ typedef struct Client {
     int is_repl_link;   /* replica side: this socket is the outbound link
                            to our primary; commands on it are applied */
     int repl_connecting; /* outbound link still completing its connect */
+    long long repl_offset; /* primary side: stream offset of the last
+                              byte queued to this replica */
+    int repl_syncing;    /* replica side: still applying the initial
+                            full-sync dump; dump bytes are the snapshot,
+                            not the live stream, so they do not advance
+                            the slave offset */
 } Client;
 
 static size_t g_clients_cap;
@@ -566,12 +599,22 @@ static int set_nonblocking(int fd) {
  * full sync (FLUSHALL plus one rebuild command per key, as RESP
  * arrays) followed by a +FULLSYNC marker. After that, every mutating
  * command from any other client is forwarded to it verbatim.
+ * A client may instead send PSYNC <replid> <offset> to resume from a
+ * stream offset. There is no backlog yet, so the answer is always
+ * +FULLRESYNC <replid> <offset> followed by a full sync; the
+ * handshake is real and the fallback is honest.
+ * Offsets: the primary counts every byte of the live write stream it
+ * forwards (master_repl_offset) and tracks, per replica, the offset
+ * of the last byte queued to it. A replica learns the primary's run
+ * id and offset from +FULLRESYNC and counts the stream bytes it
+ * applies (slave_repl_offset); dump bytes do not count, so a caught-up
+ * replica's slave offset equals the primary's master offset.
  * Replica side: REPLICAOF host port opens a non-blocking connection
- * to the primary, sends SYNC, and applies every command arriving on
+ * to the primary, sends PSYNC, and applies every command arriving on
  * that link through the normal dispatcher (and its own AOF, so the
  * replicated data is durable). REPLICAOF NO ONE drops the link.
- * A replica can itself accept SYNC and forward what it applies, so
- * replicas chain; a command is never sent back down the link it
+ * A replica can itself accept SYNC/PSYNC and forward what it applies,
+ * so replicas chain; a command is never sent back down the link it
  * arrived on, so there is no loop. */
 
 static Client *find_repl_link(void) {
@@ -597,10 +640,37 @@ static void repl_link_close(void) {
 }
 
 /* Forward one raw command (as received, RESP array or inline) to
-   every connected replica. */
+   every connected replica. The offset counts stream bytes whether or
+   not a replica is currently attached, like Redis's
+   master_repl_offset; each replica records the offset of the last
+   byte queued to it. */
 static void forward_to_replicas(const char *raw, size_t rawlen) {
-    for (size_t i = 0; i < g_nclients; i++)
-        if (g_clients[i].is_replica) dbuf_put(&g_clients[i].out, raw, rawlen);
+    g_master_repl_offset += (long long)rawlen;
+    for (size_t i = 0; i < g_nclients; i++) {
+        if (g_clients[i].is_replica) {
+            dbuf_put(&g_clients[i].out, raw, rawlen);
+            g_clients[i].repl_offset = g_master_repl_offset;
+        }
+    }
+}
+
+/* One `replicaN:ip=...,port=...,offset=...` line per connected replica
+   for INFO. */
+static void repl_info_replicas(Dbuf *info) {
+    size_t n = 0;
+    for (size_t i = 0; i < g_nclients; i++) {
+        if (!g_clients[i].is_replica) continue;
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof(peer);
+        char ip[64] = "?";
+        int port = 0;
+        if (getpeername(g_clients[i].fd, (struct sockaddr *)&peer, &plen) == 0) {
+            inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+            port = ntohs(peer.sin_port);
+        }
+        dbuf_putf(info, "replica%zu:ip=%s,port=%d,offset=%lld\r\n",
+                  n++, ip, port, g_clients[i].repl_offset);
+    }
 }
 
 /* Encode one command as a RESP array into out. argv strings are
@@ -685,8 +755,20 @@ static void send_full_sync(Client *c) {
     fflush(stdout);
 }
 
+/* Ask the primary for a sync, resuming from the offset we already
+   have when we know this primary's run id. The primary has no backlog
+   yet, so it always answers FULLRESYNC and sends a full sync; the
+   handshake is in place for a real partial resync later. */
+static void send_psync_request(Client *link) {
+    if (g_primary_replid[0])
+        dbuf_putf(&link->out, "PSYNC %s %lld\r\n",
+                  g_primary_replid, g_slave_repl_offset);
+    else
+        dbuf_put(&link->out, "PSYNC ? -1\r\n", 12);
+}
+
 /* Open the outbound link to a primary. On success the socket is a
-   client with is_repl_link set; SYNC is sent as soon as the connect
+   client with is_repl_link set; PSYNC is sent as soon as the connect
    completes (immediately for localhost, on POLLOUT otherwise). */
 static int replicaof_connect(const char *host, int port, Dbuf *reply) {
     char portstr[16];
@@ -725,9 +807,10 @@ static int replicaof_connect(const char *host, int port, Dbuf *reply) {
         return -1;
     }
     link->is_repl_link = 1;
+    link->repl_syncing = 1; /* the dump that follows is the snapshot */
     if (rc == 0) {
         link->repl_connecting = 0;
-        dbuf_put(&link->out, "SYNC\r\n", 6);
+        send_psync_request(link);
     } else {
         link->repl_connecting = 1;
     }
@@ -753,8 +836,17 @@ static void handle_replicaof(char **argv, int argc, Dbuf *reply) {
         dbuf_error(reply, "invalid port");
         return;
     }
+    /* A new primary means the stored run id and offset are for a
+       different replication stream; forget them. Reconnecting to the
+       same primary keeps them, so PSYNC can ask to resume. */
+    if (strcasecmp(argv[1], g_master_host) != 0 || port != g_master_port) {
+        g_primary_replid[0] = '\0';
+        g_slave_repl_offset = 0;
+    }
     repl_link_close(); /* drop any previous link first */
     if (replicaof_connect(argv[1], (int)port, reply) < 0) return;
+    snprintf(g_master_host, sizeof(g_master_host), "%s", argv[1]);
+    g_master_port = port;
     dbuf_simple(reply, "OK");
 }
 
@@ -792,6 +884,32 @@ static void replay_aof(const char *path) {
     free(data);
     printf("cinder: replayed %lld commands from AOF, %zu keys loaded\n",
            loaded, store_size(g_store));
+}
+
+/* 40 hex chars, like a Redis run id; fresh every process start, so a
+   restarted server never claims to be the same replication run. */
+static void gen_replid(char out[41]) {
+    static const char hex[] = "0123456789abcdef";
+    unsigned char buf[20];
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        size_t got = fread(buf, 1, sizeof(buf), f);
+        fclose(f);
+        if (got == sizeof(buf)) {
+            for (int i = 0; i < 20; i++) {
+                out[2 * i] = hex[buf[i] >> 4];
+                out[2 * i + 1] = hex[buf[i] & 0xf];
+            }
+            out[40] = '\0';
+            return;
+        }
+    }
+    for (int i = 0; i < 20; i++) {
+        unsigned v = (unsigned)rand();
+        out[2 * i] = hex[(v >> 4) & 0xf];
+        out[2 * i + 1] = hex[v & 0xf];
+    }
+    out[40] = '\0';
 }
 
 /* ---------- main ---------- */
@@ -840,6 +958,7 @@ int main(int argc, char **argv) {
     }
 
     srand((unsigned)(now_ms() ^ (long long)getpid()));
+    gen_replid(g_replid);
     g_store = store_new();
     if (!g_store) {
         fprintf(stderr, "cinder: out of memory\n");
@@ -949,7 +1068,7 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 c->repl_connecting = 0;
-                dbuf_put(&c->out, "SYNC\r\n", 6);
+                send_psync_request(c);
             }
             if (re & POLLOUT && c->out.len > 0) {
                 ssize_t w = write(c->fd, c->out.data, c->out.len);
@@ -975,7 +1094,12 @@ int main(int argc, char **argv) {
                 while (off < c->inlen) {
                     /* The primary ends a full sync with a +FULLSYNC
                        marker line, which is not a command; skip it
-                       (and any -ERR line) on the replication link. */
+                       (and any -ERR line) on the replication link.
+                       Learn the primary's run id and stream offset
+                       from +FULLRESYNC, and mark the end of the dump
+                       with +FULLSYNC: dump bytes are the snapshot,
+                       not the live stream, so they do not advance the
+                       slave offset. */
                     if (c->is_repl_link &&
                         (c->inbuf[off] == '+' || c->inbuf[off] == '-')) {
                         size_t j = off;
@@ -988,6 +1112,27 @@ int main(int argc, char **argv) {
                             j++;
                         }
                         if (!found) break; /* need more data */
+                        if (c->inbuf[off] == '+') {
+                            size_t linelen = j - off;
+                            if (linelen >= 12 &&
+                                memcmp(c->inbuf + off, "+FULLRESYNC ", 12) == 0 &&
+                                linelen < 100) {
+                                char line[100];
+                                char rid[41];
+                                long long o;
+                                memcpy(line, c->inbuf + off, linelen);
+                                line[linelen] = '\0';
+                                if (sscanf(line + 12, "%40s %lld", rid, &o) == 2) {
+                                    snprintf(g_primary_replid,
+                                             sizeof(g_primary_replid), "%s", rid);
+                                    g_slave_repl_offset = o;
+                                    c->repl_syncing = 1;
+                                }
+                            } else if (linelen >= 9 &&
+                                       memcmp(c->inbuf + off, "+FULLSYNC", 9) == 0) {
+                                c->repl_syncing = 0;
+                            }
+                        }
                         off = j + 2;
                         continue;
                     }
@@ -1016,11 +1161,21 @@ int main(int argc, char **argv) {
                         free(reply.data);
                         if (drc == 1) {
                             aof_append(cargv, cargc);
+                            if (!c->repl_syncing)
+                                g_slave_repl_offset += (long long)rawlen;
                             forward_to_replicas(raw, rawlen);
                         }
                     } else if (strcasecmp(cargv[0], "SYNC") == 0 && cargc == 1) {
                         /* A replica asking for a full sync. */
                         c->is_replica = 1;
+                        send_full_sync(c);
+                    } else if (strcasecmp(cargv[0], "PSYNC") == 0 && cargc == 3) {
+                        /* A replica asking to resume from an offset.
+                           There is no backlog yet, so this is always
+                           a full resync: say so, then sync. */
+                        c->is_replica = 1;
+                        dbuf_putf(&c->out, "+FULLRESYNC %s %lld\r\n",
+                                  g_replid, g_master_repl_offset);
                         send_full_sync(c);
                     } else if (strcasecmp(cargv[0], "REPLICAOF") == 0) {
                         Dbuf reply = {0};

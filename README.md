@@ -6,7 +6,7 @@ sets and hashes with TTLs, approximate LRU eviction, and an append-only file for
 durability. No dependencies beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.7.0.
+Version 0.8.0.
 
 ## Why
 
@@ -70,7 +70,8 @@ OK
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
 | `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` writes a snapshot of the dataset to `dump.rdb` and forces the AOF to disk |
 | `SYNC` | Ask this server for a full sync: it marks the connection a replica, streams a rebuild of the whole dataset (one command per key, with TTLs), then streams every later write live |
-| `REPLICAOF host port`, `REPLICAOF NO ONE` | Make this server a replica of `host:port` (full sync, then streamed writes, applied and AOF-logged locally); `NO ONE` detaches it |
+| `PSYNC replid offset` | Ask to resume replication from a stream offset; there is no backlog yet, so the primary always answers `+FULLRESYNC <replid> <offset>` and sends a full sync |
+| `REPLICAOF host port`, `REPLICAOF NO ONE` | Make this server a replica of `host:port` (PSYNC, then streamed writes, applied and AOF-logged locally); `NO ONE` detaches it |
 | `QUIT`, `SHUTDOWN` | Close connection / stop the server |
 
 ## Architecture
@@ -112,7 +113,7 @@ src/
 - **Event loop**: one thread, non-blocking sockets, per-client input/output
   buffers. A slow client never blocks other clients.
 - **Replication**: a replica connects with `REPLICAOF host port` (non-blocking
-  connect, `SYNC` sent when it completes) and the primary streams a full
+  connect, `PSYNC` sent when it completes) and the primary streams a full
   sync — `FLUSHALL` plus one rebuild command per key (`SET` with `PX` for
   TTL'd strings, `RPUSH`/`SADD`/`HSET` for the other types, `PEXPIRE` after
   the rebuild; keys whose TTL already passed are left out) — followed by
@@ -123,9 +124,16 @@ src/
   data survives a replica restart, and a replica can itself accept `SYNC`
   and forward what it applies, so replicas chain. A replica connection is
   read-only on the primary (only `PING` is accepted); `INFO` reports
-  `role:primary|replica` and `connected_replicas`. There is no failover
-  or partial resync yet: a replica that drops must `REPLICAOF` again and
-  takes a fresh full sync.
+  `role:primary|replica` and `connected_replicas`. Offsets: the primary
+  counts every byte of the live write stream it forwards
+  (`master_repl_offset`, under a fresh 40-hex run id per process) and
+  reports each replica's offset (`replicaN:ip=...,port=...,offset=...`);
+  a replica learns the primary's run id and offset from the `+FULLRESYNC`
+  line and counts the stream bytes it applies (`slave_repl_offset`), so a
+  caught-up replica's slave offset equals the primary's master offset.
+  There is no replication backlog yet: `PSYNC` always answers `+FULLRESYNC`
+  and takes a full sync, and there is no failover — a replica that drops
+  must `REPLICAOF` again.
 
 ## Benchmarks
 
@@ -170,7 +178,13 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # surviving TTL, skips a key whose TTL passed first, then
             # streams live SET/INCR/DEL/LPUSH writes; REPLICAOF NO ONE
             # detaches and later writes stop flowing; a replica restart
-            # rebuilds the replicated data from its own AOF)
+            # rebuilds the replicated data from its own AOF), and
+            # replication offset checks (the primary's master_repl_offset
+            # grows by exactly the bytes of a forwarded command, the
+            # replica's slave_repl_offset catches up to it and reports
+            # the same run id, INFO lists the replica with its offset,
+            # and PSYNC answers +FULLRESYNC with the run id and offset
+            # then streams a full sync)
 ```
 
 ## Roadmap
@@ -181,5 +195,10 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
 - [x] `everysec` AOF fsync policy
 - [x] RDB-style snapshots alongside the AOF (`SAVE` writes `dump.rdb`, loaded on startup)
 - [x] Replication (primary/replica over RESP)
+- [x] Replication offsets and `PSYNC` handshake (`master_repl_offset`,
+      per-replica offsets, run id; always a full resync for now)
+- [ ] Replication backlog: keep recent stream bytes so `PSYNC` can
+      resume from an offset instead of full-syncing
+- [ ] Failover: promote a replica to primary
 - [ ] `epoll` backend and a thread pool for the event loop
 - [ ] Benchmarks against real Redis on the same hardware
