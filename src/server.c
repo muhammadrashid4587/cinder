@@ -1,7 +1,8 @@
 /* cinder: a Redis-compatible in-memory key-value store in C.
  *
  * Single-threaded, poll()-based event loop. String values with TTLs,
- * approximate LRU eviction, and an append-only file for durability.
+ * approximate LRU eviction, an append-only file for durability, and
+ * RDB-style snapshots (SAVE) that are reloaded on startup.
  * Speaks RESP so real redis clients (redis-cli, redis-benchmark, and
  * any RESP client library) work against it.
  */
@@ -25,13 +26,15 @@
 #include <unistd.h>
 
 #include "aof.h"
+#include "rdb.h"
 #include "resp.h"
 #include "store.h"
 
-#define CINDER_VERSION "0.5.0"
+#define CINDER_VERSION "0.6.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
+static char g_rdb_path[1024];
 static long long g_start_ms;
 static long long g_commands_processed;
 static size_t g_max_entries; /* 0 = unlimited */
@@ -487,8 +490,12 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         return 0;
     }
     if (strcasecmp(cmd, "SAVE") == 0) {
-        /* Force the AOF to disk. Under the everysec policy this flushes
-           up to a second of pending writes immediately. */
+        if (argc != 1)
+            return dbuf_error(reply, "wrong number of arguments for 'save' command"), 0;
+        /* Snapshot the whole dataset to dump.rdb, then force the AOF
+           to disk too, as SAVE did before snapshots existed. */
+        if (rdb_save(g_store, g_rdb_path) < 0)
+            return dbuf_error(reply, "ERR failed to write snapshot"), 0;
         aof_fsync();
         dbuf_simple(reply, "OK");
         return 0;
@@ -630,10 +637,22 @@ int main(int argc, char **argv) {
     }
     char aof_path[1024];
     snprintf(aof_path, sizeof(aof_path), "%s/appendonly.aof", data_dir);
+    snprintf(g_rdb_path, sizeof(g_rdb_path), "%s/dump.rdb", data_dir);
     if (aof_open(aof_path) < 0) {
         fprintf(stderr, "cinder: cannot open AOF %s: %s\n", aof_path, strerror(errno));
         return 1;
     }
+    /* Load the snapshot first, then replay the AOF over it. The AOF
+       holds the complete history, so replaying it after the snapshot
+       reproduces the exact final state; a missing snapshot is normal
+       (nothing saved yet), a corrupt one is only a warning. */
+    errno = 0;
+    long long rdb_keys = rdb_load(g_store, g_rdb_path);
+    if (rdb_keys >= 0)
+        printf("cinder: loaded %lld keys from snapshot %s\n", rdb_keys, g_rdb_path);
+    else if (errno != ENOENT)
+        fprintf(stderr, "cinder: warning: snapshot %s is corrupt (%s); continuing with AOF replay\n",
+                g_rdb_path, strerror(errno));
     replay_aof(aof_path);
 
     signal(SIGINT, on_signal);

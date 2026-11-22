@@ -80,6 +80,13 @@ size_t store_evict_lru(Store *s, size_t max_entries);
    (NULL and 0 when nothing matches). Caller frees both. */
 size_t store_keys_matching(Store *s, const char *pattern, char ***keys_out);
 
+/* Iterate over all non-expired entries in bucket order. The callback
+   receives each entry (read-only) and arg; returning non-zero stops
+   the iteration. Expired entries are skipped, not deleted. Returns 0
+   when every entry was visited, 1 if stopped early. */
+typedef int (*store_foreach_fn)(const Entry *e, void *arg);
+int store_foreach(Store *s, store_foreach_fn fn, void *arg);
+
 /* 0 = no such key, 1 = string, 2 = list, 3 = set, 4 = hash. */
 int store_type(Store *s, const char *key);
 

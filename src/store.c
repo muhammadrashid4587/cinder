@@ -402,6 +402,18 @@ size_t store_size(Store *s) {
     return s->count;
 }
 
+int store_foreach(Store *s, store_foreach_fn fn, void *arg) {
+    for (size_t i = 0; i < s->cap; i++) {
+        Entry *e = s->buckets[i];
+        while (e) {
+            Entry *next = e->next;
+            if (!entry_expired(e) && fn(e, arg) != 0) return 1;
+            e = next;
+        }
+    }
+    return 0;
+}
+
 void store_flush(Store *s) {
     for (size_t i = 0; i < s->cap; i++) {
         Entry *e = s->buckets[i];

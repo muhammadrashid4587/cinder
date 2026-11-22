@@ -6,7 +6,7 @@ sets and hashes with TTLs, approximate LRU eviction, and an append-only file for
 durability. No dependencies beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.5.0.
+Version 0.6.0.
 
 ## Why
 
@@ -68,7 +68,7 @@ OK
 | `HGETALL key` | Flat `[field, value, ...]` array in insertion order |
 | `KEYS pattern` | Glob match (`*` and `?`) |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
-| `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` forces the AOF to disk |
+| `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` writes a snapshot of the dataset to `dump.rdb` and forces the AOF to disk |
 | `QUIT`, `SHUTDOWN` | Close connection / stop the server |
 
 ## Architecture
@@ -83,6 +83,10 @@ src/
   resp.c     RESP parser (array + inline commands) and encoders
   aof.c      append-only log: every mutation is a RESP array, replayed on start;
              fsync policy `always` or `everysec`
+  rdb.c      RDB-style snapshots: `SAVE` writes the whole dataset (all
+             types, TTLs as absolute expiries) to `dump.rdb` in a compact
+             binary format, atomically via `dump.rdb.tmp` + rename; the
+             snapshot is loaded on startup before the AOF is replayed
 ```
 
 - **Store**: chained hash table, doubling resize, lazy expiry on access plus
@@ -94,7 +98,15 @@ src/
   `fdatasync`s after every write; `everysec` writes immediately and syncs at
   most once a second via a timer in the event loop, and always syncs on a
   clean shutdown or `SAVE`. On startup the file is replayed through the
-  same dispatcher live clients use, so the log is the dataset.
+  same dispatcher live clients use, so the log is the dataset. `SAVE`
+  additionally writes a snapshot of the whole dataset to `dump.rdb`
+  (strings, lists, sets and hashes, with TTLs stored as absolute
+  expiries; keys whose TTL already passed are left out), atomically via
+  `dump.rdb.tmp`, `fsync`, and rename, so a crash mid-save never leaves
+  a torn snapshot. On startup the snapshot is loaded first and the AOF
+  is replayed over it — the AOF holds the complete history, so the
+  replay reproduces the exact final state either way, and a corrupt
+  snapshot is only a warning, never a failed start.
 - **Event loop**: one thread, non-blocking sockets, per-client input/output
   buffers. A slow client never blocks other clients.
 
@@ -132,7 +144,11 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # SHUTDOWN and reload), and everysec-policy checks (INFO
             # reports the policy, the AOF holds the record before any
             # sync, data survives a SIGKILL + restart, unknown policy
-            # is a startup error)
+            # is a startup error), and RDB snapshot checks (SAVE writes
+            # dump.rdb with all four types, a key whose TTL passed
+            # before the save is left out, and a restart with the AOF
+            # deleted restores every key from the snapshot alone, with
+            # a surviving TTL preserved)
 ```
 
 ## Roadmap
@@ -141,7 +157,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
 - [x] Sets (`SADD`/`SREM`/`SMEMBERS`/`SISMEMBER`/`SCARD`, AOF-persisted, TTLs)
 - [x] Hashes (`HSET`/`HGET`/`HDEL`/`HEXISTS`/`HLEN`/`HGETALL`, AOF-persisted, TTLs)
 - [x] `everysec` AOF fsync policy
-- [ ] RDB-style snapshots alongside the AOF
+- [x] RDB-style snapshots alongside the AOF (`SAVE` writes `dump.rdb`, loaded on startup)
 - [ ] Replication (primary/replica over RESP)
 - [ ] `epoll` backend and a thread pool for the event loop
 - [ ] Benchmarks against real Redis on the same hardware

@@ -315,6 +315,56 @@ def main():
             proc.terminate()
             proc.wait(timeout=5)
 
+    # RDB snapshots: SAVE writes dump.rdb with every key type, and a
+    # restart with the AOF deleted restores from the snapshot alone.
+    # A key whose TTL passed before the save is not in the snapshot,
+    # and a surviving TTL is preserved as an absolute expiry.
+    rdb_dir = "/tmp/cinder-smoke-rdb"
+    proc = start_server(data_dir=rdb_dir)
+    try:
+        c = Client(PORT)
+        check("rdb SET", c.cmd("SET", "snapstr", "hello"), "OK")
+        check("rdb RPUSH", c.cmd("RPUSH", "snaplist", "x", "y", "z"), 3)
+        check("rdb SADD", c.cmd("SADD", "snapset", "a", "b"), 2)
+        check("rdb HSET", c.cmd("HSET", "snaphash", "f1", "v1", "f2", "v2"), 2)
+        check("rdb SET ttl", c.cmd("SET", "snapttl", "v", "EX", "100"), "OK")
+        check("rdb SET expiring", c.cmd("SET", "snapgone", "v", "PX", "50"), "OK")
+        time.sleep(0.1)
+        check("rdb SAVE", c.cmd("SAVE"), "OK")
+        with open(os.path.join(rdb_dir, "dump.rdb"), "rb") as f:
+            snap = f.read()
+        check("rdb file magic", snap[:6], b"CINDER")
+        check("rdb file has keys", b"snapstr" in snap and b"snaphash" in snap, True)
+        check("rdb file skips expired key", b"snapgone" not in snap, True)
+        c.cmd("SHUTDOWN")
+        c.close()
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+    # Delete the AOF: the restart must restore from the snapshot alone.
+    os.remove(os.path.join(rdb_dir, "appendonly.aof"))
+    proc = start_server(data_dir=rdb_dir, fresh=False)
+    try:
+        c = Client(PORT)
+        check("rdb reload GET", c.cmd("GET", "snapstr"), "hello")
+        check("rdb reload list", c.cmd("LRANGE", "snaplist", "0", "-1"), ["x", "y", "z"])
+        check("rdb reload set", sorted(c.cmd("SMEMBERS", "snapset")), ["a", "b"])
+        check("rdb reload hash", c.cmd("HGETALL", "snaphash"), ["f1", "v1", "f2", "v2"])
+        check("rdb reload TTL survives", 90000 <= c.cmd("PTTL", "snapttl") <= 100000, True)
+        check("rdb reload expired gone", c.cmd("GET", "snapgone"), None)
+        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 5)
+        check("rdb reload SET still works", c.cmd("SET", "afterload", "1"), "OK")
+        check("rdb SAVE again", c.cmd("SAVE"), "OK")
+        c.cmd("SHUTDOWN")
+        c.close()
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
     # Unknown policy is a startup error, not a silent default.
     bad = subprocess.run(
         [BIN, "--port", str(PORT), "--data-dir", "/tmp/cinder-smoke-bad",
