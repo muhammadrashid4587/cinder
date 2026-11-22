@@ -56,12 +56,98 @@ static void set_free(Set *st) {
     free(st);
 }
 
+static void hash_free(Hash *h) {
+    if (!h) return;
+    for (size_t i = 0; i < h->len; i++) {
+        free(h->fields[i]);
+        free(h->values[i]);
+    }
+    free(h->fields);
+    free(h->values);
+    free(h);
+}
+
 static void entry_free(Entry *e) {
     free(e->key);
     if (e->type == ENTRY_LIST) list_free(e->list);
     else if (e->type == ENTRY_SET) set_free(e->set);
+    else if (e->type == ENTRY_HASH) hash_free(e->hash);
     else free(e->value);
     free(e);
+}
+
+static Hash *hash_new(void) {
+    Hash *h = calloc(1, sizeof(Hash));
+    if (!h) return NULL;
+    h->cap = 8;
+    h->fields = calloc(h->cap, sizeof(char *));
+    h->values = calloc(h->cap, sizeof(char *));
+    if (!h->fields || !h->values) {
+        hash_free(h);
+        return NULL;
+    }
+    return h;
+}
+
+/* Index of field, or -1 when absent. */
+static long long hash_find(Hash *h, const char *field) {
+    for (size_t i = 0; i < h->len; i++)
+        if (strcmp(h->fields[i], field) == 0) return (long long)i;
+    return -1;
+}
+
+/* Set field to value, adding it if absent. Returns 1 new, 0 updated,
+   -1 = OOM. */
+static int hash_put(Hash *h, const char *field, const char *value) {
+    long long idx = hash_find(h, field);
+    if (idx >= 0) {
+        char *v = strdup(value);
+        if (!v) return -1;
+        free(h->values[idx]);
+        h->values[idx] = v;
+        return 0;
+    }
+    char *f = strdup(field);
+    char *v = strdup(value);
+    if (!f || !v) {
+        free(f);
+        free(v);
+        return -1;
+    }
+    if (h->len == h->cap) {
+        size_t ncap = h->cap * 2;
+        char **nf = realloc(h->fields, ncap * sizeof(char *));
+        char **nv = realloc(h->values, ncap * sizeof(char *));
+        if (!nf || !nv) {
+            free(f);
+            free(v);
+            return -1;
+        }
+        h->fields = nf;
+        h->values = nv;
+        h->cap = ncap;
+    }
+    h->fields[h->len] = f;
+    h->values[h->len] = v;
+    h->len++;
+    return 1;
+}
+
+/* Remove field if present, preserving insertion order of the rest.
+   Returns 1 removed, 0 absent. */
+static int hash_remove(Hash *h, const char *field) {
+    long long idx = hash_find(h, field);
+    if (idx < 0) return 0;
+    free(h->fields[idx]);
+    free(h->values[idx]);
+    for (size_t i = (size_t)idx + 1; i < h->len; i++) {
+        h->fields[i - 1] = h->fields[i];
+        h->values[i - 1] = h->values[i];
+    }
+    h->len--;
+    h->fields[h->len] = NULL;
+    h->values[h->len] = NULL;
+    return 1;
 }
 
 static Set *set_new(void) {
@@ -242,6 +328,10 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
         } else if (e->type == ENTRY_SET) {
             set_free(e->set);
             e->set = NULL;
+            e->type = ENTRY_STRING;
+        } else if (e->type == ENTRY_HASH) {
+            hash_free(e->hash);
+            e->hash = NULL;
             e->type = ENTRY_STRING;
         }
         free(e->value);
@@ -439,6 +529,7 @@ int store_type(Store *s, const char *key) {
     if (!e) return 0;
     if (e->type == ENTRY_LIST) return 2;
     if (e->type == ENTRY_SET) return 3;
+    if (e->type == ENTRY_HASH) return 4;
     return 1;
 }
 
@@ -646,5 +737,108 @@ int store_smembers(Store *s, const char *key, char ***out, size_t *n_out) {
     }
     *out = res;
     *n_out = st->len;
+    return 0;
+}
+
+/* ---------- hashes ---------- */
+
+long long store_hset(Store *s, const char *key, const char *field,
+                     const char *value) {
+    Entry *e = store_find(s, key, NULL);
+    if (e) {
+        if (e->type != ENTRY_HASH) return -1;
+        int rc = hash_put(e->hash, field, value);
+        if (rc < 0) return -2;
+        e->last_access = ++s->clock;
+        return rc;
+    }
+    if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+        store_resize(s);
+    e = calloc(1, sizeof(Entry));
+    if (!e) return -2;
+    e->key = strdup(key);
+    e->hash = hash_new();
+    if (!e->key || !e->hash) {
+        entry_free(e);
+        return -2;
+    }
+    e->type = ENTRY_HASH;
+    e->expire_at = -1;
+    e->last_access = ++s->clock;
+    if (hash_put(e->hash, field, value) < 0) {
+        entry_free(e);
+        return -2;
+    }
+    size_t idx = hash_key(key) % s->cap;
+    e->next = s->buckets[idx];
+    s->buckets[idx] = e;
+    s->count++;
+    return 1;
+}
+
+char *store_hget(Store *s, const char *key, const char *field) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e || e->type != ENTRY_HASH) return NULL;
+    e->last_access = ++s->clock;
+    long long idx = hash_find(e->hash, field);
+    if (idx < 0) return NULL;
+    return strdup(e->hash->values[idx]);
+}
+
+long long store_hdel(Store *s, const char *key, const char *field) {
+    Entry **pp = NULL;
+    Entry *e = store_find(s, key, &pp);
+    if (!e) return 0;
+    if (e->type != ENTRY_HASH) return -1;
+    if (!hash_remove(e->hash, field)) return 0;
+    if (e->hash->len == 0) {
+        /* A hash emptied by removing is gone, as in Redis. */
+        *pp = e->next;
+        entry_free(e);
+        s->count--;
+    } else {
+        e->last_access = ++s->clock;
+    }
+    return 1;
+}
+
+int store_hexists(Store *s, const char *key, const char *field) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_HASH) return -1;
+    e->last_access = ++s->clock;
+    return hash_find(e->hash, field) >= 0 ? 1 : 0;
+}
+
+long long store_hlen(Store *s, const char *key) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_HASH) return -1;
+    e->last_access = ++s->clock;
+    return (long long)e->hash->len;
+}
+
+int store_hgetall(Store *s, const char *key, char ***out, size_t *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_HASH) return -1;
+    e->last_access = ++s->clock;
+    Hash *h = e->hash;
+    if (h->len == 0) return 0;
+    char **res = malloc(h->len * 2 * sizeof(char *));
+    if (!res) return -2;
+    for (size_t i = 0; i < h->len; i++) {
+        res[2 * i] = strdup(h->fields[i]);
+        res[2 * i + 1] = strdup(h->values[i]);
+        if (!res[2 * i] || !res[2 * i + 1]) {
+            for (size_t j = 0; j <= 2 * i + 1; j++) free(res[j]);
+            free(res);
+            return -2;
+        }
+    }
+    *out = res;
+    *n_out = h->len * 2;
     return 0;
 }

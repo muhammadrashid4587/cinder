@@ -28,7 +28,7 @@
 #include "resp.h"
 #include "store.h"
 
-#define CINDER_VERSION "0.4.0"
+#define CINDER_VERSION "0.5.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -377,6 +377,80 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_int(reply, n);
         return 0;
     }
+    if (strcasecmp(cmd, "HSET") == 0) {
+        if (argc < 4 || (argc % 2) != 0)
+            return dbuf_error(reply, "wrong number of arguments for 'hset' command"), 0;
+        long long added = 0;
+        for (int i = 2; i < argc; i += 2) {
+            long long rc = store_hset(g_store, argv[1], argv[i], argv[i + 1]);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == -2)
+                return dbuf_error(reply, "out of memory"), 0;
+            added += rc;
+        }
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_int(reply, added);
+        /* Log even when every field already existed: an update still
+           changes state and must reach the AOF. */
+        return 1;
+    }
+    if (strcasecmp(cmd, "HGET") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'hget' command"), 0;
+        int t = store_type(g_store, argv[1]);
+        if (t != 0 && t != 4)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        char *v = store_hget(g_store, argv[1], argv[2]);
+        if (!v) return dbuf_null(reply), 0;
+        dbuf_bulk(reply, v, strlen(v));
+        free(v);
+        return 0;
+    }
+    if (strcasecmp(cmd, "HDEL") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'hdel' command"), 0;
+        long long removed = 0;
+        for (int i = 2; i < argc; i++) {
+            long long rc = store_hdel(g_store, argv[1], argv[i]);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            removed += rc;
+        }
+        dbuf_int(reply, removed);
+        return removed > 0 ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "HEXISTS") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'hexists' command"), 0;
+        int rc = store_hexists(g_store, argv[1], argv[2]);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_int(reply, rc);
+        return 0;
+    }
+    if (strcasecmp(cmd, "HLEN") == 0) {
+        if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'hlen' command"), 0;
+        long long n = store_hlen(g_store, argv[1]);
+        if (n == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_int(reply, n);
+        return 0;
+    }
+    if (strcasecmp(cmd, "HGETALL") == 0) {
+        if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'hgetall' command"), 0;
+        char **pairs = NULL;
+        size_t n = 0;
+        int rc = store_hgetall(g_store, argv[1], &pairs, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_array_header(reply, (long long)n);
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, pairs[i], strlen(pairs[i]));
+            free(pairs[i]);
+        }
+        free(pairs);
+        return 0;
+    }
     if (strcasecmp(cmd, "FLUSHALL") == 0) {
         store_flush(g_store);
         dbuf_simple(reply, "OK");
@@ -405,6 +479,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
+            "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE"};
         dbuf_array_header(reply, (long long)(sizeof(names) / sizeof(names[0])));
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)

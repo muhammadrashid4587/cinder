@@ -1,12 +1,12 @@
 # cinder
 
 A Redis-compatible in-memory key-value store, written in C from scratch.
-Single-threaded, `poll()`-based event loop, RESP protocol, strings, lists
-and sets with TTLs, approximate LRU eviction, and an append-only file for
+Single-threaded, `poll()`-based event loop, RESP protocol, strings, lists,
+sets and hashes with TTLs, approximate LRU eviction, and an append-only file for
 durability. No dependencies beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.4.0.
+Version 0.5.0.
 
 ## Why
 
@@ -60,6 +60,12 @@ OK
 | `SMEMBERS key` | All members (insertion order) |
 | `SISMEMBER key member` | `1` if member, `0` if not |
 | `SCARD key` | Set size (`0` when missing) |
+| `HSET key field value [field value ...]` | Set fields; returns number of new fields (updates return `0` for that field) |
+| `HGET key field` | Field value (`nil` when missing) |
+| `HDEL key field [field ...]` | Delete fields; returns number removed; emptying the hash deletes the key |
+| `HEXISTS key field` | `1` if the field exists, `0` if not |
+| `HLEN key` | Number of fields (`0` when missing) |
+| `HGETALL key` | Flat `[field, value, ...]` array in insertion order |
 | `KEYS pattern` | Glob match (`*` and `?`) |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
 | `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` forces the AOF to disk |
@@ -71,8 +77,9 @@ OK
 src/
   server.c   TCP listener, poll() event loop, command dispatch
   store.c    hash table (djb2, chaining, resize at 0.75 load), TTLs,
-             strings, lists (circular-buffer lists, O(1) push/pop) and
-             sets (unordered member arrays, dedup on insert)
+             strings, lists (circular-buffer lists, O(1) push/pop),
+             sets (unordered member arrays, dedup on insert) and
+             hashes (parallel field/value arrays, insertion order)
   resp.c     RESP parser (array + inline commands) and encoders
   aof.c      append-only log: every mutation is a RESP array, replayed on start;
              fsync policy `always` or `everysec`
@@ -117,19 +124,22 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # checks (push/pop both ends, length, range with negative
             # indexes, wrong-type errors, list TTL expiry), set checks
             # (add/dedup, membership, remove, wrong-type errors, set
-            # TTL expiry, emptying a set deletes the key), an AOF
-            # restart test (data, a list and a set survive a SHUTDOWN
-            # and reload), and everysec-policy checks (INFO reports the
-            # policy, the AOF holds the record before any sync, data
-            # survives a SIGKILL + restart, unknown policy is a
-            # startup error)
+            # TTL expiry, emptying a set deletes the key), hash checks
+            # (multi-field set, update, get, delete, exists, length,
+            # getall in insertion order, wrong-type errors, hash TTL
+            # expiry, emptying a hash deletes the key), an AOF
+            # restart test (data, a list, a set and a hash survive a
+            # SHUTDOWN and reload), and everysec-policy checks (INFO
+            # reports the policy, the AOF holds the record before any
+            # sync, data survives a SIGKILL + restart, unknown policy
+            # is a startup error)
 ```
 
 ## Roadmap
 
 - [x] Lists (`LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LRANGE`, AOF-persisted, TTLs)
 - [x] Sets (`SADD`/`SREM`/`SMEMBERS`/`SISMEMBER`/`SCARD`, AOF-persisted, TTLs)
-- [ ] Hashes (data structure beyond strings, lists and sets)
+- [x] Hashes (`HSET`/`HGET`/`HDEL`/`HEXISTS`/`HLEN`/`HGETALL`, AOF-persisted, TTLs)
 - [x] `everysec` AOF fsync policy
 - [ ] RDB-style snapshots alongside the AOF
 - [ ] Replication (primary/replica over RESP)

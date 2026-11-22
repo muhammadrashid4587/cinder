@@ -6,6 +6,7 @@
 #define ENTRY_STRING 0
 #define ENTRY_LIST 1
 #define ENTRY_SET 2
+#define ENTRY_HASH 3
 
 /* A list value: circular buffer of malloc'd strings, so push/pop at
    either end is O(1) amortised. */
@@ -25,12 +26,22 @@ typedef struct Set {
     size_t len;
 } Set;
 
+/* A hash value: parallel arrays of malloc'd fields and values, in
+   insertion order; lookup by linear scan, like the set type. */
+typedef struct Hash {
+    char **fields;
+    char **values;
+    size_t cap;
+    size_t len;
+} Hash;
+
 typedef struct Entry {
     char *key;
-    int type; /* ENTRY_STRING, ENTRY_LIST or ENTRY_SET */
+    int type; /* ENTRY_STRING, ENTRY_LIST, ENTRY_SET or ENTRY_HASH */
     char *value; /* string values (type == ENTRY_STRING) */
     List *list; /* list values (type == ENTRY_LIST) */
     Set *set; /* set values (type == ENTRY_SET) */
+    Hash *hash; /* hash values (type == ENTRY_HASH) */
     long long expire_at; /* ms since epoch, -1 = no expiry */
     unsigned long long last_access; /* logical clock, for approximate LRU */
     struct Entry *next;
@@ -69,7 +80,7 @@ size_t store_evict_lru(Store *s, size_t max_entries);
    (NULL and 0 when nothing matches). Caller frees both. */
 size_t store_keys_matching(Store *s, const char *pattern, char ***keys_out);
 
-/* 0 = no such key, 1 = string, 2 = list, 3 = set. */
+/* 0 = no such key, 1 = string, 2 = list, 3 = set, 4 = hash. */
 int store_type(Store *s, const char *key);
 
 /* Push one element. Returns the new length, -1 = key holds a string,
@@ -107,5 +118,28 @@ long long store_scard(Store *s, const char *key);
    empty), -1 = wrong type, -2 = out of memory. *out is a malloc'd
    array of malloc'd strings; the caller frees both. */
 int store_smembers(Store *s, const char *key, char ***out, size_t *n_out);
+
+/* Set one field. Returns 1 when the field is new, 0 when it overwrote
+   an existing field, -1 = key holds a string, list or set, -2 = out of
+   memory. Creates the hash when the key is missing. */
+long long store_hset(Store *s, const char *key, const char *field,
+                     const char *value);
+/* Returns a malloc'd copy of the field's value, or NULL when the key or
+   the field is missing. Caller must check the type first: NULL is also
+   returned for a wrong-type key. */
+char *store_hget(Store *s, const char *key, const char *field);
+/* Remove one field. Returns 1 if removed, 0 if absent or key missing,
+   -1 = wrong type. Removing the last field deletes the key, as in
+   Redis. */
+long long store_hdel(Store *s, const char *key, const char *field);
+/* 1 = field present, 0 = absent or key missing, -1 = wrong type. */
+int store_hexists(Store *s, const char *key, const char *field);
+/* Number of fields: 0 when missing, -1 = wrong type. */
+long long store_hlen(Store *s, const char *key);
+/* All fields and values as a flat array [field, value, field, value,
+   ...] in insertion order. Returns 0 on success (out may be empty),
+   -1 = wrong type, -2 = out of memory. *out is a malloc'd array of
+   malloc'd strings; the caller frees both. */
+int store_hgetall(Store *s, const char *key, char ***out, size_t *n_out);
 
 #endif
