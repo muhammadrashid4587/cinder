@@ -6,7 +6,7 @@ sets and hashes with TTLs, approximate LRU eviction, and an append-only file for
 durability. No dependencies beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.6.0.
+Version 0.7.0.
 
 ## Why
 
@@ -69,6 +69,8 @@ OK
 | `KEYS pattern` | Glob match (`*` and `?`) |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
 | `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` writes a snapshot of the dataset to `dump.rdb` and forces the AOF to disk |
+| `SYNC` | Ask this server for a full sync: it marks the connection a replica, streams a rebuild of the whole dataset (one command per key, with TTLs), then streams every later write live |
+| `REPLICAOF host port`, `REPLICAOF NO ONE` | Make this server a replica of `host:port` (full sync, then streamed writes, applied and AOF-logged locally); `NO ONE` detaches it |
 | `QUIT`, `SHUTDOWN` | Close connection / stop the server |
 
 ## Architecture
@@ -109,6 +111,21 @@ src/
   snapshot is only a warning, never a failed start.
 - **Event loop**: one thread, non-blocking sockets, per-client input/output
   buffers. A slow client never blocks other clients.
+- **Replication**: a replica connects with `REPLICAOF host port` (non-blocking
+  connect, `SYNC` sent when it completes) and the primary streams a full
+  sync — `FLUSHALL` plus one rebuild command per key (`SET` with `PX` for
+  TTL'd strings, `RPUSH`/`SADD`/`HSET` for the other types, `PEXPIRE` after
+  the rebuild; keys whose TTL already passed are left out) — followed by
+  a `+FULLSYNC` marker. After that, every mutating command the primary
+  executes is forwarded verbatim (the raw RESP bytes) to all connected
+  replicas. The replica applies streamed commands through the same
+  dispatcher live clients use and logs them to its own AOF, so replicated
+  data survives a replica restart, and a replica can itself accept `SYNC`
+  and forward what it applies, so replicas chain. A replica connection is
+  read-only on the primary (only `PING` is accepted); `INFO` reports
+  `role:primary|replica` and `connected_replicas`. There is no failover
+  or partial resync yet: a replica that drops must `REPLICAOF` again and
+  takes a fresh full sync.
 
 ## Benchmarks
 
@@ -148,7 +165,12 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # dump.rdb with all four types, a key whose TTL passed
             # before the save is left out, and a restart with the AOF
             # deleted restores every key from the snapshot alone, with
-            # a surviving TTL preserved)
+            # a surviving TTL preserved), and replication checks
+            # (REPLICAOF streams a full sync of all four types with a
+            # surviving TTL, skips a key whose TTL passed first, then
+            # streams live SET/INCR/DEL/LPUSH writes; REPLICAOF NO ONE
+            # detaches and later writes stop flowing; a replica restart
+            # rebuilds the replicated data from its own AOF)
 ```
 
 ## Roadmap
@@ -158,6 +180,6 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
 - [x] Hashes (`HSET`/`HGET`/`HDEL`/`HEXISTS`/`HLEN`/`HGETALL`, AOF-persisted, TTLs)
 - [x] `everysec` AOF fsync policy
 - [x] RDB-style snapshots alongside the AOF (`SAVE` writes `dump.rdb`, loaded on startup)
-- [ ] Replication (primary/replica over RESP)
+- [x] Replication (primary/replica over RESP)
 - [ ] `epoll` backend and a thread pool for the event loop
 - [ ] Benchmarks against real Redis on the same hardware

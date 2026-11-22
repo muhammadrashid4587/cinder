@@ -365,6 +365,107 @@ def main():
             proc.terminate()
             proc.wait(timeout=5)
 
+    # Replication: REPLICAOF streams a full sync, then live writes.
+    # A key whose TTL passed before the sync is not in the dump.
+    repl_primary_dir = "/tmp/cinder-smoke-repl-primary"
+    repl_replica_dir = "/tmp/cinder-smoke-repl-replica"
+    primary = start_server(data_dir=repl_primary_dir)
+    replica = None
+    try:
+        p = Client(PORT)
+        check("repl SET", p.cmd("SET", "repstr", "hello"), "OK")
+        check("repl RPUSH", p.cmd("RPUSH", "replist", "x", "y", "z"), 3)
+        check("repl SADD", p.cmd("SADD", "repset", "a", "b"), 2)
+        check("repl HSET", p.cmd("HSET", "rephash", "f1", "v1", "f2", "v2"), 2)
+        check("repl SET ttl", p.cmd("SET", "repttl", "v", "EX", "100"), "OK")
+        check("repl SET gone soon", p.cmd("SET", "repgone", "v", "PX", "50"), "OK")
+        time.sleep(0.1)  # repgone expires before the sync: it must not appear
+        replica = start_server(port=7778, data_dir=repl_replica_dir)
+        r = Client(7778)
+        check("repl INFO primary role", "role:primary" in p.cmd("INFO"), True)
+        check("repl REPLICAOF", r.cmd("REPLICAOF", "127.0.0.1", "7777"), "OK")
+        check("repl REPLICAOF bad port", r.cmd("REPLICAOF", "127.0.0.1", "99999"),
+              ("error", "ERR invalid port"))
+        # The full sync arrives asynchronously; poll for it.
+        deadline = time.time() + 5
+        synced = False
+        while time.time() < deadline:
+            try:
+                if (r.cmd("GET", "repstr") == "hello" and
+                        r.cmd("LRANGE", "replist", "0", "-1") == ["x", "y", "z"]):
+                    synced = True
+                    break
+            except (EOFError, OSError):
+                pass
+            time.sleep(0.1)
+        check("repl full sync arrived", synced, True)
+        check("repl sync set", sorted(r.cmd("SMEMBERS", "repset")), ["a", "b"])
+        check("repl sync hash", r.cmd("HGETALL", "rephash"), ["f1", "v1", "f2", "v2"])
+        check("repl sync TTL survives", 90000 <= r.cmd("PTTL", "repttl") <= 100000, True)
+        check("repl sync skips expired key", r.cmd("GET", "repgone"), None)
+        check("repl INFO replica role", "role:replica" in r.cmd("INFO"), True)
+        check("repl INFO replicas", "connected_replicas:1" in p.cmd("INFO"), True)
+        # Live writes stream after the sync.
+        check("repl live SET", p.cmd("SET", "newkey", "live"), "OK")
+        check("repl live INCR", p.cmd("INCR", "repcounter"), 1)
+        check("repl live DEL", p.cmd("DEL", "repstr"), 1)
+        check("repl live LPUSH", p.cmd("LPUSH", "replist", "front"), 4)
+        deadline = time.time() + 5
+        streamed = False
+        while time.time() < deadline:
+            try:
+                if (r.cmd("GET", "newkey") == "live" and
+                        r.cmd("GET", "repstr") is None and
+                        r.cmd("GET", "repcounter") == "1"):
+                    streamed = True
+                    break
+            except (EOFError, OSError):
+                pass
+            time.sleep(0.1)
+        check("repl streamed writes arrived", streamed, True)
+        check("repl streamed list", r.cmd("LRANGE", "replist", "0", "-1"),
+              ["front", "x", "y", "z"])
+        # Detach: writes stop flowing, and the replica keeps its data.
+        check("repl REPLICAOF NO ONE", r.cmd("REPLICAOF", "NO", "ONE"), "OK")
+        check("repl INFO back to primary", "role:primary" in r.cmd("INFO"), True)
+        check("repl after detach SET", p.cmd("SET", "afterdetach", "no"), "OK")
+        time.sleep(0.3)
+        check("repl after detach not streamed", r.cmd("GET", "afterdetach"), None)
+        check("repl after detach keeps data", r.cmd("GET", "newkey"), "live")
+        check("repl INFO replicas gone", "connected_replicas:0" in p.cmd("INFO"), True)
+        r.cmd("SHUTDOWN")
+        r.close()
+        replica.wait(timeout=5)
+        replica = None
+        p.cmd("SHUTDOWN")
+        p.close()
+        primary.wait(timeout=5)
+        primary = None
+    finally:
+        if replica is not None and replica.poll() is None:
+            replica.terminate()
+            replica.wait(timeout=5)
+        if primary is not None and primary.poll() is None:
+            primary.terminate()
+            primary.wait(timeout=5)
+    # Restart the replica: its AOF must rebuild the replicated data,
+    # and the key written after the detach must stay absent.
+    replica = start_server(port=7778, data_dir=repl_replica_dir, fresh=False)
+    try:
+        r = Client(7778)
+        check("repl AOF reload GET", r.cmd("GET", "newkey"), "live")
+        check("repl AOF reload list", r.cmd("LRANGE", "replist", "0", "-1"),
+              ["front", "x", "y", "z"])
+        check("repl AOF reload no detached key", r.cmd("GET", "afterdetach"), None)
+        check("repl AOF reload hash", r.cmd("HGETALL", "rephash"), ["f1", "v1", "f2", "v2"])
+        r.cmd("SHUTDOWN")
+        r.close()
+        replica.wait(timeout=5)
+    finally:
+        if replica.poll() is None:
+            replica.terminate()
+            replica.wait(timeout=5)
+
     # Unknown policy is a startup error, not a silent default.
     bad = subprocess.run(
         [BIN, "--port", str(PORT), "--data-dir", "/tmp/cinder-smoke-bad",

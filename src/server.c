@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -30,7 +31,7 @@
 #include "resp.h"
 #include "store.h"
 
-#define CINDER_VERSION "0.6.0"
+#define CINDER_VERSION "0.7.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -116,6 +117,15 @@ static int parse_ll(const char *s, long long *out) {
 /* ---------- command dispatch ----------
  * Returns: 0 = ok, 1 = mutated state (log to AOF), 2 = close connection,
  *          3 = shut the server down. */
+
+/* Replication state lives in the client table (defined below); these
+   helpers are declared here so INFO can report the role and the
+   replica count. */
+typedef struct Client Client;
+static Client *g_clients;
+static size_t g_nclients;
+static int repl_is_replica(void);
+static size_t repl_connected_replicas(void);
 
 static int dispatch(char **argv, int argc, Dbuf *reply) {
     const char *cmd = argv[0];
@@ -473,6 +483,9 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_putf(&info, "keys:%zu\r\n", store_size(g_store));
         dbuf_putf(&info, "max_entries:%zu\r\n", g_max_entries);
         dbuf_putf(&info, "aof_fsync_policy:%s\r\n", aof_policy_name());
+        dbuf_putf(&info, "# Replication\r\n");
+        dbuf_putf(&info, "role:%s\r\n", repl_is_replica() ? "replica" : "primary");
+        dbuf_putf(&info, "connected_replicas:%zu\r\n", repl_connected_replicas());
         dbuf_bulk(reply, info.data ? info.data : "", info.len);
         free(info.data);
         return 0;
@@ -483,7 +496,8 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
-            "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE"};
+            "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE",
+            "SYNC", "REPLICAOF"};
         dbuf_array_header(reply, (long long)(sizeof(names) / sizeof(names[0])));
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
             dbuf_bulk(reply, names[i], strlen(names[i]));
@@ -506,16 +520,21 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
 
 /* ---------- clients ---------- */
 
-typedef struct {
+typedef struct Client {
     int fd;
     char inbuf[INBUF_CAP];
     size_t inlen;
     Dbuf out;
     int dead;
+    int is_replica;     /* primary side: this client is a replica (SYNC'd);
+                           only PING is accepted from it, writes are
+                           streamed to it */
+    int is_repl_link;   /* replica side: this socket is the outbound link
+                           to our primary; commands on it are applied */
+    int repl_connecting; /* outbound link still completing its connect */
 } Client;
 
-static Client *g_clients;
-static size_t g_nclients, g_clients_cap;
+static size_t g_clients_cap;
 
 static void client_add(int fd) {
     if (g_nclients >= g_clients_cap) {
@@ -540,6 +559,203 @@ static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* ---------- replication ----------
+ * Primary side: a client sends SYNC, is marked a replica, and gets a
+ * full sync (FLUSHALL plus one rebuild command per key, as RESP
+ * arrays) followed by a +FULLSYNC marker. After that, every mutating
+ * command from any other client is forwarded to it verbatim.
+ * Replica side: REPLICAOF host port opens a non-blocking connection
+ * to the primary, sends SYNC, and applies every command arriving on
+ * that link through the normal dispatcher (and its own AOF, so the
+ * replicated data is durable). REPLICAOF NO ONE drops the link.
+ * A replica can itself accept SYNC and forward what it applies, so
+ * replicas chain; a command is never sent back down the link it
+ * arrived on, so there is no loop. */
+
+static Client *find_repl_link(void) {
+    for (size_t i = 0; i < g_nclients; i++)
+        if (g_clients[i].is_repl_link) return &g_clients[i];
+    return NULL;
+}
+
+static int repl_is_replica(void) { return find_repl_link() != NULL; }
+
+static size_t repl_connected_replicas(void) {
+    size_t n = 0;
+    for (size_t i = 0; i < g_nclients; i++)
+        if (g_clients[i].is_replica) n++;
+    return n;
+}
+
+/* Mark the outbound replication link dead; the sweep at the end of
+   the loop iteration closes it. */
+static void repl_link_close(void) {
+    Client *link = find_repl_link();
+    if (link) link->dead = 1;
+}
+
+/* Forward one raw command (as received, RESP array or inline) to
+   every connected replica. */
+static void forward_to_replicas(const char *raw, size_t rawlen) {
+    for (size_t i = 0; i < g_nclients; i++)
+        if (g_clients[i].is_replica) dbuf_put(&g_clients[i].out, raw, rawlen);
+}
+
+/* Encode one command as a RESP array into out. argv strings are
+   borrowed; the caller keeps them alive for the call. */
+static void emit_resp_cmd(Dbuf *out, char **argv, int argc) {
+    dbuf_array_header(out, argc);
+    for (int i = 0; i < argc; i++) dbuf_bulk(out, argv[i], strlen(argv[i]));
+}
+
+/* One entry of the full sync: the commands that rebuild this key on
+   the replica. Strings carry their remaining TTL as PX; other types
+   get a PEXPIRE after the rebuild. */
+static int sync_emit_entry(const Entry *e, void *arg) {
+    Dbuf *out = arg;
+    long long ttl = e->expire_at > 0 ? e->expire_at - now_ms() : -1;
+    if (e->expire_at > 0 && ttl <= 0) return 0; /* expired since the scan */
+    char ttlbuf[32];
+    if (e->type == ENTRY_STRING) {
+        if (ttl > 0) {
+            snprintf(ttlbuf, sizeof(ttlbuf), "%lld", ttl);
+            char *av[] = {"SET", (char *)e->key, (char *)e->value, "PX", ttlbuf};
+            emit_resp_cmd(out, av, 5);
+        } else {
+            char *av[] = {"SET", (char *)e->key, (char *)e->value};
+            emit_resp_cmd(out, av, 3);
+        }
+        return 0;
+    }
+    if (e->type == ENTRY_LIST) {
+        List *l = e->list;
+        if (l->len == 0) return 0;
+        char **av = malloc((2 + l->len) * sizeof(char *));
+        if (!av) return 0;
+        av[0] = "RPUSH";
+        av[1] = (char *)e->key;
+        for (size_t i = 0; i < l->len; i++)
+            av[2 + i] = l->items[(l->head + i) % l->cap];
+        emit_resp_cmd(out, av, 2 + (int)l->len);
+        free(av);
+    } else if (e->type == ENTRY_SET) {
+        Set *st = e->set;
+        if (st->len == 0) return 0;
+        char **av = malloc((2 + st->len) * sizeof(char *));
+        if (!av) return 0;
+        av[0] = "SADD";
+        av[1] = (char *)e->key;
+        for (size_t i = 0; i < st->len; i++) av[2 + i] = st->members[i];
+        emit_resp_cmd(out, av, 2 + (int)st->len);
+        free(av);
+    } else if (e->type == ENTRY_HASH) {
+        Hash *h = e->hash;
+        if (h->len == 0) return 0;
+        char **av = malloc((2 + 2 * h->len) * sizeof(char *));
+        if (!av) return 0;
+        av[0] = "HSET";
+        av[1] = (char *)e->key;
+        for (size_t i = 0; i < h->len; i++) {
+            av[2 + 2 * i] = h->fields[i];
+            av[3 + 2 * i] = h->values[i];
+        }
+        emit_resp_cmd(out, av, 2 + (int)(2 * h->len));
+        free(av);
+    }
+    if (ttl > 0) {
+        snprintf(ttlbuf, sizeof(ttlbuf), "%lld", ttl);
+        char *av[] = {"PEXPIRE", (char *)e->key, ttlbuf};
+        emit_resp_cmd(out, av, 3);
+    }
+    return 0;
+}
+
+/* Queue the full sync into a replica client's output buffer. FLUSHALL
+   first: a full sync replaces the replica's dataset, it does not merge
+   into it. The +FULLSYNC marker tells the replica the dump is done. */
+static void send_full_sync(Client *c) {
+    char *flush[] = {"FLUSHALL"};
+    emit_resp_cmd(&c->out, flush, 1);
+    store_foreach(g_store, sync_emit_entry, &c->out);
+    dbuf_simple(&c->out, "FULLSYNC OK");
+    printf("cinder: full sync queued for replica (fd %d, %zu keys)\n",
+           c->fd, store_size(g_store));
+    fflush(stdout);
+}
+
+/* Open the outbound link to a primary. On success the socket is a
+   client with is_repl_link set; SYNC is sent as soon as the connect
+   completes (immediately for localhost, on POLLOUT otherwise). */
+static int replicaof_connect(const char *host, int port, Dbuf *reply) {
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
+        dbuf_error(reply, "could not resolve replication host");
+        if (res) freeaddrinfo(res);
+        return -1;
+    }
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        freeaddrinfo(res);
+        dbuf_error(reply, "could not create replication socket");
+        return -1;
+    }
+    set_nonblocking(fd);
+    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    if (rc < 0 && errno != EINPROGRESS) {
+        close(fd);
+        dbuf_error(reply, "could not connect to primary");
+        return -1;
+    }
+    client_add(fd);
+    /* client_add may have moved the array; find the new client by fd. */
+    Client *link = NULL;
+    for (size_t i = 0; i < g_nclients; i++)
+        if (g_clients[i].fd == fd) { link = &g_clients[i]; break; }
+    if (!link) {
+        close(fd);
+        dbuf_error(reply, "out of memory");
+        return -1;
+    }
+    link->is_repl_link = 1;
+    if (rc == 0) {
+        link->repl_connecting = 0;
+        dbuf_put(&link->out, "SYNC\r\n", 6);
+    } else {
+        link->repl_connecting = 1;
+    }
+    return 0;
+}
+
+/* REPLICAOF host port | REPLICAOF NO ONE. Runs in the main loop (not
+   dispatch): it creates a socket, which dispatch must never do, and
+   it is never AOF-logged. */
+static void handle_replicaof(char **argv, int argc, Dbuf *reply) {
+    if (argc == 3 && strcasecmp(argv[1], "NO") == 0 &&
+        strcasecmp(argv[2], "ONE") == 0) {
+        repl_link_close();
+        dbuf_simple(reply, "OK");
+        return;
+    }
+    if (argc != 3) {
+        dbuf_error(reply, "wrong number of arguments for 'replicaof' command");
+        return;
+    }
+    long long port;
+    if (!parse_ll(argv[2], &port) || port <= 0 || port > 65535) {
+        dbuf_error(reply, "invalid port");
+        return;
+    }
+    repl_link_close(); /* drop any previous link first */
+    if (replicaof_connect(argv[1], (int)port, reply) < 0) return;
+    dbuf_simple(reply, "OK");
 }
 
 /* ---------- AOF replay ---------- */
@@ -695,7 +911,10 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < g_nclients; i++) {
             pfds[i + 1].fd = g_clients[i].fd;
             pfds[i + 1].events = POLLIN;
-            if (g_clients[i].out.len > 0) pfds[i + 1].events |= POLLOUT;
+            /* A link still completing its connect needs POLLOUT so
+               the completion is reported. */
+            if (g_clients[i].out.len > 0 || g_clients[i].repl_connecting)
+                pfds[i + 1].events |= POLLOUT;
             pfds[i + 1].revents = 0;
         }
         int rc = poll(pfds, (nfds_t)nfds, 100);
@@ -717,6 +936,21 @@ int main(int argc, char **argv) {
             Client *c = &g_clients[i];
             short re = pfds[i + 1].revents;
             if (re & (POLLERR | POLLHUP | POLLNVAL)) { c->dead = 1; continue; }
+            if (c->is_repl_link && c->repl_connecting && (re & POLLOUT)) {
+                /* Non-blocking connect finished: check for an error,
+                   then ask the primary for a full sync. */
+                int err = 0;
+                socklen_t elen = sizeof(err);
+                if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 ||
+                    err != 0) {
+                    fprintf(stderr, "cinder: replication link failed: %s\n",
+                            strerror(err ? err : ECONNREFUSED));
+                    c->dead = 1;
+                    continue;
+                }
+                c->repl_connecting = 0;
+                dbuf_put(&c->out, "SYNC\r\n", 6);
+            }
             if (re & POLLOUT && c->out.len > 0) {
                 ssize_t w = write(c->fd, c->out.data, c->out.len);
                 if (w > 0) {
@@ -739,6 +973,24 @@ int main(int argc, char **argv) {
                 size_t off = 0;
                 int shutdown = 0;
                 while (off < c->inlen) {
+                    /* The primary ends a full sync with a +FULLSYNC
+                       marker line, which is not a command; skip it
+                       (and any -ERR line) on the replication link. */
+                    if (c->is_repl_link &&
+                        (c->inbuf[off] == '+' || c->inbuf[off] == '-')) {
+                        size_t j = off;
+                        int found = 0;
+                        while (j + 1 < c->inlen) {
+                            if (c->inbuf[j] == '\r' && c->inbuf[j + 1] == '\n') {
+                                found = 1;
+                                break;
+                            }
+                            j++;
+                        }
+                        if (!found) break; /* need more data */
+                        off = j + 2;
+                        continue;
+                    }
                     char **cargv = NULL;
                     int cargc = 0;
                     size_t consumed = 0;
@@ -751,13 +1003,56 @@ int main(int argc, char **argv) {
                         break;
                     }
                     g_commands_processed++;
-                    Dbuf reply = {0};
-                    int drc = dispatch(cargv, cargc, &reply);
-                    if (reply.len > 0) dbuf_put(&c->out, reply.data, reply.len);
-                    free(reply.data);
-                    if (drc == 1 && !g_replaying) aof_append(cargv, cargc);
-                    if (drc == 2) c->dead = 1;
-                    if (drc == 3) shutdown = 1;
+                    const char *raw = c->inbuf + off;
+                    size_t rawlen = consumed;
+                    if (c->is_repl_link) {
+                        /* A command streamed from the primary: apply
+                           it, log it to our own AOF, and forward it
+                           to our own replicas. The reply is discarded;
+                           the primary never reads it. QUIT/SHUTDOWN
+                           from a primary are ignored. */
+                        Dbuf reply = {0};
+                        int drc = dispatch(cargv, cargc, &reply);
+                        free(reply.data);
+                        if (drc == 1) {
+                            aof_append(cargv, cargc);
+                            forward_to_replicas(raw, rawlen);
+                        }
+                    } else if (strcasecmp(cargv[0], "SYNC") == 0 && cargc == 1) {
+                        /* A replica asking for a full sync. */
+                        c->is_replica = 1;
+                        send_full_sync(c);
+                    } else if (strcasecmp(cargv[0], "REPLICAOF") == 0) {
+                        Dbuf reply = {0};
+                        handle_replicaof(cargv, cargc, &reply);
+                        if (reply.len > 0) dbuf_put(&c->out, reply.data, reply.len);
+                        free(reply.data);
+                        /* handle_replicaof may add a client, which
+                           can move the client array. */
+                        c = &g_clients[i];
+                    } else if (c->is_replica) {
+                        /* A replica connection is read-only; it only
+                           ever sends PING to check the link. */
+                        if (strcasecmp(cargv[0], "PING") == 0) {
+                            Dbuf reply = {0};
+                            dispatch(cargv, cargc, &reply);
+                            if (reply.len > 0) dbuf_put(&c->out, reply.data, reply.len);
+                            free(reply.data);
+                        } else {
+                            dbuf_error(&c->out, "replica connection is read-only");
+                        }
+                    } else {
+                        Dbuf reply = {0};
+                        int drc = dispatch(cargv, cargc, &reply);
+                        if (reply.len > 0) dbuf_put(&c->out, reply.data, reply.len);
+                        free(reply.data);
+                        if (drc == 1 && !g_replaying) {
+                            aof_append(cargv, cargc);
+                            forward_to_replicas(raw, rawlen);
+                        }
+                        if (drc == 2) c->dead = 1;
+                        if (drc == 3) shutdown = 1;
+                    }
                     for (int k = 0; k < cargc; k++) free(cargv[k]);
                     free(cargv);
                     off += consumed;
