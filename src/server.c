@@ -31,7 +31,7 @@
 #include "resp.h"
 #include "store.h"
 
-#define CINDER_VERSION "0.8.0"
+#define CINDER_VERSION "0.9.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -41,16 +41,30 @@ static long long g_commands_processed;
 static size_t g_max_entries; /* 0 = unlimited */
 static int g_replaying;
 
-/* Replication offsets. The primary counts every byte of the live
-   write stream it forwards (g_master_repl_offset) under its run id
-   (g_replid, fresh per process); a replica learns the primary's run
-   id and offset from the +FULLRESYNC line and counts the stream bytes
-   it applies (g_slave_repl_offset). There is no backlog yet, so a
-   PSYNC always answers FULLRESYNC and takes a full sync. */
+/* Replication offsets and backlog. The primary counts every byte of
+   the live write stream it forwards (g_master_repl_offset) under its
+   run id (g_replid, fresh per process); a replica learns the primary's
+   run id and offset from the +FULLRESYNC line and counts the stream
+   bytes it applies (g_slave_repl_offset). The backlog is a ring buffer
+   holding the most recent bytes of that stream (default the last
+   1 MiB, --repl-backlog-size), so a PSYNC whose offset is still inside
+   it gets a partial resync (+CONTINUE plus only the missed bytes)
+   instead of a full sync. */
 static char g_replid[41];
 static long long g_master_repl_offset;
 static char g_primary_replid[41];
 static long long g_slave_repl_offset;
+/* The backlog records the exact byte stream g_master_repl_offset
+   counts, whether or not a replica is currently attached, so a replica
+   that drops and reconnects can resume from any offset still inside
+   it. g_backlog_start is the stream offset of the oldest byte held
+   (g_backlog_head); bytes older than that have dropped off the front
+   and can only be had with a full sync. */
+static char *g_backlog;
+static size_t g_backlog_cap = 1048576; /* 1 MiB default */
+static size_t g_backlog_len;
+static size_t g_backlog_head;
+static long long g_backlog_start;
 static char g_master_host[256];
 static long long g_master_port;
 static volatile sig_atomic_t g_running = 1;
@@ -512,6 +526,10 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             dbuf_putf(&info, "master_repl_offset:%lld\r\n", g_master_repl_offset);
         }
         dbuf_putf(&info, "connected_replicas:%zu\r\n", repl_connected_replicas());
+        dbuf_putf(&info, "repl_backlog_active:%d\r\n", g_backlog_cap > 0 ? 1 : 0);
+        dbuf_putf(&info, "repl_backlog_size:%zu\r\n", g_backlog_cap);
+        dbuf_putf(&info, "repl_backlog_first_byte_offset:%lld\r\n", g_backlog_start);
+        dbuf_putf(&info, "repl_backlog_histlen:%zu\r\n", g_backlog_len);
         repl_info_replicas(&info);
         dbuf_bulk(reply, info.data ? info.data : "", info.len);
         free(info.data);
@@ -600,9 +618,12 @@ static int set_nonblocking(int fd) {
  * arrays) followed by a +FULLSYNC marker. After that, every mutating
  * command from any other client is forwarded to it verbatim.
  * A client may instead send PSYNC <replid> <offset> to resume from a
- * stream offset. There is no backlog yet, so the answer is always
- * +FULLRESYNC <replid> <offset> followed by a full sync; the
- * handshake is real and the fallback is honest.
+ * stream offset. If it names this server's run id and the offset is
+ * still inside the replication backlog, the answer is
+ * +CONTINUE <replid> <offset> followed by only the missed bytes;
+ * otherwise it is +FULLRESYNC <replid> <offset> followed by a full
+ * sync. The backlog holds the most recent bytes of the live write
+ * stream, so a short disconnect resumes instead of re-syncing.
  * Offsets: the primary counts every byte of the live write stream it
  * forwards (master_repl_offset) and tracks, per replica, the offset
  * of the last byte queued to it. A replica learns the primary's run
@@ -639,12 +660,73 @@ static void repl_link_close(void) {
     if (link) link->dead = 1;
 }
 
+/* Record raw stream bytes in the backlog. The bytes cover offsets
+   [g_master_repl_offset, g_master_repl_offset + n); the caller bumps
+   the offset afterwards. When the buffer is full the oldest bytes drop
+   off the front and g_backlog_start advances past them. */
+static void backlog_append(const char *data, size_t n) {
+    if (g_backlog_cap == 0 || !g_backlog || n == 0) return;
+    if (g_backlog_len == 0)
+        g_backlog_start = g_master_repl_offset;
+    if (n >= g_backlog_cap) {
+        /* Only the tail of this one command fits; everything older
+           is gone. */
+        memcpy(g_backlog, data + (n - g_backlog_cap), g_backlog_cap);
+        g_backlog_head = 0;
+        g_backlog_len = g_backlog_cap;
+        g_backlog_start = g_master_repl_offset + (long long)(n - g_backlog_cap);
+        return;
+    }
+    if (g_backlog_len + n > g_backlog_cap) {
+        size_t drop = g_backlog_len + n - g_backlog_cap;
+        g_backlog_head = (g_backlog_head + drop) % g_backlog_cap;
+        g_backlog_len -= drop;
+        g_backlog_start += (long long)drop;
+    }
+    size_t tail = (g_backlog_head + g_backlog_len) % g_backlog_cap;
+    size_t first = g_backlog_cap - tail;
+    if (first >= n) {
+        memcpy(g_backlog + tail, data, n);
+    } else {
+        memcpy(g_backlog + tail, data, first);
+        memcpy(g_backlog, data + first, n - first);
+    }
+    g_backlog_len += n;
+}
+
+/* True when stream offset `off` is still in the backlog: the bytes
+   from `off` to the current master offset are all held. An offset of
+   exactly the master offset is in the backlog too (nothing missed). */
+static int backlog_contains(long long off) {
+    return g_backlog_cap > 0 && g_backlog != NULL &&
+           off >= g_backlog_start && off <= g_master_repl_offset;
+}
+
+/* Queue the backlog bytes from stream offset `from` (inclusive) to
+   the current master offset into a replica's output buffer. The
+   caller checks backlog_contains(from) first, and sends the +CONTINUE
+   line before calling this, so the line precedes the stream bytes. */
+static void backlog_send(Client *c, long long from) {
+    size_t n = (size_t)(g_master_repl_offset - from);
+    if (n == 0) return;
+    size_t pos = (g_backlog_head + (size_t)(from - g_backlog_start)) % g_backlog_cap;
+    size_t first = g_backlog_cap - pos;
+    if (first >= n) {
+        dbuf_put(&c->out, g_backlog + pos, n);
+    } else {
+        dbuf_put(&c->out, g_backlog + pos, first);
+        dbuf_put(&c->out, g_backlog, n - first);
+    }
+}
+
 /* Forward one raw command (as received, RESP array or inline) to
    every connected replica. The offset counts stream bytes whether or
    not a replica is currently attached, like Redis's
    master_repl_offset; each replica records the offset of the last
-   byte queued to it. */
+   byte queued to it. The backlog records the same bytes, so a replica
+   that drops can resume from any offset still inside it. */
 static void forward_to_replicas(const char *raw, size_t rawlen) {
+    backlog_append(raw, rawlen);
     g_master_repl_offset += (long long)rawlen;
     for (size_t i = 0; i < g_nclients; i++) {
         if (g_clients[i].is_replica) {
@@ -756,9 +838,9 @@ static void send_full_sync(Client *c) {
 }
 
 /* Ask the primary for a sync, resuming from the offset we already
-   have when we know this primary's run id. The primary has no backlog
-   yet, so it always answers FULLRESYNC and sends a full sync; the
-   handshake is in place for a real partial resync later. */
+   have when we know this primary's run id. The primary answers
+   +CONTINUE and streams only the missed bytes when the offset is
+   still in its backlog, +FULLRESYNC and a full sync otherwise. */
 static void send_psync_request(Client *link) {
     if (g_primary_replid[0])
         dbuf_putf(&link->out, "PSYNC %s %lld\r\n",
@@ -917,10 +999,13 @@ static void gen_replid(char out[41]) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [--port N] [--data-dir DIR] [--max-entries N] [--aof-fsync POLICY]\n"
+        "       [--repl-backlog-size N]\n"
         "  --port        TCP port to listen on (default 6379)\n"
         "  --data-dir    directory for the append-only log (default ./data)\n"
         "  --max-entries evict approximately-LRU keys past this many (default 0 = unlimited)\n"
-        "  --aof-fsync   AOF fsync policy: always (default) or everysec\n",
+        "  --aof-fsync   AOF fsync policy: always (default) or everysec\n"
+        "  --repl-backlog-size bytes of recent replication stream kept for\n"
+        "                partial resync (default 1048576, 0 disables it)\n",
         prog);
 }
 
@@ -932,11 +1017,12 @@ int main(int argc, char **argv) {
         {"data-dir", required_argument, NULL, 'd'},
         {"max-entries", required_argument, NULL, 'm'},
         {"aof-fsync", required_argument, NULL, 'f'},
+        {"repl-backlog-size", required_argument, NULL, 'b'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:d:m:f:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:m:f:b:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': port = atoi(optarg); break;
         case 'd': data_dir = optarg; break;
@@ -948,6 +1034,15 @@ int main(int argc, char **argv) {
                 return 1;
             }
             break;
+        case 'b': {
+            long long n = atoll(optarg);
+            if (n < 0) {
+                fprintf(stderr, "cinder: invalid replication backlog size %s\n", optarg);
+                return 1;
+            }
+            g_backlog_cap = (size_t)n;
+            break;
+        }
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 1;
         }
@@ -959,6 +1054,17 @@ int main(int argc, char **argv) {
 
     srand((unsigned)(now_ms() ^ (long long)getpid()));
     gen_replid(g_replid);
+    /* The replication backlog is allocated once, up front; a failed
+       allocation disables partial resync rather than failing the start. */
+    if (g_backlog_cap > 0) {
+        g_backlog = malloc(g_backlog_cap);
+        if (!g_backlog) {
+            fprintf(stderr,
+                    "cinder: warning: cannot allocate %zu-byte replication backlog; partial resync disabled\n",
+                    g_backlog_cap);
+            g_backlog_cap = 0;
+        }
+    }
     g_store = store_new();
     if (!g_store) {
         fprintf(stderr, "cinder: out of memory\n");
@@ -1015,8 +1121,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     set_nonblocking(listener);
-    printf("cinder %s listening on port %d (data dir %s, max entries %zu, aof fsync %s)\n",
-           CINDER_VERSION, port, data_dir, g_max_entries, aof_policy_name());
+    printf("cinder %s listening on port %d (data dir %s, max entries %zu, aof fsync %s, repl backlog %zu bytes)\n",
+           CINDER_VERSION, port, data_dir, g_max_entries, aof_policy_name(), g_backlog_cap);
     fflush(stdout);
 
     long long loop = 0;
@@ -1128,6 +1234,27 @@ int main(int argc, char **argv) {
                                     g_slave_repl_offset = o;
                                     c->repl_syncing = 1;
                                 }
+                            } else if (linelen >= 10 &&
+                                       memcmp(c->inbuf + off, "+CONTINUE ", 10) == 0 &&
+                                       linelen < 100) {
+                                /* Partial resync: the stream resumes
+                                   at the offset we asked for, so the
+                                   bytes that follow are live stream,
+                                   not a dump. Take the offset from
+                                   the line and stay out of syncing
+                                   mode, so each applied command
+                                   advances the slave offset. */
+                                char line[100];
+                                char rid[41];
+                                long long o;
+                                memcpy(line, c->inbuf + off, linelen);
+                                line[linelen] = '\0';
+                                if (sscanf(line + 10, "%40s %lld", rid, &o) == 2) {
+                                    snprintf(g_primary_replid,
+                                             sizeof(g_primary_replid), "%s", rid);
+                                    g_slave_repl_offset = o;
+                                }
+                                c->repl_syncing = 0;
                             } else if (linelen >= 9 &&
                                        memcmp(c->inbuf + off, "+FULLSYNC", 9) == 0) {
                                 c->repl_syncing = 0;
@@ -1155,14 +1282,23 @@ int main(int argc, char **argv) {
                            it, log it to our own AOF, and forward it
                            to our own replicas. The reply is discarded;
                            the primary never reads it. QUIT/SHUTDOWN
-                           from a primary are ignored. */
+                           from a primary are ignored. The slave offset
+                           is a stream position, so it advances for
+                           every byte received on the link, even a
+                           command that turns out to be a no-op locally
+                           (a DEL of an already-expired key, say):
+                           otherwise the offset would lag the stream
+                           and a later PSYNC would replay commands
+                           already applied. Dump bytes are the
+                           exception: while repl_syncing they are the
+                           snapshot, not the stream. */
                         Dbuf reply = {0};
                         int drc = dispatch(cargv, cargc, &reply);
                         free(reply.data);
+                        if (!c->repl_syncing)
+                            g_slave_repl_offset += (long long)rawlen;
                         if (drc == 1) {
                             aof_append(cargv, cargc);
-                            if (!c->repl_syncing)
-                                g_slave_repl_offset += (long long)rawlen;
                             forward_to_replicas(raw, rawlen);
                         }
                     } else if (strcasecmp(cargv[0], "SYNC") == 0 && cargc == 1) {
@@ -1171,12 +1307,22 @@ int main(int argc, char **argv) {
                         send_full_sync(c);
                     } else if (strcasecmp(cargv[0], "PSYNC") == 0 && cargc == 3) {
                         /* A replica asking to resume from an offset.
-                           There is no backlog yet, so this is always
-                           a full resync: say so, then sync. */
+                           Same run id and an offset still in the
+                           backlog: partial resync, stream only the
+                           missed bytes. Anything else: full resync. */
+                        long long want = -1;
+                        parse_ll(cargv[2], &want);
                         c->is_replica = 1;
-                        dbuf_putf(&c->out, "+FULLRESYNC %s %lld\r\n",
-                                  g_replid, g_master_repl_offset);
-                        send_full_sync(c);
+                        if (strcasecmp(cargv[1], g_replid) == 0 &&
+                            backlog_contains(want)) {
+                            dbuf_putf(&c->out, "+CONTINUE %s %lld\r\n",
+                                      g_replid, want);
+                            backlog_send(c, want);
+                        } else {
+                            dbuf_putf(&c->out, "+FULLRESYNC %s %lld\r\n",
+                                      g_replid, g_master_repl_offset);
+                            send_full_sync(c);
+                        }
                     } else if (strcasecmp(cargv[0], "REPLICAOF") == 0) {
                         Dbuf reply = {0};
                         handle_replicaof(cargv, cargc, &reply);
@@ -1252,6 +1398,7 @@ int main(int argc, char **argv) {
         free(g_clients[i].out.data);
     }
     free(g_clients);
+    free(g_backlog);
     close(listener);
     aof_close();
     store_free(g_store);

@@ -6,7 +6,7 @@ sets and hashes with TTLs, approximate LRU eviction, and an append-only file for
 durability. No dependencies beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.8.0.
+Version 0.9.0.
 
 ## Why
 
@@ -70,7 +70,7 @@ OK
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
 | `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` writes a snapshot of the dataset to `dump.rdb` and forces the AOF to disk |
 | `SYNC` | Ask this server for a full sync: it marks the connection a replica, streams a rebuild of the whole dataset (one command per key, with TTLs), then streams every later write live |
-| `PSYNC replid offset` | Ask to resume replication from a stream offset; there is no backlog yet, so the primary always answers `+FULLRESYNC <replid> <offset>` and sends a full sync |
+| `PSYNC replid offset` | Ask to resume replication from a stream offset; when the replid matches this server's run id and the offset is still in the replication backlog (the last 1 MB of the write stream by default, `--repl-backlog-size`), the primary answers `+CONTINUE <replid> <offset>` and streams only the missed bytes, otherwise `+FULLRESYNC <replid> <offset>` and a full sync |
 | `REPLICAOF host port`, `REPLICAOF NO ONE` | Make this server a replica of `host:port` (PSYNC, then streamed writes, applied and AOF-logged locally); `NO ONE` detaches it |
 | `QUIT`, `SHUTDOWN` | Close connection / stop the server |
 
@@ -131,9 +131,17 @@ src/
   a replica learns the primary's run id and offset from the `+FULLRESYNC`
   line and counts the stream bytes it applies (`slave_repl_offset`), so a
   caught-up replica's slave offset equals the primary's master offset.
-  There is no replication backlog yet: `PSYNC` always answers `+FULLRESYNC`
-  and takes a full sync, and there is no failover — a replica that drops
-  must `REPLICAOF` again.
+  The primary also keeps a replication backlog — a ring buffer of the
+  most recent bytes of the write stream (the last 1 MB by default,
+  `--repl-backlog-size`, `0` disables it) — so a `PSYNC` that names the
+  primary's run id with an offset still inside the backlog gets a
+  partial resync (`+CONTINUE` plus only the missed bytes) instead of
+  a full sync; an unknown run id or an offset that has aged out of the
+  backlog falls back to `+FULLRESYNC` and a full sync. The replica's
+  slave offset is a stream position: it advances for every byte
+  received on the replication link, even a command that turns out to
+  be a no-op locally, so a later `PSYNC` never replays a command twice.
+  There is no failover — a replica that drops must `REPLICAOF` again.
 
 ## Benchmarks
 
@@ -184,7 +192,14 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # replica's slave_repl_offset catches up to it and reports
             # the same run id, INFO lists the replica with its offset,
             # and PSYNC answers +FULLRESYNC with the run id and offset
-            # then streams a full sync)
+            # then streams a full sync), and partial resync checks (a
+            # replica that drops and reconnects while its offset is
+            # still in the primary's backlog replays only the missed
+            # writes and keeps a key written directly to it, proving
+            # no FLUSHALL ran; with a 128-byte backlog, ten 70-byte
+            # writes push the offset out of the backlog, so the
+            # reconnect falls back to a full resync and the local-only
+            # key is wiped)
 ```
 
 ## Roadmap
@@ -197,8 +212,10 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
 - [x] Replication (primary/replica over RESP)
 - [x] Replication offsets and `PSYNC` handshake (`master_repl_offset`,
       per-replica offsets, run id; always a full resync for now)
-- [ ] Replication backlog: keep recent stream bytes so `PSYNC` can
-      resume from an offset instead of full-syncing
+- [x] Replication backlog: keep recent stream bytes so `PSYNC` can
+      resume from an offset instead of full-syncing (1 MB ring buffer
+      by default, `--repl-backlog-size`; `+CONTINUE` partial resync,
+      `+FULLRESYNC` fallback when the offset aged out)
 - [ ] Failover: promote a replica to primary
 - [ ] `epoll` backend and a thread pool for the event loop
 - [ ] Benchmarks against real Redis on the same hardware

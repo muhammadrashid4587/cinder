@@ -446,6 +446,10 @@ def main():
         check("repl INFO master_replid 40 hex",
               len(replid or "") == 40 and
               all(ch in "0123456789abcdef" for ch in replid), True)
+        check("repl INFO backlog active", "repl_backlog_active:1" in pinfo, True)
+        check("repl INFO backlog size", "repl_backlog_size:1048576" in pinfo, True)
+        check("repl INFO backlog histlen",
+              int(info_field(pinfo, "repl_backlog_histlen")) > 0, True)
         off_before = int(info_field(pinfo, "master_repl_offset"))
         check("repl offset SET", p.cmd("SET", "offkey", "offval"), "OK")
         off_after = int(info_field(p.cmd("INFO"), "master_repl_offset"))
@@ -465,9 +469,8 @@ def main():
         check("repl INFO replica line",
               "replica0:ip=127.0.0.1,port=" in p.cmd("INFO") and
               f",offset={off_after}" in p.cmd("INFO"), True)
-        # PSYNC: the primary answers +FULLRESYNC with its run id and
-        # offset, then streams a full sync; even a resume offset gets
-        # a full sync, because there is no backlog yet.
+        # PSYNC with an unknown run id ("?") answers +FULLRESYNC with
+        # the primary's run id and offset, then streams a full sync.
         ps = Client(PORT)
         ps.s.sendall(b"PSYNC ? -1\r\n")
         line = ps._read_line()
@@ -493,6 +496,41 @@ def main():
                 break
             time.sleep(0.1)
         check("repl INFO replicas back to 1", back_to_one, True)
+        # Partial resync: a replica that drops and reconnects while its
+        # offset is still in the primary's backlog resumes with
+        # +CONTINUE and replays only the missed writes. No FLUSHALL
+        # runs, so a key written directly to the replica survives —
+        # that is what distinguishes a partial resync from a full one.
+        check("partial local write", r.cmd("SET", "localonly", "keepme"), "OK")
+        check("partial local read", r.cmd("GET", "localonly"), "keepme")
+        check("partial detach", r.cmd("REPLICAOF", "NO", "ONE"), "OK")
+        check("partial missed SET 1", p.cmd("SET", "missed1", "one"), "OK")
+        check("partial missed SET 2", p.cmd("SET", "missed2", "two"), "OK")
+        off_missed = int(info_field(p.cmd("INFO"), "master_repl_offset"))
+        check("partial reattach", r.cmd("REPLICAOF", "127.0.0.1", "7777"), "OK")
+        deadline = time.time() + 5
+        resumed = False
+        while time.time() < deadline:
+            try:
+                if (r.cmd("GET", "missed1") == "one" and
+                        r.cmd("GET", "missed2") == "two" and
+                        r.cmd("GET", "localonly") == "keepme"):
+                    resumed = True
+                    break
+            except (EOFError, OSError):
+                pass
+            time.sleep(0.1)
+        check("partial resync replays missed writes", resumed, True)
+        check("partial resync keeps local-only key",
+              r.cmd("GET", "localonly"), "keepme")
+        deadline = time.time() + 5
+        caught_up = False
+        while time.time() < deadline:
+            if info_field(r.cmd("INFO"), "slave_repl_offset") == str(off_missed):
+                caught_up = True
+                break
+            time.sleep(0.1)
+        check("partial resync slave offset catches up", caught_up, True)
         # Detach: writes stop flowing, and the replica keeps its data.
         check("repl REPLICAOF NO ONE", r.cmd("REPLICAOF", "NO", "ONE"), "OK")
         check("repl INFO back to primary", "role:primary" in r.cmd("INFO"), True)
@@ -533,6 +571,72 @@ def main():
         if replica.poll() is None:
             replica.terminate()
             replica.wait(timeout=5)
+
+    # Backlog fallback: with a tiny backlog, a replica whose offset has
+    # aged out of it gets a full resync instead — the FLUSHALL wipes a
+    # key written directly to the replica, and the dump rebuilds the
+    # whole dataset.
+    fb_primary_dir = "/tmp/cinder-smoke-fallback-primary"
+    fb_replica_dir = "/tmp/cinder-smoke-fallback-replica"
+    fb_primary = start_server(["--repl-backlog-size", "128"],
+                              port=7779, data_dir=fb_primary_dir)
+    fb_replica = None
+    try:
+        fp = Client(7779)
+        check("fallback INFO backlog size",
+              "repl_backlog_size:128" in fp.cmd("INFO"), True)
+        check("fallback SET base", fp.cmd("SET", "fbkey", "base"), "OK")
+        fb_replica = start_server(port=7780, data_dir=fb_replica_dir)
+        fr = Client(7780)
+        check("fallback REPLICAOF", fr.cmd("REPLICAOF", "127.0.0.1", "7779"), "OK")
+        deadline = time.time() + 5
+        fb_synced = False
+        while time.time() < deadline:
+            try:
+                if fr.cmd("GET", "fbkey") == "base":
+                    fb_synced = True
+                    break
+            except (EOFError, OSError):
+                pass
+            time.sleep(0.1)
+        check("fallback full sync arrived", fb_synced, True)
+        check("fallback local write", fr.cmd("SET", "fblocal", "keepme"), "OK")
+        check("fallback detach", fr.cmd("REPLICAOF", "NO", "ONE"), "OK")
+        # Ten 70-byte SETs push the replica's offset out of the
+        # 128-byte backlog.
+        for i in range(10):
+            fp.cmd("SET", f"pad{i}", "x" * 40)
+        check("fallback reattach", fr.cmd("REPLICAOF", "127.0.0.1", "7779"), "OK")
+        deadline = time.time() + 5
+        fb_full = False
+        while time.time() < deadline:
+            try:
+                if (fr.cmd("GET", "pad9") == "x" * 40 and
+                        fr.cmd("GET", "fblocal") is None):
+                    fb_full = True
+                    break
+            except (EOFError, OSError):
+                pass
+            time.sleep(0.1)
+        check("fallback full resync replays all writes", fb_full, True)
+        check("fallback local key wiped by full sync",
+              fr.cmd("GET", "fblocal"), None)
+        check("fallback base key present", fr.cmd("GET", "fbkey"), "base")
+        fr.cmd("SHUTDOWN")
+        fr.close()
+        fb_replica.wait(timeout=5)
+        fb_replica = None
+        fp.cmd("SHUTDOWN")
+        fp.close()
+        fb_primary.wait(timeout=5)
+        fb_primary = None
+    finally:
+        if fb_replica is not None and fb_replica.poll() is None:
+            fb_replica.terminate()
+            fb_replica.wait(timeout=5)
+        if fb_primary is not None and fb_primary.poll() is None:
+            fb_primary.terminate()
+            fb_primary.wait(timeout=5)
 
     # Unknown policy is a startup error, not a silent default.
     bad = subprocess.run(
