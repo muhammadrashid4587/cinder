@@ -40,10 +40,88 @@ Store *store_new(void) {
     return s;
 }
 
+static void list_free(List *l) {
+    if (!l) return;
+    for (size_t i = 0; i < l->len; i++)
+        free(l->items[(l->head + i) % l->cap]);
+    free(l->items);
+    free(l);
+}
+
 static void entry_free(Entry *e) {
     free(e->key);
-    free(e->value);
+    if (e->type == ENTRY_LIST) list_free(e->list);
+    else free(e->value);
     free(e);
+}
+
+static List *list_new(void) {
+    List *l = calloc(1, sizeof(List));
+    if (!l) return NULL;
+    l->cap = 8;
+    l->items = calloc(l->cap, sizeof(char *));
+    if (!l->items) {
+        free(l);
+        return NULL;
+    }
+    return l;
+}
+
+/* Double capacity, re-laying elements out from index 0. */
+static int list_grow(List *l) {
+    size_t ncap = l->cap * 2;
+    char **ni = calloc(ncap, sizeof(char *));
+    if (!ni) return 0;
+    for (size_t i = 0; i < l->len; i++)
+        ni[i] = l->items[(l->head + i) % l->cap];
+    free(l->items);
+    l->items = ni;
+    l->cap = ncap;
+    l->head = 0;
+    return 1;
+}
+
+static int list_push_head(List *l, const char *elem) {
+    char *e = strdup(elem);
+    if (!e) return 0;
+    if (l->len == l->cap && !list_grow(l)) {
+        free(e);
+        return 0;
+    }
+    l->head = (l->head + l->cap - 1) % l->cap;
+    l->items[l->head] = e;
+    l->len++;
+    return 1;
+}
+
+static int list_push_tail(List *l, const char *elem) {
+    char *e = strdup(elem);
+    if (!e) return 0;
+    if (l->len == l->cap && !list_grow(l)) {
+        free(e);
+        return 0;
+    }
+    l->items[(l->head + l->len) % l->cap] = e;
+    l->len++;
+    return 1;
+}
+
+static char *list_pop_head(List *l) {
+    if (l->len == 0) return NULL;
+    char *e = l->items[l->head];
+    l->items[l->head] = NULL;
+    l->head = (l->head + 1) % l->cap;
+    l->len--;
+    return e;
+}
+
+static char *list_pop_tail(List *l) {
+    if (l->len == 0) return NULL;
+    size_t idx = (l->head + l->len - 1) % l->cap;
+    char *e = l->items[idx];
+    l->items[idx] = NULL;
+    l->len--;
+    return e;
 }
 
 void store_free(Store *s) {
@@ -99,6 +177,12 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
     if (e) {
         char *nv = strdup(value);
         if (!nv) return 0;
+        if (e->type == ENTRY_LIST) {
+            /* SET replaces the key wholesale, whatever it held. */
+            list_free(e->list);
+            e->list = NULL;
+            e->type = ENTRY_STRING;
+        }
         free(e->value);
         e->value = nv;
         e->expire_at = expire_at;
@@ -115,6 +199,7 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
         entry_free(e);
         return 0;
     }
+    e->type = ENTRY_STRING;
     e->expire_at = expire_at;
     e->last_access = ++s->clock;
     size_t idx = hash_key(key) % s->cap;
@@ -126,7 +211,7 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
 
 char *store_get(Store *s, const char *key) {
     Entry *e = store_find(s, key, NULL);
-    if (!e) return NULL;
+    if (!e || e->type != ENTRY_STRING) return NULL;
     e->last_access = ++s->clock;
     return strdup(e->value);
 }
@@ -284,4 +369,127 @@ size_t store_evict_lru(Store *s, size_t max_entries) {
         evicted++;
     }
     return evicted;
+}
+
+/* ---------- lists ---------- */
+
+int store_type(Store *s, const char *key) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    return e->type == ENTRY_LIST ? 2 : 1;
+}
+
+/* Push onto an existing list, or create the list when the key is missing. */
+static long long store_list_push(Store *s, const char *key, const char *elem,
+                                 int at_head) {
+    Entry *e = store_find(s, key, NULL);
+    if (e) {
+        if (e->type != ENTRY_LIST) return -1;
+        if (!(at_head ? list_push_head(e->list, elem)
+                      : list_push_tail(e->list, elem)))
+            return -2;
+        e->last_access = ++s->clock;
+        return (long long)e->list->len;
+    }
+    if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+        store_resize(s);
+    e = calloc(1, sizeof(Entry));
+    if (!e) return -2;
+    e->key = strdup(key);
+    e->list = list_new();
+    if (!e->key || !e->list) {
+        entry_free(e);
+        return -2;
+    }
+    e->type = ENTRY_LIST;
+    e->expire_at = -1;
+    e->last_access = ++s->clock;
+    if (!(at_head ? list_push_head(e->list, elem)
+                  : list_push_tail(e->list, elem))) {
+        entry_free(e);
+        return -2;
+    }
+    size_t idx = hash_key(key) % s->cap;
+    e->next = s->buckets[idx];
+    s->buckets[idx] = e;
+    s->count++;
+    return 1;
+}
+
+long long store_lpush(Store *s, const char *key, const char *elem) {
+    return store_list_push(s, key, elem, 1);
+}
+
+long long store_rpush(Store *s, const char *key, const char *elem) {
+    return store_list_push(s, key, elem, 0);
+}
+
+static char *store_list_pop(Store *s, const char *key, int *wrongtype,
+                            int from_head) {
+    if (wrongtype) *wrongtype = 0;
+    Entry **pp = NULL;
+    Entry *e = store_find(s, key, &pp);
+    if (!e) return NULL;
+    if (e->type != ENTRY_LIST) {
+        if (wrongtype) *wrongtype = 1;
+        return NULL;
+    }
+    char *el = from_head ? list_pop_head(e->list) : list_pop_tail(e->list);
+    if (!el) return NULL;
+    if (e->list->len == 0) {
+        /* A list emptied by popping is gone, as in Redis. */
+        *pp = e->next;
+        entry_free(e);
+        s->count--;
+    } else {
+        e->last_access = ++s->clock;
+    }
+    return el;
+}
+
+char *store_lpop(Store *s, const char *key, int *wrongtype) {
+    return store_list_pop(s, key, wrongtype, 1);
+}
+
+char *store_rpop(Store *s, const char *key, int *wrongtype) {
+    return store_list_pop(s, key, wrongtype, 0);
+}
+
+long long store_llen(Store *s, const char *key) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_LIST) return -1;
+    e->last_access = ++s->clock;
+    return (long long)e->list->len;
+}
+
+int store_lrange(Store *s, const char *key, long long start, long long stop,
+                 char ***out, size_t *n_out) {
+    *out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_LIST) return -1;
+    e->last_access = ++s->clock;
+    List *l = e->list;
+    long long len = (long long)l->len;
+    if (start < 0) start += len;
+    if (stop < 0) stop += len;
+    if (start < 0) start = 0;
+    if (stop >= len) stop = len - 1;
+    if (start > stop || start >= len) return 0;
+    size_t n = (size_t)(stop - start + 1);
+    char **res = malloc(n * sizeof(char *));
+    if (!res) return -2;
+    for (size_t i = 0; i < n; i++) {
+        res[i] = strdup(l->items[(l->head + (size_t)start + i) % l->cap]);
+        if (!res[i]) {
+            for (size_t j = 0; j < i; j++) free(res[j]);
+            free(res);
+            return -2;
+        }
+    }
+    *out = res;
+    *n_out = n;
+    return 0;
 }

@@ -148,6 +148,40 @@ def main():
         check("FLUSHALL", c.cmd("FLUSHALL"), "OK")
         check("DBSIZE after flush", c.cmd("DBSIZE"), 0)
         check("SET after flush", c.cmd("SET", "after", "flush"), "OK")
+        # Lists: push/pop at both ends, length, range, wrong type, TTL.
+        check("RPUSH", c.cmd("RPUSH", "mylist", "a", "b", "c"), 3)
+        check("LLEN", c.cmd("LLEN", "mylist"), 3)
+        check("LRANGE all", c.cmd("LRANGE", "mylist", "0", "-1"), ["a", "b", "c"])
+        check("LPUSH", c.cmd("LPUSH", "mylist", "z"), 4)
+        check("LRANGE after LPUSH", c.cmd("LRANGE", "mylist", "0", "-1"), ["z", "a", "b", "c"])
+        check("LRANGE neg", c.cmd("LRANGE", "mylist", "-2", "-1"), ["b", "c"])
+        check("LRANGE empty range", c.cmd("LRANGE", "mylist", "2", "1"), [])
+        check("LRANGE out of range", c.cmd("LRANGE", "mylist", "10", "20"), [])
+        check("LPOP", c.cmd("LPOP", "mylist"), "z")
+        check("RPOP", c.cmd("RPOP", "mylist"), "c")
+        check("LLEN after pops", c.cmd("LLEN", "mylist"), 2)
+        check("LPOP missing", c.cmd("LPOP", "ghostlist"), None)
+        check("RPOP missing", c.cmd("RPOP", "ghostlist"), None)
+        check("LLEN missing", c.cmd("LLEN", "ghostlist"), 0)
+        check("LRANGE missing", c.cmd("LRANGE", "ghostlist", "0", "-1"), [])
+        wrongtype = ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value")
+        check("LPUSH wrongtype", c.cmd("LPUSH", "after", "x"), wrongtype)
+        check("RPUSH wrongtype", c.cmd("RPUSH", "after", "x"), wrongtype)
+        check("LPOP wrongtype", c.cmd("LPOP", "after"), wrongtype)
+        check("LLEN wrongtype", c.cmd("LLEN", "after"), wrongtype)
+        check("LRANGE wrongtype", c.cmd("LRANGE", "after", "0", "-1"), wrongtype)
+        check("GET list wrongtype", c.cmd("GET", "mylist"), wrongtype)
+        check("INCR list wrongtype", c.cmd("INCR", "mylist"), wrongtype)
+        check("LPUSH ttl list", c.cmd("LPUSH", "blinklist", "a"), 1)
+        check("PEXPIRE list", c.cmd("PEXPIRE", "blinklist", "50"), 1)
+        time.sleep(0.1)
+        check("LLEN expired list", c.cmd("LLEN", "blinklist"), 0)
+        check("LRANGE expired list", c.cmd("LRANGE", "blinklist", "0", "-1"), [])
+        check("RPUSH solo", c.cmd("RPUSH", "solo", "only"), 1)
+        check("LPOP solo", c.cmd("LPOP", "solo"), "only")
+        check("EXISTS after last pop", c.cmd("EXISTS", "solo"), 0)
+        check("DEL list", c.cmd("DEL", "mylist"), 1)
+        check("RPUSH persist list", c.cmd("RPUSH", "plist", "x", "y", "z"), 3)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -156,7 +190,8 @@ def main():
             proc.terminate()
             proc.wait(timeout=5)
 
-    # Restart: AOF must rebuild the dataset (only "after" survived the flush).
+    # Restart: AOF must rebuild the dataset ("after" and the "plist" list
+    # survived the flush).
     proc = subprocess.Popen(
         [BIN, "--port", str(PORT), "--data-dir", DATA_DIR],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -165,7 +200,12 @@ def main():
         wait_for_port(PORT, proc)
         c = Client(PORT)
         check("AOF replay GET after", c.cmd("GET", "after"), "flush")
-        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 1)
+        check("AOF replay list", c.cmd("LRANGE", "plist", "0", "-1"), ["x", "y", "z"])
+        check("AOF replay list len", c.cmd("LLEN", "plist"), 3)
+        # The replayed PEXPIRE re-arms blinklist's 50 ms TTL from replay
+        # time, so it is briefly alive again; touching it expires it.
+        check("AOF replay expired list gone", c.cmd("LLEN", "blinklist"), 0)
+        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 2)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
