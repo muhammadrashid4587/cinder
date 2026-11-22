@@ -8,6 +8,7 @@
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -31,11 +32,12 @@
 #include "resp.h"
 #include "store.h"
 
-#define CINDER_VERSION "0.9.0"
+#define CINDER_VERSION "0.10.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
 static char g_rdb_path[1024];
+static char g_repl_state_path[1024]; /* data dir + "/replication.state" */
 static long long g_start_ms;
 static long long g_commands_processed;
 static size_t g_max_entries; /* 0 = unlimited */
@@ -512,7 +514,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_putf(&info, "max_entries:%zu\r\n", g_max_entries);
         dbuf_putf(&info, "aof_fsync_policy:%s\r\n", aof_policy_name());
         dbuf_putf(&info, "# Replication\r\n");
-        dbuf_putf(&info, "role:%s\r\n", repl_is_replica() ? "replica" : "primary");
+        dbuf_putf(&info, "role:%s\r\n", repl_is_replica() ? "replica" : "master");
         if (repl_is_replica()) {
             dbuf_putf(&info, "master_host:%s\r\n", g_master_host);
             dbuf_putf(&info, "master_port:%lld\r\n", g_master_port);
@@ -633,7 +635,16 @@ static int set_nonblocking(int fd) {
  * Replica side: REPLICAOF host port opens a non-blocking connection
  * to the primary, sends PSYNC, and applies every command arriving on
  * that link through the normal dispatcher (and its own AOF, so the
- * replicated data is durable). REPLICAOF NO ONE drops the link.
+ * replicated data is durable). REPLICAOF NO ONE is promotion: the
+ * link drops, the replica state (primary run id and stream offset)
+ * is forgotten, and the node is a primary again, keeping the data it
+ * replicated; a later REPLICAOF to the old primary full-syncs. The
+ * replica state is also written to replication.state in the data dir
+ * on a clean shutdown and reloaded (then consumed) on startup, so a
+ * replica that restarts cleanly resumes from its offset with a
+ * partial resync instead of full-syncing; an unclean stop leaves no
+ * state file, so the next REPLICAOF full-syncs rather than risk
+ * replaying commands from a stale offset.
  * A replica can itself accept SYNC/PSYNC and forward what it applies,
  * so replicas chain; a command is never sent back down the link it
  * arrived on, so there is no loop. */
@@ -658,6 +669,82 @@ static size_t repl_connected_replicas(void) {
 static void repl_link_close(void) {
     Client *link = find_repl_link();
     if (link) link->dead = 1;
+}
+
+/* Drop any persisted replication state from the data dir. */
+static void repl_state_discard(void) {
+    if (g_repl_state_path[0]) unlink(g_repl_state_path);
+}
+
+/* Forget which primary this node replicates from: the stream position
+   (primary run id and slave offset) and the master's address. Used by
+   promotion (REPLICAOF NO ONE) and when attaching to a different
+   primary, so a later REPLICAOF starts from a full sync. The dataset
+   is untouched. */
+static void repl_forget_master(void) {
+    g_master_host[0] = '\0';
+    g_master_port = 0;
+    g_primary_replid[0] = '\0';
+    g_slave_repl_offset = 0;
+    repl_state_discard();
+}
+
+/* Persist the replication stream position to the data dir. Only
+   called on a clean shutdown, when the offset is exact: every applied
+   command is already in the AOF, and no more will be applied after
+   this, so reloading it resumes precisely where this process left
+   off. Best effort: a failure to write just means the next REPLICAOF
+   full-syncs. */
+static void repl_state_save(void) {
+    if (!g_repl_state_path[0] || !g_primary_replid[0]) return;
+    FILE *f = fopen(g_repl_state_path, "w");
+    if (!f) return;
+    fprintf(f, "cinder-repl-state-v1\n%s\n%lld\n%s\n%lld\n",
+            g_primary_replid, g_slave_repl_offset,
+            g_master_host, g_master_port);
+    fclose(f);
+}
+
+/* Reload a persisted stream position, written by repl_state_save on
+   a clean shutdown. The file is consumed (deleted) as soon as it is
+   read, so a stale position can never be replayed after an unclean
+   stop: a process that dies without a clean shutdown leaves no file,
+   and the next REPLICAOF full-syncs. A corrupt file is ignored. */
+static void repl_state_load(void) {
+    if (!g_repl_state_path[0]) return;
+    FILE *f = fopen(g_repl_state_path, "r");
+    if (!f) return;
+    char magic[64] = "", rid[64] = "", host[256] = "";
+    char offbuf[64] = "", portbuf[64] = "";
+    int ok = 0;
+    if (fgets(magic, sizeof(magic), f) && fgets(rid, sizeof(rid), f) &&
+        fgets(offbuf, sizeof(offbuf), f) && fgets(host, sizeof(host), f) &&
+        fgets(portbuf, sizeof(portbuf), f)) {
+        /* Strip trailing newlines. */
+        magic[strcspn(magic, "\r\n")] = '\0';
+        rid[strcspn(rid, "\r\n")] = '\0';
+        offbuf[strcspn(offbuf, "\r\n")] = '\0';
+        host[strcspn(host, "\r\n")] = '\0';
+        portbuf[strcspn(portbuf, "\r\n")] = '\0';
+        long long off = -1, port = 0;
+        int hex = strlen(rid) == 40;
+        for (int i = 0; hex && i < 40; i++)
+            if (!isxdigit((unsigned char)rid[i])) hex = 0;
+        if (strcmp(magic, "cinder-repl-state-v1") == 0 && hex &&
+            parse_ll(offbuf, &off) && off >= 0 && host[0] &&
+            parse_ll(portbuf, &port) && port > 0 && port <= 65535) {
+            snprintf(g_primary_replid, sizeof(g_primary_replid), "%s", rid);
+            g_slave_repl_offset = off;
+            snprintf(g_master_host, sizeof(g_master_host), "%s", host);
+            g_master_port = port;
+            ok = 1;
+        }
+    }
+    fclose(f);
+    unlink(g_repl_state_path);
+    if (ok)
+        printf("cinder: resumed replication state: primary %s:%lld, replid %s, offset %lld\n",
+               g_master_host, g_master_port, g_primary_replid, g_slave_repl_offset);
 }
 
 /* Record raw stream bytes in the backlog. The bytes cover offsets
@@ -901,11 +988,14 @@ static int replicaof_connect(const char *host, int port, Dbuf *reply) {
 
 /* REPLICAOF host port | REPLICAOF NO ONE. Runs in the main loop (not
    dispatch): it creates a socket, which dispatch must never do, and
-   it is never AOF-logged. */
+   it is never AOF-logged. NO ONE is promotion: the replica detaches
+   from its primary, forgets the replication stream, and becomes a
+   primary itself, keeping the data it replicated. */
 static void handle_replicaof(char **argv, int argc, Dbuf *reply) {
     if (argc == 3 && strcasecmp(argv[1], "NO") == 0 &&
         strcasecmp(argv[2], "ONE") == 0) {
         repl_link_close();
+        repl_forget_master();
         dbuf_simple(reply, "OK");
         return;
     }
@@ -921,10 +1011,8 @@ static void handle_replicaof(char **argv, int argc, Dbuf *reply) {
     /* A new primary means the stored run id and offset are for a
        different replication stream; forget them. Reconnecting to the
        same primary keeps them, so PSYNC can ask to resume. */
-    if (strcasecmp(argv[1], g_master_host) != 0 || port != g_master_port) {
-        g_primary_replid[0] = '\0';
-        g_slave_repl_offset = 0;
-    }
+    if (strcasecmp(argv[1], g_master_host) != 0 || port != g_master_port)
+        repl_forget_master();
     repl_link_close(); /* drop any previous link first */
     if (replicaof_connect(argv[1], (int)port, reply) < 0) return;
     snprintf(g_master_host, sizeof(g_master_host), "%s", argv[1]);
@@ -1079,6 +1167,8 @@ int main(int argc, char **argv) {
     char aof_path[1024];
     snprintf(aof_path, sizeof(aof_path), "%s/appendonly.aof", data_dir);
     snprintf(g_rdb_path, sizeof(g_rdb_path), "%s/dump.rdb", data_dir);
+    snprintf(g_repl_state_path, sizeof(g_repl_state_path),
+             "%s/replication.state", data_dir);
     if (aof_open(aof_path) < 0) {
         fprintf(stderr, "cinder: cannot open AOF %s: %s\n", aof_path, strerror(errno));
         return 1;
@@ -1095,6 +1185,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "cinder: warning: snapshot %s is corrupt (%s); continuing with AOF replay\n",
                 g_rdb_path, strerror(errno));
     replay_aof(aof_path);
+    /* A clean-shutdown replication state file resumes the stream
+       position a replica had when it last stopped; see
+       repl_state_load. */
+    repl_state_load();
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -1378,6 +1472,9 @@ int main(int argc, char **argv) {
     }
 
     printf("\ncinder: shutting down, %zu keys in memory\n", store_size(g_store));
+    /* Persist the replication stream position, if this node is a
+       replica, so a clean restart can resume from it. */
+    repl_state_save();
     /* Flush any pending replies (notably the SHUTDOWN +OK) before
        closing client sockets: switch them back to blocking briefly. */
     for (size_t i = 0; i < g_nclients; i++) {

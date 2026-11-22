@@ -6,7 +6,7 @@ sets and hashes with TTLs, approximate LRU eviction, and an append-only file for
 durability. No dependencies beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.9.0.
+Version 0.10.0.
 
 ## Why
 
@@ -71,7 +71,7 @@ OK
 | `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` writes a snapshot of the dataset to `dump.rdb` and forces the AOF to disk |
 | `SYNC` | Ask this server for a full sync: it marks the connection a replica, streams a rebuild of the whole dataset (one command per key, with TTLs), then streams every later write live |
 | `PSYNC replid offset` | Ask to resume replication from a stream offset; when the replid matches this server's run id and the offset is still in the replication backlog (the last 1 MB of the write stream by default, `--repl-backlog-size`), the primary answers `+CONTINUE <replid> <offset>` and streams only the missed bytes, otherwise `+FULLRESYNC <replid> <offset>` and a full sync |
-| `REPLICAOF host port`, `REPLICAOF NO ONE` | Make this server a replica of `host:port` (PSYNC, then streamed writes, applied and AOF-logged locally); `NO ONE` detaches it |
+| `REPLICAOF host port`, `REPLICAOF NO ONE` | Make this server a replica of `host:port` (PSYNC, then streamed writes, applied and AOF-logged locally); `NO ONE` promotes it to primary: the link drops, the replica state (primary run id and stream offset) is forgotten, the replicated data stays, and the node accepts writes as a primary. Reattaching to the old primary afterwards full-syncs |
 | `QUIT`, `SHUTDOWN` | Close connection / stop the server |
 
 ## Architecture
@@ -124,7 +124,7 @@ src/
   data survives a replica restart, and a replica can itself accept `SYNC`
   and forward what it applies, so replicas chain. A replica connection is
   read-only on the primary (only `PING` is accepted); `INFO` reports
-  `role:primary|replica` and `connected_replicas`. Offsets: the primary
+  `role:master|replica` and `connected_replicas`. Offsets: the primary
   counts every byte of the live write stream it forwards
   (`master_repl_offset`, under a fresh 40-hex run id per process) and
   reports each replica's offset (`replicaN:ip=...,port=...,offset=...`);
@@ -141,7 +141,18 @@ src/
   slave offset is a stream position: it advances for every byte
   received on the replication link, even a command that turns out to
   be a no-op locally, so a later `PSYNC` never replays a command twice.
-  There is no failover — a replica that drops must `REPLICAOF` again.
+  **Failover**: `REPLICAOF NO ONE` promotes a replica to primary — the
+  link drops, the replica state (primary run id and stream offset) is
+  forgotten, and the node keeps the data it replicated and accepts
+  writes as a primary; its own run id and stream offset are untouched,
+  so replicas chained off it keep working. A promoted node that
+  `REPLICAOF`s its old primary again full-syncs, since the stream
+  position is gone. A replica that shuts down cleanly also writes its
+  stream position to `replication.state` in the data dir, and reloads
+  it (consuming the file) on startup, so a clean restart resumes from
+  its offset with a partial resync instead of full-syncing; an unclean
+  stop leaves no state file, so the next `REPLICAOF` full-syncs rather
+  than risk replaying commands from a stale offset.
 
 ## Benchmarks
 
@@ -193,13 +204,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # the same run id, INFO lists the replica with its offset,
             # and PSYNC answers +FULLRESYNC with the run id and offset
             # then streams a full sync), and partial resync checks (a
-            # replica that drops and reconnects while its offset is
-            # still in the primary's backlog replays only the missed
+            # replica that shuts down cleanly and restarts resumes from
+            # its persisted stream position, replays only the missed
             # writes and keeps a key written directly to it, proving
             # no FLUSHALL ran; with a 128-byte backlog, ten 70-byte
             # writes push the offset out of the backlog, so the
             # reconnect falls back to a full resync and the local-only
-            # key is wiped)
+            # key is wiped), and failover checks (REPLICAOF NO ONE
+            # promotes a replica to primary: INFO reports role:master
+            # with no master_host, the replicated data stays, the
+            # promoted node accepts writes, the old primary's later
+            # writes stop flowing, promoting again is a no-op, and
+            # reattaching to the old primary full-syncs, wiping the
+            # writes made while promoted)
 ```
 
 ## Roadmap
@@ -216,6 +233,10 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
       resume from an offset instead of full-syncing (1 MB ring buffer
       by default, `--repl-backlog-size`; `+CONTINUE` partial resync,
       `+FULLRESYNC` fallback when the offset aged out)
-- [ ] Failover: promote a replica to primary
+- [x] Failover: promote a replica to primary (`REPLICAOF NO ONE`
+      detaches, forgets the stream position, keeps the replicated data,
+      and reports `role:master` in `INFO`; a clean replica restart
+      resumes from its persisted stream position instead of
+      full-syncing)
 - [ ] `epoll` backend and a thread pool for the event loop
 - [ ] Benchmarks against real Redis on the same hardware

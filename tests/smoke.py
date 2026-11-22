@@ -382,7 +382,7 @@ def main():
         time.sleep(0.1)  # repgone expires before the sync: it must not appear
         replica = start_server(port=7778, data_dir=repl_replica_dir)
         r = Client(7778)
-        check("repl INFO primary role", "role:primary" in p.cmd("INFO"), True)
+        check("repl INFO master role", "role:master" in p.cmd("INFO"), True)
         check("repl REPLICAOF", r.cmd("REPLICAOF", "127.0.0.1", "7777"), "OK")
         check("repl REPLICAOF bad port", r.cmd("REPLICAOF", "127.0.0.1", "99999"),
               ("error", "ERR invalid port"))
@@ -501,12 +501,22 @@ def main():
         # +CONTINUE and replays only the missed writes. No FLUSHALL
         # runs, so a key written directly to the replica survives —
         # that is what distinguishes a partial resync from a full one.
+        # The drop is a clean shutdown: the shutdown persists the
+        # replica's stream position, and the restart resumes from it.
+        # (REPLICAOF NO ONE is promotion now, not a transient detach:
+        # it forgets the stream position, so reattaching after one
+        # full-syncs.)
         check("partial local write", r.cmd("SET", "localonly", "keepme"), "OK")
         check("partial local read", r.cmd("GET", "localonly"), "keepme")
-        check("partial detach", r.cmd("REPLICAOF", "NO", "ONE"), "OK")
+        check("partial shutdown", r.cmd("SHUTDOWN"), "OK")
+        r.close()
+        replica.wait(timeout=5)
+        replica = None
         check("partial missed SET 1", p.cmd("SET", "missed1", "one"), "OK")
         check("partial missed SET 2", p.cmd("SET", "missed2", "two"), "OK")
         off_missed = int(info_field(p.cmd("INFO"), "master_repl_offset"))
+        replica = start_server(port=7778, data_dir=repl_replica_dir, fresh=False)
+        r = Client(7778)
         check("partial reattach", r.cmd("REPLICAOF", "127.0.0.1", "7777"), "OK")
         deadline = time.time() + 5
         resumed = False
@@ -533,7 +543,7 @@ def main():
         check("partial resync slave offset catches up", caught_up, True)
         # Detach: writes stop flowing, and the replica keeps its data.
         check("repl REPLICAOF NO ONE", r.cmd("REPLICAOF", "NO", "ONE"), "OK")
-        check("repl INFO back to primary", "role:primary" in r.cmd("INFO"), True)
+        check("repl INFO back to master", "role:master" in r.cmd("INFO"), True)
         check("repl after detach SET", p.cmd("SET", "afterdetach", "no"), "OK")
         time.sleep(0.3)
         check("repl after detach not streamed", r.cmd("GET", "afterdetach"), None)
@@ -637,6 +647,87 @@ def main():
         if fb_primary is not None and fb_primary.poll() is None:
             fb_primary.terminate()
             fb_primary.wait(timeout=5)
+
+    # Failover: REPLICAOF NO ONE promotes a replica to primary. The
+    # promoted node keeps the data it replicated, accepts writes, and
+    # reports role:master; the old primary's later writes stop flowing.
+    # Promotion forgets the stream position, so reattaching to the old
+    # primary full-syncs and wipes writes made while promoted.
+    fo_primary_dir = "/tmp/cinder-smoke-failover-primary"
+    fo_replica_dir = "/tmp/cinder-smoke-failover-replica"
+    fo_primary = start_server(port=7781, data_dir=fo_primary_dir)
+    fo_replica = None
+    try:
+        fp = Client(7781)
+        check("failover SET", fp.cmd("SET", "fokey", "before"), "OK")
+        check("failover HSET", fp.cmd("HSET", "fohash", "f1", "v1"), 1)
+        fo_replica = start_server(port=7782, data_dir=fo_replica_dir)
+        fr = Client(7782)
+        check("failover REPLICAOF", fr.cmd("REPLICAOF", "127.0.0.1", "7781"), "OK")
+        deadline = time.time() + 5
+        fo_synced = False
+        while time.time() < deadline:
+            try:
+                if fr.cmd("GET", "fokey") == "before":
+                    fo_synced = True
+                    break
+            except (EOFError, OSError):
+                pass
+            time.sleep(0.1)
+        check("failover full sync arrived", fo_synced, True)
+        check("failover replica role", "role:replica" in fr.cmd("INFO"), True)
+        check("failover promote", fr.cmd("REPLICAOF", "NO", "ONE"), "OK")
+        check("failover INFO role master", "role:master" in fr.cmd("INFO"), True)
+        check("failover INFO no master host",
+              "master_host:" not in fr.cmd("INFO"), True)
+        fo_replid = info_field(fr.cmd("INFO"), "master_replid")
+        check("failover INFO master_replid 40 hex",
+              len(fo_replid or "") == 40 and
+              all(ch in "0123456789abcdef" for ch in fo_replid), True)
+        check("failover keeps replicated data", fr.cmd("GET", "fokey"), "before")
+        check("failover keeps replicated hash",
+              fr.cmd("HGETALL", "fohash"), ["f1", "v1"])
+        check("failover promoted accepts writes",
+              fr.cmd("SET", "fowrite", "after"), "OK")
+        check("failover promoted write readable",
+              fr.cmd("GET", "fowrite"), "after")
+        check("failover old primary write", fp.cmd("SET", "foafter", "no"), "OK")
+        time.sleep(0.3)
+        check("failover old writes stop flowing", fr.cmd("GET", "foafter"), None)
+        check("failover promote again is OK", fr.cmd("REPLICAOF", "NO", "ONE"), "OK")
+        check("failover still master", "role:master" in fr.cmd("INFO"), True)
+        check("failover still has promoted write",
+              fr.cmd("GET", "fowrite"), "after")
+        # Reattaching after promotion full-syncs: the write made while
+        # promoted is wiped and the old primary's writes come back.
+        check("failover reattach", fr.cmd("REPLICAOF", "127.0.0.1", "7781"), "OK")
+        deadline = time.time() + 5
+        fo_resynced = False
+        while time.time() < deadline:
+            try:
+                if (fr.cmd("GET", "foafter") == "no" and
+                        fr.cmd("GET", "fowrite") is None):
+                    fo_resynced = True
+                    break
+            except (EOFError, OSError):
+                pass
+            time.sleep(0.1)
+        check("failover reattach full-syncs", fo_resynced, True)
+        fr.cmd("SHUTDOWN")
+        fr.close()
+        fo_replica.wait(timeout=5)
+        fo_replica = None
+        fp.cmd("SHUTDOWN")
+        fp.close()
+        fo_primary.wait(timeout=5)
+        fo_primary = None
+    finally:
+        if fo_replica is not None and fo_replica.poll() is None:
+            fo_replica.terminate()
+            fo_replica.wait(timeout=5)
+        if fo_primary is not None and fo_primary.poll() is None:
+            fo_primary.terminate()
+            fo_primary.wait(timeout=5)
 
     # Unknown policy is a startup error, not a silent default.
     bad = subprocess.run(
