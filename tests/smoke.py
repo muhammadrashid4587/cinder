@@ -152,6 +152,84 @@ def main():
         check("DEL incr extras", c.cmd("DEL", "ttlctr", "grow", "blinkctr"), 3)
         check("KEYS *", sorted(c.cmd("KEYS", "*")), ["counter", "name", "temp"])
         check("KEYS c*", c.cmd("KEYS", "c*"), ["counter"])
+        # SCAN: cursor-based iteration with MATCH and COUNT. The helper
+        # drives the cursor to 0 and returns every key seen plus the
+        # number of round trips it took.
+        def scan_all(*args):
+            seen = []
+            cursor = "0"
+            rounds = 0
+            while True:
+                cursor, keys = c.cmd("SCAN", cursor, *args)
+                seen.extend(keys)
+                rounds += 1
+                if rounds > 10000:
+                    raise AssertionError("SCAN did not terminate")
+                if cursor == "0":
+                    break
+            return seen, rounds
+        keys, rounds = scan_all()
+        check("SCAN all keys", sorted(keys), ["counter", "name", "temp"])
+        check("SCAN default COUNT one round", rounds, 1)
+        keys, _ = scan_all("MATCH", "c*")
+        check("SCAN MATCH c*", sorted(keys), ["counter"])
+        keys, _ = scan_all("MATCH", "zzz*")
+        check("SCAN MATCH none", keys, [])
+        keys, rounds = scan_all("COUNT", "1")
+        check("SCAN COUNT 1 all keys", sorted(keys),
+              ["counter", "name", "temp"])
+        check("SCAN COUNT 1 took >1 round", rounds > 1, True)
+        keys, _ = scan_all("MATCH", "c*", "COUNT", "1")
+        check("SCAN MATCH+COUNT", sorted(keys), ["counter"])
+        check("SCAN bad cursor", c.cmd("SCAN", "abc"),
+              ("error", "ERR invalid cursor"))
+        check("SCAN negative cursor", c.cmd("SCAN", "-1"),
+              ("error", "ERR invalid cursor"))
+        check("SCAN bad option", c.cmd("SCAN", "0", "NOPE"),
+              ("error", "ERR syntax error"))
+        check("SCAN COUNT missing value", c.cmd("SCAN", "0", "COUNT"),
+              ("error", "ERR syntax error"))
+        check("SCAN COUNT bad value", c.cmd("SCAN", "0", "COUNT", "x"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("SCAN COUNT negative", c.cmd("SCAN", "0", "COUNT", "-1"),
+              ("error", "ERR syntax error"))
+        check("SCAN duplicate MATCH",
+              c.cmd("SCAN", "0", "MATCH", "*", "MATCH", "*"),
+              ("error", "ERR syntax error"))
+        check("SCAN no args", c.cmd("SCAN"),
+              ("error", "ERR wrong number of arguments for 'scan' command"))
+        # SCAN across a table resize: 800 keys push the table 1024 ->
+        # 2048 before the scan starts, then 800 more mid-iteration push
+        # it to 4096. Keys present for the whole iteration must all
+        # come back, even though the buckets moved under the cursor.
+        for i in range(800):
+            c.cmd("SET", f"scan:{i}", str(i))
+        seen = []
+        cursor = "0"
+        rounds = 0
+        grown = False
+        while True:
+            cursor, keys = c.cmd("SCAN", cursor, "MATCH", "scan:*",
+                                 "COUNT", "1")
+            seen.extend(keys)
+            rounds += 1
+            if rounds > 10000:
+                raise AssertionError("SCAN did not terminate")
+            if not grown and rounds == 5:
+                for i in range(800):
+                    c.cmd("SET", f"scan2:{i}", str(i))
+                grown = True
+            if cursor == "0":
+                break
+        check("SCAN resize all 800 keys", sorted(set(seen)),
+              sorted(f"scan:{i}" for i in range(800)))
+        check("SCAN resize terminated in bounds", rounds < 5000, True)
+        # Cleanup in two DELs: one command may carry at most 1024
+        # RESP array elements, so 1600 keys do not fit in a single DEL.
+        check("SCAN resize cleanup 1",
+              c.cmd("DEL", *[f"scan:{i}" for i in range(800)]), 800)
+        check("SCAN resize cleanup 2",
+              c.cmd("DEL", *[f"scan2:{i}" for i in range(800)]), 800)
         check("DBSIZE", c.cmd("DBSIZE"), 3)
         # GETDEL / GETEX: get-and-delete and get-and-retime a string key.
         check("SET getdel", c.cmd("SET", "gd", "gone"), "OK")
@@ -1038,7 +1116,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.25.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.26.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

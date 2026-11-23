@@ -116,6 +116,24 @@ size_t store_evict_lru(Store *s, size_t max_entries);
    (NULL and 0 when nothing matches). Caller frees both. */
 size_t store_keys_matching(Store *s, const char *pattern, char ***keys_out);
 
+/* Cursor-based keyspace iteration, Redis SCAN semantics. The cursor
+   is a bucket index walked in reverse-bit order (the trick Redis's
+   dictScan uses), so a table resize mid-iteration still visits every
+   bucket exactly once: keys present for the whole iteration are
+   returned at least once, and the iteration ends when the returned
+   cursor is 0. Any unsigned cursor is valid (it is masked to the
+   table size); start with 0. Each call scans buckets until `count`
+   matching non-expired keys have been collected (the default Redis
+   COUNT is 10) or the cursor wraps to 0; one bucket's matches are
+   all returned, so a batch can exceed `count` slightly. Expired
+   keys are skipped, not deleted: SCAN is read-only. Returns the
+   next cursor (0 = iteration complete); *keys_out is a malloc'd
+   array of malloc'd strings (NULL and 0 when nothing matched).
+   Caller frees both. */
+unsigned long long store_scan(Store *s, unsigned long long cursor,
+                              const char *pattern, size_t count,
+                              char ***keys_out, size_t *n_out);
+
 /* Iterate over all non-expired entries in bucket order. The callback
    receives each entry (read-only) and arg; returning non-zero stops
    the iteration. Expired entries are skipped, not deleted. Returns 0

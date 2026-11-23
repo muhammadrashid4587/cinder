@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.25.0.
+Version 0.26.0.
 
 ## Why
 
@@ -89,6 +89,7 @@ OK
 | `ZRANK key member` | 0-based rank of a member, lowest score first (`nil` when missing) |
 | `ZINCRBY key increment member` | Add to a member's score (creating member and key when missing); returns the new score |
 | `KEYS pattern` | Glob match (`*` and `?`) |
+| `SCAN cursor [MATCH pattern] [COUNT n]` | Cursor-based keyspace iteration: start at cursor `0`, repeat with the returned cursor until it comes back `0`; `MATCH` filters with the same glob as `KEYS`, `COUNT` (default 10) is a hint for how many matching keys to return per call |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
 | `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` writes a snapshot of the dataset to `dump.rdb` and forces the AOF to disk |
 | `BGSAVE` | Snapshot the dataset to `dump.rdb` in the background: the event loop serializes the store to memory and a worker thread writes the file, so the server keeps answering commands while it saves; answers `Background saving started`, a second `BGSAVE` while one is in progress is an error, and `INFO` reports `bgsave_in_progress` and `last_bgsave_status` |
@@ -520,7 +521,23 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       so the log replays identically. Limitation: member lookup is
       still a linear scan, so large sorted sets are slower than a
       skip list would be
+- [x] `SCAN` (0.26.0): cursor-based keyspace iteration,
+      `SCAN cursor [MATCH pattern] [COUNT n]`, returning `[cursor,
+      [keys...]]` until the cursor comes back `0`. The cursor is a
+      bucket index walked in reverse-bit order — the same trick
+      Redis's `dictScan` uses — so a table resize mid-iteration still
+      visits every bucket exactly once: keys present for the whole
+      iteration come back at least once. `MATCH` reuses the `KEYS`
+      glob, `COUNT` defaults to 10 and is a hint (one bucket's
+      matches are all returned, so a batch can exceed it slightly).
+      Read-only, so no AOF, RDB, or replication change was needed.
+      Limitation: keys added or deleted mid-iteration may be missed
+      or returned twice, as in Redis, and a scan over a mostly-empty
+      table with a selective `MATCH` can walk the whole table in one
+      call before returning anything
 
 ## Next
 
-- [ ] `SCAN` (cursor-based keyspace iteration, with `MATCH` and `COUNT`)
+- [ ] String misc commands: `SETNX` / `SETEX` / `GETSET` / `APPEND` /
+      `STRLEN` (smallest remaining string slice; `GETDEL`/`GETEX`
+      already exist)

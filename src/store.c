@@ -719,6 +719,63 @@ done:
     return n;
 }
 
+/* Reverse every bit of v, the way Redis's dictScan reverses its
+   cursor: the scan walks buckets in reverse-bit order, so a table
+   that doubles mid-iteration still has every bucket visited exactly
+   once. */
+static unsigned long long rev_bits(unsigned long long v) {
+    unsigned long long s = 8 * sizeof(v); /* bit size */
+    unsigned long long mask = ~0ULL;
+    while ((s >>= 1) > 0) {
+        mask ^= (mask << s);
+        v = ((v >> s) & mask) | ((v << s) & ~mask);
+    }
+    return v;
+}
+
+unsigned long long store_scan(Store *s, unsigned long long cursor,
+                              const char *pattern, size_t count,
+                              char ***keys_out, size_t *n_out) {
+    *keys_out = NULL;
+    *n_out = 0;
+    size_t n = 0, cap = 0;
+    char **keys = NULL;
+    /* The table cannot resize during this call (single-threaded
+       event loop), so the mask is fixed for the whole call; the
+       next call re-reads it, which is what makes a resize between
+       calls safe. */
+    size_t m0 = s->cap - 1;
+    unsigned long long v = cursor;
+    do {
+        Entry *e = s->buckets[(size_t)(v & m0)];
+        while (e) {
+            if (!entry_expired(e) && glob_match(pattern, e->key)) {
+                if (n >= cap) {
+                    cap = cap ? cap * 2 : 16;
+                    char **nk = realloc(keys, cap * sizeof(char *));
+                    if (!nk) goto done;
+                    keys = nk;
+                }
+                keys[n] = strdup(e->key);
+                if (!keys[n]) goto done;
+                n++;
+            }
+            e = e->next;
+        }
+        /* Advance the cursor in reverse-bit order. Setting the bits
+           above the table size first is what keeps the walk correct
+           when the table has grown since the cursor was issued. */
+        v |= ~((unsigned long long)m0);
+        v = rev_bits(v);
+        v++;
+        v = rev_bits(v);
+    } while (v != 0 && n < count);
+done:
+    *keys_out = keys;
+    *n_out = n;
+    return v;
+}
+
 size_t store_evict_lru(Store *s, size_t max_entries) {
     size_t evicted = 0;
     while (s->count > max_entries) {

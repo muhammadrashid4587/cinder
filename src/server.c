@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.25.0"
+#define CINDER_VERSION "0.26.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -463,6 +463,60 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'keys' command"), 0;
         char **keys = NULL;
         size_t n = store_keys_matching(g_store, argv[1], &keys);
+        dbuf_array_header(reply, (long long)n);
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, keys[i], strlen(keys[i]));
+            free(keys[i]);
+        }
+        free(keys);
+        return 0;
+    }
+    if (strcasecmp(cmd, "SCAN") == 0) {
+        if (argc < 2)
+            return dbuf_error(reply, "wrong number of arguments for 'scan' command"), 0;
+        /* The cursor is an unsigned decimal integer; anything else
+           is the same "invalid cursor" error Redis returns. A
+           cursor past the end of the table is still valid — the
+           store masks it — so no range check is needed. */
+        unsigned long long cursor = 0;
+        if (!*argv[1])
+            return dbuf_error(reply, "invalid cursor"), 0;
+        for (const char *p = argv[1]; *p; p++) {
+            if (*p < '0' || *p > '9')
+                return dbuf_error(reply, "invalid cursor"), 0;
+            cursor = cursor * 10 + (unsigned long long)(*p - '0');
+        }
+        const char *pattern = "*";
+        long long count = 10; /* Redis's default COUNT */
+        int seen_match = 0, seen_count = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcasecmp(argv[i], "MATCH") == 0) {
+                if (seen_match || i + 1 >= argc)
+                    return dbuf_error(reply, "syntax error"), 0;
+                seen_match = 1;
+                pattern = argv[++i];
+            } else if (strcasecmp(argv[i], "COUNT") == 0) {
+                if (seen_count || i + 1 >= argc)
+                    return dbuf_error(reply, "syntax error"), 0;
+                seen_count = 1;
+                long long n;
+                if (!parse_ll(argv[++i], &n))
+                    return dbuf_error(reply, "value is not an integer or out of range"), 0;
+                if (n < 0)
+                    return dbuf_error(reply, "syntax error"), 0;
+                count = n;
+            } else {
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        }
+        char **keys = NULL;
+        size_t n = 0;
+        unsigned long long next = store_scan(g_store, cursor, pattern,
+                                             (size_t)count, &keys, &n);
+        dbuf_array_header(reply, 2);
+        char curbuf[32];
+        snprintf(curbuf, sizeof(curbuf), "%llu", next);
+        dbuf_bulk(reply, curbuf, strlen(curbuf));
         dbuf_array_header(reply, (long long)n);
         for (size_t i = 0; i < n; i++) {
             dbuf_bulk(reply, keys[i], strlen(keys[i]));
@@ -1016,7 +1070,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZREM",
             "ZRANK", "ZINCRBY",
-            "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
+            "KEYS", "SCAN", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
             "SYNC", "PSYNC", "REPLICAOF"};
         dbuf_array_header(reply, (long long)(sizeof(names) / sizeof(names[0])));
