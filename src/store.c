@@ -185,6 +185,20 @@ static int zset_put(ZSet *z, const char *member, double score) {
     return 0;
 }
 
+/* Remove a member. Returns 1 removed, 0 when the member was absent. */
+static int zset_remove(ZSet *z, const char *member) {
+    long long idx = zset_find(z, member);
+    if (idx < 0) return 0;
+    free(z->members[idx]);
+    memmove(&z->members[idx], &z->members[idx + 1],
+            (z->len - (size_t)idx - 1) * sizeof(char *));
+    memmove(&z->scores[idx], &z->scores[idx + 1],
+            (z->len - (size_t)idx - 1) * sizeof(double));
+    z->len--;
+    z->members[z->len] = NULL;
+    return 1;
+}
+
 static Hash *hash_new(void) {
     Hash *h = calloc(1, sizeof(Hash));
     if (!h) return NULL;
@@ -1130,4 +1144,148 @@ long long store_zcard(Store *s, const char *key) {
     if (e->type != ENTRY_ZSET) return -1;
     e->last_access = ++s->clock;
     return (long long)e->zset->len;
+}
+
+long long store_zrem(Store *s, const char *key, const char *member) {
+    Entry **pp = NULL;
+    Entry *e = store_find(s, key, &pp);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    if (!zset_remove(e->zset, member)) return 0;
+    if (e->zset->len == 0) {
+        /* A sorted set emptied by removing is gone, as in Redis. */
+        *pp = e->next;
+        entry_free(e);
+        s->count--;
+    } else {
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+    }
+    return 1;
+}
+
+/* Rank of a member: 1 = found (*out is the 0-based rank), 0 = key or
+   member missing, -1 = wrong type. reverse ranks from the highest
+   score down, as ZREVRANK would. */
+int store_zrank(Store *s, const char *key, const char *member, int reverse,
+                long long *out) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    e->last_access = ++s->clock;
+    long long idx = zset_find(e->zset, member);
+    if (idx < 0) return 0;
+    *out = reverse ? (long long)e->zset->len - 1 - idx : idx;
+    return 1;
+}
+
+/* Members in [start, stop] (inclusive), in ascending score order, or
+   descending when reverse is set. Negative indices count from the
+   end, as in Redis, and out-of-range ends are clamped. Returns 0 on
+   success (*n_out is 0 for a missing key or an empty range),
+   -1 = wrong type, -2 = out of memory. *members_out is a malloc'd
+   array of malloc'd strings and *scores_out a malloc'd array of the
+   matching scores; the caller frees both. */
+int store_zrange(Store *s, const char *key, long long start, long long stop,
+                 int reverse, char ***members_out, double **scores_out,
+                 size_t *n_out) {
+    *members_out = NULL;
+    *scores_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    e->last_access = ++s->clock;
+    ZSet *z = e->zset;
+    long long len = (long long)z->len;
+    if (start < 0) start += len;
+    if (stop < 0) stop += len;
+    if (start < 0) start = 0;
+    if (stop >= len) stop = len - 1;
+    if (start > stop || start >= len) return 0;
+    size_t n = (size_t)(stop - start + 1);
+    char **members = malloc(n * sizeof(char *));
+    double *scores = malloc(n * sizeof(double));
+    if (!members || !scores) {
+        free(members);
+        free(scores);
+        return -2;
+    }
+    for (size_t i = 0; i < n; i++) {
+        /* Reversed ranges index into the reversed ordering, as in
+           Redis: ZREVRANGE -2 -1 is the last two members of the
+           highest-first sequence, not the ascending slice reversed. */
+        long long idx = reverse ? len - 1 - start - (long long)i
+                                : start + (long long)i;
+        members[i] = strdup(z->members[idx]);
+        if (!members[i]) {
+            for (size_t j = 0; j < i; j++) free(members[j]);
+            free(members);
+            free(scores);
+            return -2;
+        }
+        scores[i] = z->scores[idx];
+    }
+    *members_out = members;
+    *scores_out = scores;
+    *n_out = n;
+    return 0;
+}
+
+/* Add increment to a member's score, creating the member (with score
+   = increment) and the key when missing. Returns 1 when the member
+   is new, 0 when an existing member's score changed, 2 when nothing
+   changed (increment 0 on a member already there), -1 = wrong type,
+   -2 = out of memory. *out is the member's new score. */
+int store_zincrby(Store *s, const char *key, const char *member,
+                  double incr, double *out) {
+    Entry *e = store_find(s, key, NULL);
+    if (e) {
+        if (e->type != ENTRY_ZSET) return -1;
+        long long idx = zset_find(e->zset, member);
+        if (idx >= 0) {
+            double cur = e->zset->scores[idx];
+            if (incr == 0) {
+                *out = cur;
+                return 2;
+            }
+            double next = cur + incr;
+            int rc = zset_put(e->zset, member, next);
+            if (rc < 0) return -2;
+            e->last_access = ++s->clock;
+            entry_touch(s, e);
+            *out = next;
+            return 0;
+        }
+        int rc = zset_put(e->zset, member, incr);
+        if (rc < 0) return -2;
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+        *out = incr;
+        return 1;
+    }
+    if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+        store_resize(s);
+    e = calloc(1, sizeof(Entry));
+    if (!e) return -2;
+    e->key = strdup(key);
+    e->zset = zset_new();
+    if (!e->key || !e->zset) {
+        entry_free(e);
+        return -2;
+    }
+    e->type = ENTRY_ZSET;
+    e->expire_at = -1;
+    e->last_access = ++s->clock;
+    e->version = ++s->mod_seq;
+    if (zset_put(e->zset, member, incr) < 0) {
+        entry_free(e);
+        return -2;
+    }
+    size_t idx = hash_key(key) % s->cap;
+    e->next = s->buckets[idx];
+    s->buckets[idx] = e;
+    s->count++;
+    *out = incr;
+    return 1;
 }

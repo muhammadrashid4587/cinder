@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.21.0"
+#define CINDER_VERSION "0.22.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -712,6 +712,83 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_int(reply, n);
         return 0;
     }
+    if (strcasecmp(cmd, "ZRANGE") == 0 || strcasecmp(cmd, "ZREVRANGE") == 0) {
+        int reverse = strcasecmp(cmd, "ZREVRANGE") == 0;
+        if (argc != 4 && argc != 5)
+            return dbuf_error(reply, reverse ? "wrong number of arguments for 'zrevrange' command" : "wrong number of arguments for 'zrange' command"), 0;
+        long long start, stop;
+        if (!parse_ll(argv[2], &start) || !parse_ll(argv[3], &stop))
+            return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        int withscores = 0;
+        if (argc == 5) {
+            if (strcasecmp(argv[4], "WITHSCORES") != 0)
+                return dbuf_error(reply, "syntax error"), 0;
+            withscores = 1;
+        }
+        char **members = NULL;
+        double *scores = NULL;
+        size_t n = 0;
+        int rc = store_zrange(g_store, argv[1], start, stop, reverse,
+                              &members, &scores, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_array_header(reply, (long long)(withscores ? n * 2 : n));
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, members[i], strlen(members[i]));
+            if (withscores) {
+                char buf[32];
+                format_score(buf, sizeof(buf), scores[i]);
+                dbuf_bulk(reply, buf, strlen(buf));
+            }
+            free(members[i]);
+        }
+        free(members);
+        free(scores);
+        return 0;
+    }
+    if (strcasecmp(cmd, "ZREM") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'zrem' command"), 0;
+        long long removed = 0;
+        for (int i = 2; i < argc; i++) {
+            long long rc = store_zrem(g_store, argv[1], argv[i]);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            removed += rc;
+        }
+        dbuf_int(reply, removed);
+        return removed > 0 ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "ZRANK") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'zrank' command"), 0;
+        long long rank;
+        int rc = store_zrank(g_store, argv[1], argv[2], 0, &rank);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == 0) return dbuf_null(reply), 0;
+        dbuf_int(reply, rank);
+        return 0;
+    }
+    if (strcasecmp(cmd, "ZINCRBY") == 0) {
+        if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'zincrby' command"), 0;
+        double incr;
+        if (!parse_double(argv[2], &incr))
+            return dbuf_error(reply, "value is not a valid float"), 0;
+        double next;
+        int rc = store_zincrby(g_store, argv[1], argv[3], incr, &next);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        char buf[32];
+        format_score(buf, sizeof(buf), next);
+        dbuf_bulk(reply, buf, strlen(buf));
+        /* A 0 increment on an existing member changes nothing, so
+           like the ZADD no-op it is neither logged nor a WATCH
+           invalidation. */
+        return rc == 2 ? 0 : 1;
+    }
     if (strcasecmp(cmd, "FLUSHALL") == 0) {
         store_flush(g_store);
         dbuf_simple(reply, "OK");
@@ -784,7 +861,8 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
-            "ZADD", "ZSCORE", "ZCARD",
+            "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZREM",
+            "ZRANK", "ZINCRBY",
             "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
             "SYNC", "PSYNC", "REPLICAOF"};

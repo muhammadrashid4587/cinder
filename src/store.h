@@ -198,5 +198,31 @@ int store_zscore(Store *s, const char *key, const char *member,
                  double *out);
 /* Number of members: 0 when missing, -1 = wrong type. */
 long long store_zcard(Store *s, const char *key);
+/* Remove one member. Returns 1 removed, 0 when the key or member
+   is missing, -1 = wrong type. The key is deleted when the last
+   member is removed, as in Redis. */
+long long store_zrem(Store *s, const char *key, const char *member);
+/* Rank of a member: 1 = found (*out is the 0-based rank), 0 = key or
+   member missing, -1 = wrong type. reverse ranks from the highest
+   score down, as ZREVRANK would. */
+int store_zrank(Store *s, const char *key, const char *member, int reverse,
+                long long *out);
+/* Members in [start, stop] (inclusive), ascending by score, or
+   descending when reverse is set. Negative indices count from the
+   end, as in Redis, and out-of-range ends are clamped. Returns 0 on
+   success (*n_out is 0 for a missing key or an empty range),
+   -1 = wrong type, -2 = out of memory. *members_out is a malloc'd
+   array of malloc'd strings and *scores_out a malloc'd array of the
+   matching scores; the caller frees both. */
+int store_zrange(Store *s, const char *key, long long start, long long stop,
+                 int reverse, char ***members_out, double **scores_out,
+                 size_t *n_out);
+/* Add increment to a member's score, creating the member (with score
+   = increment) and the key when missing. Returns 1 when the member
+   is new, 0 when an existing member's score changed, 2 when nothing
+   changed (increment 0 on a member already there), -1 = wrong type,
+   -2 = out of memory. *out is the member's new score. */
+int store_zincrby(Store *s, const char *key, const char *member,
+                  double incr, double *out);
 
 #endif

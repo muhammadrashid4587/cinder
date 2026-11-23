@@ -349,6 +349,56 @@ def main():
         check("ZCARD expired zset", c.cmd("ZCARD", "blinkzset"), 0)
         check("ZSCORE expired zset", c.cmd("ZSCORE", "blinkzset", "a"), None)
         check("ZADD persist zset", c.cmd("ZADD", "pzset", "1.5", "x", "2.25", "y", "10", "z"), 3)
+        # Sorted-set ranges, rank, removal and increment. myzset holds
+        # c=0.5, a=3, b=5 at this point.
+        check("ZRANGE all", c.cmd("ZRANGE", "myzset", "0", "-1"), ["c", "a", "b"])
+        check("ZRANGE first two", c.cmd("ZRANGE", "myzset", "0", "1"), ["c", "a"])
+        check("ZRANGE negative", c.cmd("ZRANGE", "myzset", "-2", "-1"), ["a", "b"])
+        check("ZRANGE withscores", c.cmd("ZRANGE", "myzset", "0", "-1", "WITHSCORES"),
+              ["c", "0.5", "a", "3", "b", "5"])
+        check("ZRANGE empty range", c.cmd("ZRANGE", "myzset", "2", "1"), [])
+        check("ZRANGE out of range", c.cmd("ZRANGE", "myzset", "5", "10"), [])
+        check("ZRANGE missing", c.cmd("ZRANGE", "ghostzset", "0", "-1"), [])
+        check("ZREVRANGE all", c.cmd("ZREVRANGE", "myzset", "0", "-1"), ["b", "a", "c"])
+        check("ZREVRANGE withscores", c.cmd("ZREVRANGE", "myzset", "0", "-1", "WITHSCORES"),
+              ["b", "5", "a", "3", "c", "0.5"])
+        check("ZREVRANGE negative", c.cmd("ZREVRANGE", "myzset", "-2", "-1"), ["a", "c"])
+        check("ZRANK lowest", c.cmd("ZRANK", "myzset", "c"), 0)
+        check("ZRANK middle", c.cmd("ZRANK", "myzset", "a"), 1)
+        check("ZRANK highest", c.cmd("ZRANK", "myzset", "b"), 2)
+        check("ZRANK missing member", c.cmd("ZRANK", "myzset", "ghost"), None)
+        check("ZRANK missing key", c.cmd("ZRANK", "ghostzset", "a"), None)
+        check("ZINCRBY existing", c.cmd("ZINCRBY", "myzset", "2", "a"), "5")
+        check("ZRANGE after tie", c.cmd("ZRANGE", "myzset", "0", "-1"), ["c", "a", "b"])
+        check("ZINCRBY new member", c.cmd("ZINCRBY", "myzset", "1.5", "d"), "1.5")
+        check("ZCARD after ZINCRBY", c.cmd("ZCARD", "myzset"), 4)
+        check("ZINCRBY zero noop", c.cmd("ZINCRBY", "myzset", "0", "a"), "5")
+        check("ZINCRBY new key", c.cmd("ZINCRBY", "newzset", "-2.5", "m"), "-2.5")
+        check("ZINCRBY bad float", c.cmd("ZINCRBY", "myzset", "xx", "a"),
+              ("error", "ERR value is not a valid float"))
+        check("ZREM one", c.cmd("ZREM", "myzset", "b"), 1)
+        check("ZCARD after ZREM", c.cmd("ZCARD", "myzset"), 3)
+        check("ZRANK removed member", c.cmd("ZRANK", "myzset", "b"), None)
+        check("ZREM missing member", c.cmd("ZREM", "myzset", "ghost"), 0)
+        check("ZREM multi", c.cmd("ZREM", "myzset", "a", "c", "d"), 3)
+        check("ZCARD emptied zset", c.cmd("ZCARD", "myzset"), 0)
+        check("EXISTS emptied zset", c.cmd("EXISTS", "myzset"), 0)
+        check("ZREM missing key", c.cmd("ZREM", "ghostzset", "a"), 0)
+        check("ZRANGE wrong args", c.cmd("ZRANGE", "myzset", "0"),
+              ("error", "ERR wrong number of arguments for 'zrange' command"))
+        check("ZRANGE bad index", c.cmd("ZRANGE", "myzset", "x", "y"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("ZRANGE bad option", c.cmd("ZRANGE", "myzset", "0", "-1", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("ZREVRANGE wrongtype", c.cmd("ZREVRANGE", "after", "0", "-1"), wrongtype)
+        check("ZREM wrongtype", c.cmd("ZREM", "after", "x"), wrongtype)
+        check("ZRANK wrongtype", c.cmd("ZRANK", "after", "x"), wrongtype)
+        check("ZINCRBY wrongtype", c.cmd("ZINCRBY", "after", "1", "x"), wrongtype)
+        check("COMMAND lists ZRANGE", "ZRANGE" in c.cmd("COMMAND"), True)
+        check("COMMAND lists ZREVRANGE", "ZREVRANGE" in c.cmd("COMMAND"), True)
+        check("COMMAND lists ZREM", "ZREM" in c.cmd("COMMAND"), True)
+        check("COMMAND lists ZRANK", "ZRANK" in c.cmd("COMMAND"), True)
+        check("COMMAND lists ZINCRBY", "ZINCRBY" in c.cmd("COMMAND"), True)
         # Transactions: MULTI queues, EXEC runs the queue in order and
         # returns one reply per command, DISCARD drops the queue, and
         # the error cases. A second client proves the queued writes
@@ -502,6 +552,10 @@ def main():
         check("COMMAND lists ZCARD", "ZCARD" in c.cmd("COMMAND"), True)
         # Clean up the transaction keys: the AOF restart below counts
         # exact keys (5: after, plist, pset, phash, pzset).
+        # ZINCRBY and ZREM on pzset before the restart, so the AOF
+        # replay section below can prove they were logged.
+        check("AOF pre-restart ZINCRBY", c.cmd("ZINCRBY", "pzset", "1", "x"), "2.5")
+        check("AOF pre-restart ZREM", c.cmd("ZREM", "pzset", "z"), 1)
         check("tx cleanup", c.cmd("DEL", "txkey", "txctr", "txkey2", "txlist"), 4)
         c2.close()
         c.cmd("SHUTDOWN")
@@ -528,9 +582,11 @@ def main():
         check("AOF replay set card", c.cmd("SCARD", "pset"), 3)
         check("AOF replay hash", c.cmd("HGETALL", "phash"), ["a", "1", "b", "2"])
         check("AOF replay hash len", c.cmd("HLEN", "phash"), 2)
-        check("AOF replay zset card", c.cmd("ZCARD", "pzset"), 3)
+        check("AOF replay zset card", c.cmd("ZCARD", "pzset"), 2)
         check("AOF replay zset score", c.cmd("ZSCORE", "pzset", "y"), "2.25")
-        check("AOF replay zset score int", c.cmd("ZSCORE", "pzset", "z"), "10")
+        check("AOF replay zset incr score", c.cmd("ZSCORE", "pzset", "x"), "2.5")
+        check("AOF replay zset range", c.cmd("ZRANGE", "pzset", "0", "-1"), ["y", "x"])
+        check("AOF replay zset removed gone", c.cmd("ZSCORE", "pzset", "z"), None)
         # The replayed PEXPIRE re-arms blinklist's 50 ms TTL from replay
         # time, so it is briefly alive again. The checks above run only
         # a few ms after the restart, so whether the TTL has passed by
@@ -836,7 +892,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.21.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.22.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

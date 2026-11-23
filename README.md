@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.21.0.
+Version 0.22.0.
 
 ## Why
 
@@ -81,6 +81,11 @@ OK
 | `ZADD key score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing) |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZCARD key` | Number of members (`0` when missing) |
+| `ZRANGE key start stop [WITHSCORES]` | Members in index range, lowest score first; negative indices count from the end, `WITHSCORES` interleaves each score after its member |
+| `ZREVRANGE key start stop [WITHSCORES]` | Same range, highest score first |
+| `ZREM key member [member ...]` | Remove members; returns number removed (the key is deleted when the last member is removed) |
+| `ZRANK key member` | 0-based rank of a member, lowest score first (`nil` when missing) |
+| `ZINCRBY key increment member` | Add to a member's score (creating member and key when missing); returns the new score |
 | `KEYS pattern` | Glob match (`*` and `?`) |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
 | `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` writes a snapshot of the dataset to `dump.rdb` and forces the AOF to disk |
@@ -456,12 +461,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       every score before applying any pair, so a bad score changes
       nothing, and re-adding a member with its current score is a
       no-op that neither logs nor invalidates a `WATCH`. Limitations:
-      no range commands yet (`ZRANGE`/`ZREVRANGE`/`ZRANGEBYSCORE`),
-      no `ZREM`/`ZRANK`/`ZINCRBY`, no `NX`/`XX`/`GT`/`LT`/`CH`/`INCR`
-      options on `ZADD`, and member lookup is a linear scan, so large
-      sorted sets are slower than a skip list would be
+      no range-by-score command yet (`ZRANGEBYSCORE`), no `NX`/`XX`/
+      `GT`/`LT`/`CH`/`INCR` options on `ZADD`, and member lookup is a
+      linear scan, so large sorted sets are slower than a skip list
+      would be
+- [x] Sorted-set ranges and removal (0.22.0): `ZRANGE` / `ZREVRANGE`
+      (negative indices, optional `WITHSCORES`), `ZREM`, `ZRANK`,
+      `ZINCRBY`; `ZREM` deletes the key when the last member goes,
+      `ZINCRBY` with an increment of 0 on an existing member is a
+      no-op like the `ZADD` same-score case. `ZREM` and `ZINCRBY`
+      are mutating commands, so they are AOF-logged and replicated
+      like `ZADD`; the snapshot and full sync already carried whole
+      sorted sets, so they needed no change
 
 ## Next
 
-- [ ] Sorted-set ranges and removal: `ZRANGE`, `ZREVRANGE`,
-      `ZRANGEBYSCORE`, `ZREM`, `ZRANK`, `ZINCRBY`
+- [ ] Sorted-set ranges by score: `ZRANGEBYSCORE`
