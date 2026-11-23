@@ -466,6 +466,34 @@ def main():
             proc.terminate()
             proc.wait(timeout=5)
 
+    # Benchmark tool: tools/bench.py runs against a live server and
+    # exits 0 with a Markdown table (one row per operation). A small
+    # run here just proves the tool works end to end; the real
+    # numbers vs Redis live in the README Benchmarks section.
+    bench_dir = "/tmp/cinder-smoke-bench"
+    proc = start_server(data_dir=bench_dir)
+    try:
+        bench = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(
+                os.path.abspath(__file__)), "..", "tools", "bench.py"),
+             "--port", str(PORT), "--requests", "200", "--pipeline", "10"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            timeout=60,
+        )
+        check("bench exits 0", bench.returncode, 0)
+        check("bench reports SET", "| `SET` |" in bench.stdout, True)
+        check("bench reports GET", "| `GET` |" in bench.stdout, True)
+        check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
+        c = Client(PORT)
+        check("bench INFO version", "0.13.0" in c.cmd("INFO"), True)
+        c.cmd("SHUTDOWN")
+        c.close()
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
     # Replication: REPLICAOF streams a full sync, then live writes.
     # A key whose TTL passed before the sync is not in the dump.
     repl_primary_dir = "/tmp/cinder-smoke-repl-primary"

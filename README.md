@@ -8,7 +8,7 @@ that runs background saves (`BGSAVE`) off the event loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.12.0.
+Version 0.13.0.
 
 ## Why
 
@@ -185,22 +185,38 @@ src/
 
 ## Benchmarks
 
-Sequential (one request at a time, no pipelining) on the dev VM, AOF fsync
-policy `always`:
+Measured with `tools/bench.py` (one client, 5,000 requests per
+operation, pipeline depth 50, mean of 3 runs each), cinder and real
+Redis 8.12.0 back-to-back on the same dev VM. Redis ran with
+persistence off (`--save '' --appendonly no`); cinder ran with its
+AOF on. The VM is a shared, noisy host, so treat these as
+same-ballpark numbers (±20% run to run), not lab precision.
 
-| Operation | Throughput |
-| --- | --- |
-| `SET` | ~25,000 ops/sec |
-| `GET` | ~34,000 ops/sec |
+| Operation | cinder `always` | cinder `everysec` | Redis 8.12.0 |
+| --- | ---: | ---: | ---: |
+| `SET` | ~27,000 | ~26,000 | ~33,000 |
+| `GET` | ~30,000 | ~33,000 | ~35,000 |
+| `INCR` | ~19,000 | ~24,000 | ~37,000 |
+| `LPUSH` | ~21,000 | ~22,000 | ~38,000 |
+| `HSET` | ~25,000 | ~22,000 | ~34,000 |
+| `SET` pipelined | ~149,000 | ~146,000 | ~209,000 |
+| `GET` pipelined | ~241,000 | ~229,000 | ~207,000 |
 
-`SET` pays one `fdatasync` per write under the `always` policy. On this
-dev VM `fdatasync` is cheap, so sequential single-client throughput is
-about the same under `everysec` (~22k–33k SET/s either way); the policy
-still matters where fsync is expensive, and the sync count is the real
+Sequential single-client throughput is latency-bound, so cinder and
+Redis land in the same ballpark on `SET`/`GET`/`HSET` and on
+pipelined `GET` (where cinder is ahead). `INCR` and `LPUSH` trail
+Redis by roughly 2x, and pipelined `SET` by ~1.4x — those are the
+known gaps to close next. `SET` pays one `fdatasync` per write under
+the `always` policy, but on this dev VM `fdatasync` is cheap, so
+`always` and `everysec` measure about the same; the policy still
+matters where fsync is expensive, and the sync count is the real
 difference — verified with `strace`, 200 sequential SETs cost 201
 `fdatasync`s under `always` and 2 under `everysec` (one at the first
-write, one on shutdown). Pipelined clients would be substantially
-faster under either policy.
+write, one on shutdown). Reproduce with:
+
+```sh
+python3 tools/bench.py --port 7777 --compare-port 7780 --label redis
+```
 
 ## Tests
 
@@ -254,7 +270,10 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # second `BGSAVE` completes after the first, and a restart
             # with the AOF deleted restores every key from the background
             # snapshot alone, with a surviving TTL preserved; `--threads 0`
-            # is a startup error)
+            # is a startup error), and a benchmark-tool check
+            # (`tools/bench.py` runs against a live server, exits 0, and
+            # prints one table row per operation, and `INFO` reports
+            # version 0.13.0)
 ```
 
 ## Roadmap
@@ -282,4 +301,8 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
 - [x] Thread pool for the event loop (FIFO job queue, `--threads`,
       default 1; `BGSAVE` serializes on the loop and a worker writes
       the snapshot off-loop, `INFO` reports pool size and save status)
-- [ ] Benchmarks against real Redis on the same hardware
+- [x] Benchmarks against real Redis on the same hardware
+      (`tools/bench.py`: sequential and pipelined SET/GET/INCR/LPUSH/
+      HSET vs Redis 8.12.0, mean of 3 runs each, recorded in the
+      Benchmarks section — same ballpark on SET/GET/HSET and
+      pipelined GET, ~2x behind on INCR/LPUSH)
