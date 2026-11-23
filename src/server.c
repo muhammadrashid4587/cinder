@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.29.0"
+#define CINDER_VERSION "0.30.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -557,6 +557,39 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (rc == -1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         dbuf_int(reply, n);
+        return 0;
+    }
+    if (strcasecmp(cmd, "BITOP") == 0) {
+        if (argc < 4) return dbuf_error(reply, "wrong number of arguments for 'bitop' command"), 0;
+        int op;
+        if (strcasecmp(argv[1], "AND") == 0) op = BITOP_AND;
+        else if (strcasecmp(argv[1], "OR") == 0) op = BITOP_OR;
+        else if (strcasecmp(argv[1], "XOR") == 0) op = BITOP_XOR;
+        else if (strcasecmp(argv[1], "NOT") == 0) op = BITOP_NOT;
+        else return dbuf_error(reply, "syntax error"), 0;
+        if (op == BITOP_NOT) {
+            if (argc != 4)
+                return dbuf_error(reply, "BITOP NOT must be called with a single source key."), 0;
+        } else if (argc < 5) {
+            return dbuf_error(reply, "wrong number of arguments for 'bitop' command"), 0;
+        }
+        long long n = 0;
+        int changed = 0;
+        int rc = store_bitop(g_store, op, argv[2], (const char **)(argv + 3),
+                             argc - 3, &n, &changed);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_int(reply, n);
+        /* Only a real change is logged and replicated: a BITOP
+           whose result matches the destination, or one over
+           missing keys with no destination to delete, changes
+           nothing and does not invalidate a WATCH. */
+        if (changed) {
+            if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+            return 1;
+        }
         return 0;
     }
     if (strcasecmp(cmd, "DEL") == 0) {
@@ -1219,7 +1252,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         static const char *names[] = {"PING", "ECHO", "QUIT", "SHUTDOWN", "SET", "GET",
             "MSET", "MGET", "GETDEL", "GETEX",
             "SETNX", "SETEX", "GETSET", "APPEND", "STRLEN",
-            "GETRANGE", "SETRANGE", "SETBIT", "GETBIT", "BITCOUNT",
+            "GETRANGE", "SETRANGE", "SETBIT", "GETBIT", "BITCOUNT", "BITOP",
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",

@@ -839,6 +839,103 @@ int store_bitcount(Store *s, const char *key, long long start, long long end,
     return 0;
 }
 
+int store_bitop(Store *s, int op, const char *dest, const char **keys, int nkeys,
+                long long *len_out, int *changed_out) {
+    *len_out = 0;
+    *changed_out = 0;
+    /* A non-string destination is an error even when the result
+       would be empty, as in Redis. */
+    Entry *de = store_find(s, dest, NULL);
+    if (de && de->type != ENTRY_STRING) return -1;
+    char **vals = calloc((size_t)nkeys, sizeof(char *));
+    size_t *lens = calloc((size_t)nkeys, sizeof(size_t));
+    if (!vals || !lens) {
+        free(vals);
+        free(lens);
+        return -2;
+    }
+    size_t maxlen = 0;
+    for (int i = 0; i < nkeys; i++) {
+        Entry *e = store_find(s, keys[i], NULL);
+        if (e && e->type != ENTRY_STRING) {
+            for (int j = 0; j < i; j++) free(vals[j]);
+            free(vals);
+            free(lens);
+            return -1;
+        }
+        if (!e) continue; /* a missing source counts as empty */
+        vals[i] = store_get_len(s, keys[i], &lens[i]);
+        if (!vals[i]) {
+            for (int j = 0; j < i; j++) free(vals[j]);
+            free(vals);
+            free(lens);
+            return -2;
+        }
+        if (lens[i] > maxlen) maxlen = lens[i];
+    }
+    *len_out = (long long)maxlen;
+    if (maxlen == 0) {
+        /* Every source is missing: the result is empty and the
+           destination key is deleted, as in Redis. */
+        free(vals);
+        free(lens);
+        if (de) {
+            store_del(s, dest);
+            *changed_out = 1;
+        }
+        return 0;
+    }
+    char *res = calloc(maxlen, 1);
+    if (!res) {
+        for (int i = 0; i < nkeys; i++) free(vals[i]);
+        free(vals);
+        free(lens);
+        return -2;
+    }
+    switch (op) {
+    case BITOP_AND:
+        if (vals[0]) memcpy(res, vals[0], lens[0]);
+        for (int i = 1; i < nkeys; i++) {
+            for (size_t b = 0; b < lens[i]; b++) res[b] &= vals[i][b];
+            /* Bytes past the end of this source count as zero, so
+               AND zeroes them in the result — a missing source
+               zeroes the whole result, as in Redis. */
+            for (size_t b = lens[i]; b < maxlen; b++) res[b] = 0;
+        }
+        break;
+    case BITOP_OR:
+        for (int i = 0; i < nkeys; i++)
+            for (size_t b = 0; b < lens[i]; b++) res[b] |= vals[i][b];
+        break;
+    case BITOP_XOR:
+        for (int i = 0; i < nkeys; i++)
+            for (size_t b = 0; b < lens[i]; b++) res[b] ^= vals[i][b];
+        break;
+    case BITOP_NOT: /* exactly one source, enforced by the caller */
+        for (size_t b = 0; b < lens[0]; b++) res[b] = (char)~vals[0][b];
+        break;
+    }
+    for (int i = 0; i < nkeys; i++) free(vals[i]);
+    free(vals);
+    free(lens);
+    /* A result identical to what the destination already holds
+       changes nothing: no version bump, no log, as with SETBIT. */
+    if (de && de->value_len == maxlen && memcmp(de->value, res, maxlen) == 0) {
+        free(res);
+        return 0;
+    }
+    /* Overwrites the destination wholesale and clears its TTL, like
+       a SET; the sources were all copied first, so the destination
+       may also be one of them. */
+    if (!store_set_len(s, dest, res, maxlen, -1)) {
+        free(res);
+        return -2;
+    }
+    free(res);
+    *changed_out = 1;
+    return 0;
+}
+
 int store_del(Store *s, const char *key) {
     Entry *prev = NULL;
     (void)prev;

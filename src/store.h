@@ -140,6 +140,25 @@ int store_getbit(Store *s, const char *key, long long offset, int *out);
    -1 = wrong type. */
 int store_bitcount(Store *s, const char *key, long long start, long long end,
                    int has_range, long long *out);
+/* Bitwise operations across string values. */
+#define BITOP_AND 0
+#define BITOP_OR 1
+#define BITOP_XOR 2
+#define BITOP_NOT 3
+/* Bitwise operation across string values, Redis BITOP semantics:
+   AND/OR/XOR take two or more source keys, NOT takes exactly one.
+   A missing source key counts as an empty string, so the result is
+   as long as the longest source. The result overwrites the
+   destination key, whatever it held, and clears its TTL, as in
+   Redis. When every source is missing the result is empty and the
+   destination key is deleted, as in Redis. Returns 0 on success
+   (*len_out is the result length in bytes; *changed_out is 1 when
+   the stored state actually changed, 0 when the destination already
+   held exactly the result, or the result was empty and there was no
+   destination to delete), -1 = wrong type (the destination or a
+   source holds a non-string), -2 = out of memory. */
+int store_bitop(Store *s, int op, const char *dest, const char **keys, int nkeys,
+                long long *len_out, int *changed_out);
 /* Increment a string key's integer value by delta, in one hash lookup.
    Creates the key when missing (or expired). The TTL is untouched, so
    INCR preserves it, as in Redis. Returns 0 on success (*out is the

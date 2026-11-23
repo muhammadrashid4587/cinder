@@ -437,7 +437,51 @@ def main():
         check("COMMAND lists SETBIT", "SETBIT" in c.cmd("COMMAND"), True)
         check("COMMAND lists GETBIT", "GETBIT" in c.cmd("COMMAND"), True)
         check("COMMAND lists BITCOUNT", "BITCOUNT" in c.cmd("COMMAND"), True)
-        check("string bits cleanup", c.cmd("DEL", "bits", "zb", "bt", "bl"), 4)
+        # BITOP: bitwise AND / OR / XOR / NOT across string keys.
+        check("SET bitop a", c.cmd("SET", "ba", "foobar"), "OK")
+        check("SET bitop b", c.cmd("SET", "bb", "abcdef"), "OK")
+        check("BITOP AND", c.cmd("BITOP", "AND", "bd", "ba", "bb"), 6)
+        check("GET BITOP AND", c.cmd("GET", "bd"), "`bc`ab")
+        check("BITOP OR", c.cmd("BITOP", "OR", "bd", "ba", "bb"), 6)
+        check("GET BITOP OR", c.cmd("GET", "bd"), "goofev")
+        check("BITOP XOR", c.cmd("BITOP", "XOR", "bd", "ba", "bb"), 6)
+        check("GET BITOP XOR", c.cmd("GET", "bd"), "\x07\r\x0c\x06\x04\x14")
+        # A missing source counts as an empty string: AND with it is all zeros.
+        check("BITOP AND missing", c.cmd("BITOP", "AND", "bd", "ba", "ghost"), 6)
+        check("GET BITOP AND missing", c.cmd("GET", "bd"), "\x00\x00\x00\x00\x00\x00")
+        # Every source missing: empty result, the destination is deleted.
+        check("BITOP all missing", c.cmd("BITOP", "AND", "bd", "ghost1", "ghost2"), 0)
+        check("EXISTS after empty BITOP", c.cmd("EXISTS", "bd"), 0)
+        check("BITOP all missing no dest", c.cmd("BITOP", "OR", "bd", "ghost1", "ghost2"), 0)
+        # NOT inverts the single source; checked by length and bit count
+        # (the bytes themselves are not valid UTF-8, so GET is not compared).
+        check("BITOP NOT", c.cmd("BITOP", "NOT", "bd", "ba"), 6)
+        check("STRLEN BITOP NOT", c.cmd("STRLEN", "bd"), 6)
+        check("BITCOUNT BITOP NOT", c.cmd("BITCOUNT", "bd"), 22)
+        check("BITOP NOT missing", c.cmd("BITOP", "NOT", "bd", "ghost"), 0)
+        check("EXISTS after NOT missing", c.cmd("EXISTS", "bd"), 0)
+        # BITOP overwrites the destination and clears its TTL, like SET.
+        check("SET EX bitop ttl", c.cmd("SET", "bd", "x", "EX", "100"), "OK")
+        check("BITOP clears TTL", c.cmd("BITOP", "AND", "bd", "ba", "bb"), 6)
+        check("TTL after BITOP", c.cmd("TTL", "bd"), -1)
+        # The destination may also be a source key.
+        check("BITOP dest is source", c.cmd("BITOP", "AND", "ba", "ba", "bb"), 6)
+        check("GET dest is source", c.cmd("GET", "ba"), "`bc`ab")
+        # Errors.
+        check("BITOP bad op", c.cmd("BITOP", "NAND", "bd", "ba", "bb"),
+              ("error", "ERR syntax error"))
+        check("BITOP AND one key", c.cmd("BITOP", "AND", "bd", "ba"),
+              ("error", "ERR wrong number of arguments for 'bitop' command"))
+        check("BITOP NOT two keys", c.cmd("BITOP", "NOT", "bd", "ba", "bb"),
+              ("error", "ERR BITOP NOT must be called with a single source key."))
+        check("BITOP wrong args", c.cmd("BITOP", "AND", "bd"),
+              ("error", "ERR wrong number of arguments for 'bitop' command"))
+        check("BITOP wrongtype source", c.cmd("BITOP", "AND", "bd", "ba", "bl"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("BITOP wrongtype dest", c.cmd("BITOP", "AND", "bl", "ba", "bb"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("COMMAND lists BITOP", "BITOP" in c.cmd("COMMAND"), True)
+        check("string bits cleanup", c.cmd("DEL", "bits", "zb", "bt", "bl", "ba", "bb", "bd"), 7)
         # MSET / MGET: set and get several string keys at once.
         check("MSET", c.cmd("MSET", "m1", "one", "m2", "two", "m3", "three"), "OK")
         check("MGET all", c.cmd("MGET", "m1", "m2", "m3"), ["one", "two", "three"])
@@ -1304,7 +1348,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.29.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.30.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

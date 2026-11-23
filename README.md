@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.29.0.
+Version 0.30.0.
 
 ## Why
 
@@ -67,6 +67,7 @@ OK
 | `SETBIT key offset value` | Set one bit (`0` or `1`, bit 0 is the high bit of byte 0), creating the key zero-padded when missing; returns the old bit; preserves the TTL; setting a bit that already holds the value changes nothing and is not logged |
 | `GETBIT key offset` | Bit value (`0` when missing or out of range) |
 | `BITCOUNT key [start end]` | Count set bits, optionally over a byte range (negative indexes count from the end, out-of-range ends are clamped); `0` when missing |
+| `BITOP op dest key [key ...]` | Bitwise `AND` / `OR` / `XOR` across string keys (`NOT` takes exactly one key); a missing source counts as an empty string, the result is as long as the longest input, it overwrites the destination and clears its TTL; when every source is missing the result is empty and the destination is deleted, returning `0` |
 | `DEL key [key ...]`, `EXISTS key [key ...]` | Multi-key delete / existence |
 | `EXPIRE key s`, `PEXPIRE key ms` | Set a TTL |
 | `TTL key`, `PTTL key` | Remaining TTL (`-2` missing, `-1` no expiry) |
@@ -363,7 +364,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # is a startup error), and a benchmark-tool check
             # (`tools/bench.py` runs against a live server, exits 0, and
             # prints one table row per operation, and `INFO` reports
-            # version 0.29.0), and `always`-policy checks (a pipeline
+            # version 0.30.0), and `always`-policy checks (a pipeline
             # mixing writes and reads returns its replies in command
             # order, two clients writing at once each get their own
             # +OK, a QUIT sent in the same packet as a SET still
@@ -413,7 +414,13 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # values, wrong-type and wrong-argument errors; `COMMAND`
             # lists all three; and a replication full sync rebuilds
             # bit keys byte-identically, including values ending in a
-            # zero byte)
+            # zero byte), and `BITOP` checks (`AND`/`OR`/`XOR`/`NOT`
+            # results, a missing source counting as empty, an
+            # all-missing result deleting the destination, `NOT` of a
+            # missing key, the destination TTL being cleared, the
+            # destination also being a source, bad-op and
+            # wrong-argument and wrong-type errors, and `COMMAND`
+            # listing `BITOP`)
 ```
 
 ## Roadmap
@@ -621,7 +628,22 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       value ending in one gets a trailing `SETBIT` of its last bit,
       which zero-pads it back to its full length
 
+- [x] `BITOP` (0.30.0): bitwise `AND` / `OR` / `XOR` / `NOT` across
+      string keys, the follow-on to the bit commands. A missing source
+      key counts as an empty string, so the result is as long as the
+      longest input; the result overwrites the destination key and
+      clears its TTL, as in Redis; when every source is missing the
+      result is empty and the destination key is deleted, returning 0.
+      A result identical to the destination changes nothing, so it is
+      not AOF-logged or replicated and does not invalidate a `WATCH`.
+      The raw command is logged when it changes state, so AOF replay
+      and live replication reproduce it, and the snapshot and full
+      sync already carried whole strings, so they needed no change.
+      Limitation: the whole result is computed in memory before it is
+      written, so a `BITOP` over 512 MB strings transiently holds two
+      copies of the longest input
+
 ## Next
 
-- [ ] `BITOP` (bitwise `AND` / `OR` / `XOR` / `NOT` across string
-      keys, the natural follow-on to the bit commands)
+- [ ] `BITFIELD` (get/set/increment bit fields in a string key, the
+      natural follow-on to the bit commands)
