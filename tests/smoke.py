@@ -422,6 +422,51 @@ def main():
               ("error", "ERR syntax error"))
         check("ZRANGEBYSCORE wrongtype", c.cmd("ZRANGEBYSCORE", "after", "0", "10"), wrongtype)
         check("COMMAND lists ZRANGEBYSCORE", "ZRANGEBYSCORE" in c.cmd("COMMAND"), True)
+        # Reversed ranges by score. Same myzset (c=0.5, d=1.5, a=5, b=5);
+        # bounds are max-first, as in Redis, and ties come back in
+        # reverse member order (b before a).
+        check("ZREVRANGEBYSCORE all", c.cmd("ZREVRANGEBYSCORE", "myzset", "10", "0"),
+              ["b", "a", "d", "c"])
+        check("ZREVRANGEBYSCORE slice", c.cmd("ZREVRANGEBYSCORE", "myzset", "5", "1"),
+              ["b", "a", "d"])
+        check("ZREVRANGEBYSCORE excl max", c.cmd("ZREVRANGEBYSCORE", "myzset", "(5", "1"),
+              ["d"])
+        check("ZREVRANGEBYSCORE excl min", c.cmd("ZREVRANGEBYSCORE", "myzset", "5", "(1"),
+              ["b", "a", "d"])
+        check("ZREVRANGEBYSCORE excl both",
+              c.cmd("ZREVRANGEBYSCORE", "myzset", "(5", "(0.5"), ["d"])
+        check("ZREVRANGEBYSCORE infinities",
+              c.cmd("ZREVRANGEBYSCORE", "myzset", "+inf", "-inf"),
+              ["b", "a", "d", "c"])
+        check("ZREVRANGEBYSCORE withscores",
+              c.cmd("ZREVRANGEBYSCORE", "myzset", "+inf", "-inf", "WITHSCORES"),
+              ["b", "5", "a", "5", "d", "1.5", "c", "0.5"])
+        check("ZREVRANGEBYSCORE limit", c.cmd("ZREVRANGEBYSCORE", "myzset", "10", "0",
+                                               "LIMIT", "1", "2"), ["a", "d"])
+        check("ZREVRANGEBYSCORE limit all", c.cmd("ZREVRANGEBYSCORE", "myzset", "10", "0",
+                                                   "LIMIT", "0", "-1"),
+              ["b", "a", "d", "c"])
+        check("ZREVRANGEBYSCORE limit past end",
+              c.cmd("ZREVRANGEBYSCORE", "myzset", "10", "0", "LIMIT", "10", "5"), [])
+        check("ZREVRANGEBYSCORE limit withscores",
+              c.cmd("ZREVRANGEBYSCORE", "myzset", "10", "0", "WITHSCORES", "LIMIT", "2", "1"),
+              ["d", "1.5"])
+        check("ZREVRANGEBYSCORE reversed bounds",
+              c.cmd("ZREVRANGEBYSCORE", "myzset", "0", "10"), [])
+        check("ZREVRANGEBYSCORE empty slice",
+              c.cmd("ZREVRANGEBYSCORE", "myzset", "3", "2"), [])
+        check("ZREVRANGEBYSCORE missing",
+              c.cmd("ZREVRANGEBYSCORE", "ghostzset", "+inf", "-inf"), [])
+        check("ZREVRANGEBYSCORE wrong args", c.cmd("ZREVRANGEBYSCORE", "myzset", "10"),
+              ("error", "ERR wrong number of arguments for 'zrevrangebyscore' command"))
+        check("ZREVRANGEBYSCORE bad bound", c.cmd("ZREVRANGEBYSCORE", "myzset", "xx", "0"),
+              ("error", "ERR value is not a valid float"))
+        check("ZREVRANGEBYSCORE bad option",
+              c.cmd("ZREVRANGEBYSCORE", "myzset", "10", "0", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("ZREVRANGEBYSCORE wrongtype",
+              c.cmd("ZREVRANGEBYSCORE", "after", "10", "0"), wrongtype)
+        check("COMMAND lists ZREVRANGEBYSCORE", "ZREVRANGEBYSCORE" in c.cmd("COMMAND"), True)
         check("ZREM one", c.cmd("ZREM", "myzset", "b"), 1)
         check("ZCARD after ZREM", c.cmd("ZCARD", "myzset"), 3)
         check("ZRANK removed member", c.cmd("ZRANK", "myzset", "b"), None)
@@ -938,7 +983,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.23.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.24.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

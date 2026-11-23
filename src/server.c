@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.23.0"
+#define CINDER_VERSION "0.24.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -762,14 +762,25 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(scores);
         return 0;
     }
-    if (strcasecmp(cmd, "ZRANGEBYSCORE") == 0) {
+    if (strcasecmp(cmd, "ZRANGEBYSCORE") == 0 ||
+        strcasecmp(cmd, "ZREVRANGEBYSCORE") == 0) {
+        /* ZREVRANGEBYSCORE takes its bounds max-first, as in Redis,
+           and returns the matches highest score first; the bound
+           parsing, WITHSCORES and LIMIT handling are otherwise the
+           same as ZRANGEBYSCORE. */
+        int reverse = strcasecmp(cmd, "ZREVRANGEBYSCORE") == 0;
         if (argc < 4)
-            return dbuf_error(reply, "wrong number of arguments for 'zrangebyscore' command"), 0;
+            return dbuf_error(reply, reverse ? "wrong number of arguments for 'zrevrangebyscore' command" : "wrong number of arguments for 'zrangebyscore' command"), 0;
         double min, max;
         int min_excl, max_excl;
-        if (!parse_score_bound(argv[2], &min, &min_excl) ||
-            !parse_score_bound(argv[3], &max, &max_excl))
+        if (reverse) {
+            if (!parse_score_bound(argv[2], &max, &max_excl) ||
+                !parse_score_bound(argv[3], &min, &min_excl))
+                return dbuf_error(reply, "value is not a valid float"), 0;
+        } else if (!parse_score_bound(argv[2], &min, &min_excl) ||
+                   !parse_score_bound(argv[3], &max, &max_excl)) {
             return dbuf_error(reply, "value is not a valid float"), 0;
+        }
         int withscores = 0;
         int have_limit = 0;
         long long offset = 0, count = -1;
@@ -792,7 +803,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         double *scores = NULL;
         size_t n = 0;
         int rc = store_zrangebyscore(g_store, argv[1], min, min_excl,
-                                     max, max_excl, offset, count,
+                                     max, max_excl, offset, count, reverse,
                                      &members, &scores, &n);
         if (rc == -1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
@@ -925,7 +936,8 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
-            "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE", "ZREM",
+            "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
+            "ZREVRANGEBYSCORE", "ZREM",
             "ZRANK", "ZINCRBY",
             "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",

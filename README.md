@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.23.0.
+Version 0.24.0.
 
 ## Why
 
@@ -84,6 +84,7 @@ OK
 | `ZRANGE key start stop [WITHSCORES]` | Members in index range, lowest score first; negative indices count from the end, `WITHSCORES` interleaves each score after its member |
 | `ZREVRANGE key start stop [WITHSCORES]` | Same range, highest score first |
 | `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]` | Members whose scores fall in `[min, max]`; bounds may be `-inf`/`+inf` or exclusive with a leading `(` (e.g. `(5`); `LIMIT` skips `offset` matches and returns at most `count` (negative `count` means all); `WITHSCORES` interleaves each score after its member |
+| `ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]` | Same range, highest score first; bounds are `max` first, as in Redis, with the same exclusive/inf/`WITHSCORES`/`LIMIT` handling |
 | `ZREM key member [member ...]` | Remove members; returns number removed (the key is deleted when the last member is removed) |
 | `ZRANK key member` | 0-based rank of a member, lowest score first (`nil` when missing) |
 | `ZINCRBY key increment member` | Add to a member's score (creating member and key when missing); returns the new score |
@@ -298,7 +299,11 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # and RDB snapshot and replication full-sync checks for
             # scores), and score-range checks (inclusive and exclusive
             # bounds, infinities, WITHSCORES, LIMIT offset/count,
-            # reversed bounds, missing key, bad bounds and options), an AOF
+            # reversed bounds, missing key, bad bounds and options),
+            # and reversed score-range checks (max-first bounds,
+            # exclusive bounds and infinities, WITHSCORES, LIMIT
+            # offset/count, ties in reverse member order, missing
+            # key, bad bounds and options), an AOF
             # restart test (data, a list, a set, a hash and a sorted set survive a
             # SHUTDOWN and reload), and everysec-policy checks (INFO
             # reports the policy, the AOF holds the record before any
@@ -343,7 +348,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # is a startup error), and a benchmark-tool check
             # (`tools/bench.py` runs against a live server, exits 0, and
             # prints one table row per operation, and `INFO` reports
-            # version 0.18.0), and `always`-policy checks (a pipeline
+            # version 0.24.0), and `always`-policy checks (a pipeline
             # mixing writes and reads returns its replies in command
             # order, two clients writing at once each get their own
             # +OK, a QUIT sent in the same packet as a SET still
@@ -482,10 +487,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       supported, a negative `LIMIT` count means all matches; a
       read-only command, so no AOF, RDB, or replication change was
       needed. The store scans the already score-sorted member array
-      in one pass, so no new data structure. Limitation: no
-      `ZREVRANGEBYSCORE` yet, and member lookup is still a linear
-      scan, so large sorted sets are slower than a skip list would be
+      in one pass, so no new data structure. Limitation: member
+      lookup is still a linear scan, so large sorted sets are slower
+      than a skip list would be
+- [x] Sorted-set ranges by score, reversed (0.24.0):
+      `ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset
+      count]`, bounds max-first as in Redis, same exclusive/inf/
+      `WITHSCORES`/`LIMIT` handling as `ZRANGEBYSCORE`, highest
+      score first (on a score tie, the last member first); also
+      read-only, so no AOF, RDB, or replication change was needed.
+      The reversed scan walks the same sorted array from the top
+      down. Limitation: member lookup is still a linear scan, so
+      large sorted sets are slower than a skip list would be
 
 ## Next
 
-- [ ] Sorted-set ranges by score, reversed: `ZREVRANGEBYSCORE`
+- [ ] Sorted-set `ZADD` options (`NX`/`XX`/`GT`/`LT`/`CH`/`INCR`)

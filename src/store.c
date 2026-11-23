@@ -1232,15 +1232,17 @@ int store_zrange(Store *s, const char *key, long long start, long long stop,
     return 0;
 }
 
-/* Members whose scores fall in [min, max], ascending by score, with
-   an endpoint excluded when its flag is set. Skips `offset` matches
-   and returns at most `count` (`count < 0` means all). The array is
-   already sorted by (score, member), so one linear scan finds the
-   matching slice. */
+/* Members whose scores fall in [min, max], ascending by score, or
+   descending when reverse is set, with an endpoint excluded when
+   its flag is set. Skips `offset` matches and returns at most
+   `count` (`count < 0` means all). The array is already sorted by
+   (score, member), so one linear scan finds the matching slice; a
+   reversed scan walks it from the top down. */
 int store_zrangebyscore(Store *s, const char *key, double min, int min_excl,
                         double max, int max_excl, long long offset,
-                        long long count, char ***members_out,
-                        double **scores_out, size_t *n_out) {
+                        long long count, int reverse,
+                        char ***members_out, double **scores_out,
+                        size_t *n_out) {
     *members_out = NULL;
     *scores_out = NULL;
     *n_out = 0;
@@ -1270,7 +1272,11 @@ int store_zrangebyscore(Store *s, const char *key, double min, int min_excl,
         return -2;
     }
     size_t seen = 0, out = 0;
-    for (size_t i = 0; i < z->len && out < n; i++) {
+    for (size_t k = 0; k < z->len && out < n; k++) {
+        /* Reversed scans walk the sorted array from the top down, so
+           the highest scores (and, on a tie, the last member) come
+           first, as in Redis. */
+        size_t i = reverse ? z->len - 1 - k : k;
         double sc = z->scores[i];
         if ((min_excl ? sc <= min : sc < min) ||
             (max_excl ? sc >= max : sc > max))
