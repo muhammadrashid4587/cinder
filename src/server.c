@@ -265,6 +265,21 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_simple(reply, "OK");
         return 1;
     }
+    if (strcasecmp(cmd, "MSET") == 0) {
+        if (argc < 3 || (argc % 2) == 0)
+            return dbuf_error(reply, "wrong number of arguments for 'mset' command"), 0;
+        /* store_set overwrites any type, as in Redis: an MSET over a
+           list/set/hash key replaces it with the string. A duplicate
+           key in one call takes the last value. Single-threaded, so
+           the whole call is atomic with respect to other clients. */
+        for (int i = 1; i < argc; i += 2) {
+            if (!store_set(g_store, argv[i], argv[i + 1], -1))
+                return dbuf_error(reply, "out of memory"), 0;
+        }
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_simple(reply, "OK");
+        return 1;
+    }
     if (strcasecmp(cmd, "GET") == 0) {
         if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'get' command"), 0;
         if (store_type(g_store, argv[1]) > 1)
@@ -273,6 +288,26 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (!v) return dbuf_null(reply), 0;
         dbuf_bulk(reply, v, strlen(v));
         free(v);
+        return 0;
+    }
+    if (strcasecmp(cmd, "MGET") == 0) {
+        if (argc < 2) return dbuf_error(reply, "wrong number of arguments for 'mget' command"), 0;
+        /* Unlike GET, a key holding a non-string is nil here, not a
+           WRONGTYPE error — that is real Redis behaviour. */
+        dbuf_array_header(reply, (long long)(argc - 1));
+        for (int i = 1; i < argc; i++) {
+            if (store_type(g_store, argv[i]) > 1) {
+                dbuf_null(reply);
+                continue;
+            }
+            char *v = store_get(g_store, argv[i]);
+            if (!v) {
+                dbuf_null(reply);
+                continue;
+            }
+            dbuf_bulk(reply, v, strlen(v));
+            free(v);
+        }
         return 0;
     }
     if (strcasecmp(cmd, "GETDEL") == 0) {
@@ -659,7 +694,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
     }
     if (strcasecmp(cmd, "COMMAND") == 0) {
         static const char *names[] = {"PING", "ECHO", "QUIT", "SHUTDOWN", "SET", "GET",
-            "GETDEL", "GETEX",
+            "MSET", "MGET", "GETDEL", "GETEX",
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",

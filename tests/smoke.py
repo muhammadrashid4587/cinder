@@ -181,6 +181,21 @@ def main():
         check("GETEX wrongtype", c.cmd("GETEX", "gdl"),
               ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
         check("GETDEL/GETEX cleanup", c.cmd("DEL", "ge", "gdl"), 2)
+        # MSET / MGET: set and get several string keys at once.
+        check("MSET", c.cmd("MSET", "m1", "one", "m2", "two", "m3", "three"), "OK")
+        check("MGET all", c.cmd("MGET", "m1", "m2", "m3"), ["one", "two", "three"])
+        check("MGET missing", c.cmd("MGET", "m1", "ghost", "m3"), ["one", None, "three"])
+        check("MSET odd args", c.cmd("MSET", "m1", "one", "m2"),
+              ("error", "ERR wrong number of arguments for 'mset' command"))
+        check("MSET no args", c.cmd("MSET"),
+              ("error", "ERR wrong number of arguments for 'mset' command"))
+        check("MGET no args", c.cmd("MGET"),
+              ("error", "ERR wrong number of arguments for 'mget' command"))
+        check("RPUSH mget list", c.cmd("RPUSH", "ml", "a"), 1)
+        check("MGET wrongtype is nil", c.cmd("MGET", "m1", "ml"), ["one", None])
+        check("MSET overwrites list", c.cmd("MSET", "ml", "now-string"), "OK")
+        check("GET overwritten list", c.cmd("GET", "ml"), "now-string")
+        check("MSET/MGET cleanup", c.cmd("DEL", "m1", "m2", "m3", "ml"), 4)
         check("SET persist", c.cmd("SET", "durable", "yes"), "OK")
         info = c.cmd("INFO")
         check("INFO has keys", "keys:4" in info, True)

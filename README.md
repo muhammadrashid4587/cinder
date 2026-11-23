@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.19.0.
+Version 0.20.0.
 
 ## Why
 
@@ -52,7 +52,9 @@ OK
 | --- | --- |
 | `PING [msg]`, `ECHO msg` | Connectivity |
 | `SET key value [EX s \| PX ms] [NX \| XX]` | String set with TTL and conditional write |
+| `MSET key value [key value ...]` | Set several string keys at once (overwrites a non-string key with a string) |
 | `GET key` | String get |
+| `MGET key [key ...]` | Get several string keys at once (`nil` for a missing key or a key holding a non-string value) |
 | `GETDEL key` | Return the value and delete the key (`nil` when missing) |
 | `GETEX key [EX s \| PX ms \| PERSIST]` | Return the value and set, refresh, or remove its TTL (`nil` when missing; no option leaves the TTL alone) |
 | `DEL key [key ...]`, `EXISTS key [key ...]` | Multi-key delete / existence |
@@ -427,3 +429,12 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       and replicated only when they actually change state (a missing
       key, a bare `GETEX`, or `PERSIST` on a key with no TTL logs
       nothing)
+- [x] `MSET` / `MGET` (0.20.0): `MSET` sets several string keys in one
+      call (overwriting a list/set/hash key with a string, as in Redis;
+      a duplicate key in one call takes the last value), `MGET` returns
+      the values in order with `nil` for a missing key or a key holding
+      a non-string value — unlike `GET`, a wrong-type key is `nil`, not
+      a `WRONGTYPE` error; `MSET` is AOF-logged and replicated, `MGET`
+      is read-only. Limitation: on an out-of-memory failure midway
+      through an `MSET`, the pairs set before the failure stay set
+      (same partial-apply behaviour as `HSET` in this codebase)
