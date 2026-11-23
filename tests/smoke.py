@@ -259,6 +259,63 @@ def main():
         check("GETEX wrongtype", c.cmd("GETEX", "gdl"),
               ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
         check("GETDEL/GETEX cleanup", c.cmd("DEL", "ge", "gdl"), 2)
+        # String misc: SETNX / SETEX / GETSET / APPEND / STRLEN.
+        check("SETNX new", c.cmd("SETNX", "nx", "one"), 1)
+        check("GET after SETNX", c.cmd("GET", "nx"), "one")
+        check("SETNX existing", c.cmd("SETNX", "nx", "two"), 0)
+        check("GET after SETNX existing", c.cmd("GET", "nx"), "one")
+        check("SETNX wrong args", c.cmd("SETNX", "nx"),
+              ("error", "ERR wrong number of arguments for 'setnx' command"))
+        check("RPUSH setnx list", c.cmd("RPUSH", "nxl", "a"), 1)
+        check("SETNX over list is 0", c.cmd("SETNX", "nxl", "x"), 0)
+        check("SETNX leaves list alone", c.cmd("LRANGE", "nxl", "0", "-1"), ["a"])
+        check("SETEX", c.cmd("SETEX", "sx", "100", "val"), "OK")
+        check("GET after SETEX", c.cmd("GET", "sx"), "val")
+        check("TTL after SETEX ~", 99 <= c.cmd("TTL", "sx") <= 100, True)
+        check("SETEX bad ttl 0", c.cmd("SETEX", "sx", "0", "val"),
+              ("error", "ERR invalid expire time in 'setex' command"))
+        check("SETEX bad ttl text", c.cmd("SETEX", "sx", "ten", "val"),
+              ("error", "ERR invalid expire time in 'setex' command"))
+        check("SETEX wrong args", c.cmd("SETEX", "sx", "100"),
+              ("error", "ERR wrong number of arguments for 'setex' command"))
+        check("SETEX overwrites list", c.cmd("SETEX", "nxl", "100", "now-string"), "OK")
+        check("GET overwritten list", c.cmd("GET", "nxl"), "now-string")
+        check("GETSET missing", c.cmd("GETSET", "gs", "first"), None)
+        check("GET after GETSET missing", c.cmd("GET", "gs"), "first")
+        check("GETSET", c.cmd("GETSET", "gs", "second"), "first")
+        check("GET after GETSET", c.cmd("GET", "gs"), "second")
+        check("SET EX getset ttl", c.cmd("SET", "gs", "v", "EX", "100"), "OK")
+        check("GETSET clears TTL", c.cmd("GETSET", "gs", "w"), "v")
+        check("TTL after GETSET", c.cmd("TTL", "gs"), -1)
+        check("GETSET wrong args", c.cmd("GETSET", "gs"),
+              ("error", "ERR wrong number of arguments for 'getset' command"))
+        check("RPUSH getset list", c.cmd("RPUSH", "gsl", "a"), 1)
+        check("GETSET wrongtype", c.cmd("GETSET", "gsl", "x"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("APPEND new", c.cmd("APPEND", "ap", "hello"), 5)
+        check("GET after APPEND new", c.cmd("GET", "ap"), "hello")
+        check("APPEND", c.cmd("APPEND", "ap", " world"), 11)
+        check("GET after APPEND", c.cmd("GET", "ap"), "hello world")
+        check("APPEND empty", c.cmd("APPEND", "ap", ""), 11)
+        check("SET EX append ttl", c.cmd("SET", "ap", "x", "EX", "100"), "OK")
+        check("APPEND preserves TTL", c.cmd("APPEND", "ap", "y"), 2)
+        check("TTL after APPEND ~", 99 <= c.cmd("TTL", "ap") <= 100, True)
+        check("APPEND wrong args", c.cmd("APPEND", "ap"),
+              ("error", "ERR wrong number of arguments for 'append' command"))
+        check("APPEND wrongtype", c.cmd("APPEND", "gsl", "x"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("STRLEN", c.cmd("STRLEN", "ap"), 2)
+        check("STRLEN missing", c.cmd("STRLEN", "ghost"), 0)
+        check("STRLEN wrong args", c.cmd("STRLEN"),
+              ("error", "ERR wrong number of arguments for 'strlen' command"))
+        check("STRLEN wrongtype", c.cmd("STRLEN", "gsl"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("COMMAND lists SETNX", "SETNX" in c.cmd("COMMAND"), True)
+        check("COMMAND lists SETEX", "SETEX" in c.cmd("COMMAND"), True)
+        check("COMMAND lists GETSET", "GETSET" in c.cmd("COMMAND"), True)
+        check("COMMAND lists APPEND", "APPEND" in c.cmd("COMMAND"), True)
+        check("COMMAND lists STRLEN", "STRLEN" in c.cmd("COMMAND"), True)
+        check("string misc cleanup", c.cmd("DEL", "nx", "sx", "gs", "gsl", "ap", "nxl"), 6)
         # MSET / MGET: set and get several string keys at once.
         check("MSET", c.cmd("MSET", "m1", "one", "m2", "two", "m3", "three"), "OK")
         check("MGET all", c.cmd("MGET", "m1", "m2", "m3"), ["one", "two", "three"])
@@ -1116,7 +1173,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.26.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.27.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.26.0.
+Version 0.27.0.
 
 ## Why
 
@@ -57,6 +57,11 @@ OK
 | `MGET key [key ...]` | Get several string keys at once (`nil` for a missing key or a key holding a non-string value) |
 | `GETDEL key` | Return the value and delete the key (`nil` when missing) |
 | `GETEX key [EX s \| PX ms \| PERSIST]` | Return the value and set, refresh, or remove its TTL (`nil` when missing; no option leaves the TTL alone) |
+| `SETNX key value` | Set only when the key does not exist; returns `1` when set, `0` when the key already exists (whatever type it holds) |
+| `SETEX key seconds value` | Set a string with a TTL in seconds (`invalid expire time` when the TTL is not a positive integer; overwrites any type, like `SET`) |
+| `GETSET key value` | Return the old value and set the new one (`nil` when missing; clears the TTL) |
+| `APPEND key value` | Append to a string, creating the key when missing, and return the new length; preserves the TTL |
+| `STRLEN key` | Length of a string (`0` when missing) |
 | `DEL key [key ...]`, `EXISTS key [key ...]` | Multi-key delete / existence |
 | `EXPIRE key s`, `PEXPIRE key ms` | Set a TTL |
 | `TTL key`, `PTTL key` | Remaining TTL (`-2` missing, `-1` no expiry) |
@@ -375,7 +380,14 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # `DISCARD` clear the watch set, `WATCH` inside `MULTI` is
             # an error while `UNWATCH` inside `MULTI` queues and runs
             # at `EXEC`, a no-op `SADD` does not invalidate a watch,
-            # and `COMMAND` lists `WATCH` and `UNWATCH`)
+            # and `COMMAND` lists `WATCH` and `UNWATCH`), and string-misc
+            # checks (`SETNX` sets only when absent and returns `0`
+            # for a key that already exists, even a list; `SETEX`
+            # sets the value plus a TTL and rejects a bad TTL;
+            # `GETSET` returns the old value and clears the TTL;
+            # `APPEND` appends or creates and preserves the TTL;
+            # `STRLEN` returns the length, `0` for a missing key,
+            # and wrong-type errors for the commands that take one)
 ```
 
 ## Roadmap
@@ -535,9 +547,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       or returned twice, as in Redis, and a scan over a mostly-empty
       table with a selective `MATCH` can walk the whole table in one
       call before returning anything
+- [x] String misc commands (0.27.0): `SETNX` / `SETEX` / `GETSET` /
+      `APPEND` / `STRLEN`. `SETNX` returns `1` only when it sets
+      (a key that exists, of any type, answers `0`); `SETEX` sets
+      the value plus a TTL in seconds and rejects a non-positive
+      TTL; `GETSET` returns the old value (`nil` when missing) and
+      clears the TTL; `APPEND` grows the stored string in place
+      and preserves the TTL, creating the key when missing; `STRLEN`
+      returns the length, `0` for a missing key. All five are
+      AOF-logged and replicated when they change state (a `SETNX`
+      that does not set logs nothing); the mutating ones bump the
+      key's version, so `WATCH` sees them. `COMMAND` lists all five
 
 ## Next
 
-- [ ] String misc commands: `SETNX` / `SETEX` / `GETSET` / `APPEND` /
-      `STRLEN` (smallest remaining string slice; `GETDEL`/`GETEX`
-      already exist)
+- [ ] String ranges: `GETRANGE` / `SETRANGE` (substring read and
+      overwrite, zero-padding past the end)

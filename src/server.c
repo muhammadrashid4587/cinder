@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.26.0"
+#define CINDER_VERSION "0.27.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -402,6 +402,67 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             store_expire(g_store, argv[1], expire_at);
             return 1;
         }
+        return 0;
+    }
+    if (strcasecmp(cmd, "SETNX") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'setnx' command"), 0;
+        /* SETNX returns 0 when the key already exists, whatever it
+           holds — that is real Redis behaviour, not a WRONGTYPE
+           error — and only a real set is logged or replicated. */
+        if (store_exists(g_store, argv[1])) return dbuf_int(reply, 0), 0;
+        if (!store_set(g_store, argv[1], argv[2], -1))
+            return dbuf_error(reply, "out of memory"), 0;
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_int(reply, 1);
+        return 1;
+    }
+    if (strcasecmp(cmd, "SETEX") == 0) {
+        if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'setex' command"), 0;
+        long long s;
+        if (!parse_ll(argv[2], &s) || s <= 0)
+            return dbuf_error(reply, "invalid expire time in 'setex' command"), 0;
+        /* SETEX overwrites any type, like SET. */
+        if (!store_set(g_store, argv[1], argv[3], now_ms() + s * 1000))
+            return dbuf_error(reply, "out of memory"), 0;
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_simple(reply, "OK");
+        return 1;
+    }
+    if (strcasecmp(cmd, "GETSET") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'getset' command"), 0;
+        if (store_type(g_store, argv[1]) > 1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        char *old = store_get(g_store, argv[1]);
+        /* GETSET clears the TTL, like a plain SET. */
+        if (!store_set(g_store, argv[1], argv[2], -1)) {
+            free(old);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        if (!old) return dbuf_null(reply), 1;
+        dbuf_bulk(reply, old, strlen(old));
+        free(old);
+        return 1;
+    }
+    if (strcasecmp(cmd, "APPEND") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'append' command"), 0;
+        long long n = store_append(g_store, argv[1], argv[2]);
+        if (n == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (n == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_int(reply, n);
+        return 1;
+    }
+    if (strcasecmp(cmd, "STRLEN") == 0) {
+        if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'strlen' command"), 0;
+        if (store_type(g_store, argv[1]) > 1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        char *v = store_get(g_store, argv[1]);
+        if (!v) return dbuf_int(reply, 0), 0;
+        dbuf_int(reply, (long long)strlen(v));
+        free(v);
         return 0;
     }
     if (strcasecmp(cmd, "DEL") == 0) {
@@ -1063,6 +1124,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
     if (strcasecmp(cmd, "COMMAND") == 0) {
         static const char *names[] = {"PING", "ECHO", "QUIT", "SHUTDOWN", "SET", "GET",
             "MSET", "MGET", "GETDEL", "GETEX",
+            "SETNX", "SETEX", "GETSET", "APPEND", "STRLEN",
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",

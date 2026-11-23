@@ -562,6 +562,43 @@ int store_incr(Store *s, const char *key, long long delta, long long *out) {
     return 0;
 }
 
+long long store_append(Store *s, const char *key, const char *value) {
+    Entry *e = store_find(s, key, NULL);
+    if (e) {
+        if (e->type != ENTRY_STRING) return -1;
+        /* Grow the stored string in place; the expiry is untouched,
+           so APPEND preserves the TTL, as in Redis. */
+        size_t old = strlen(e->value);
+        size_t add = strlen(value);
+        char *nv = realloc(e->value, old + add + 1);
+        if (!nv) return -2;
+        e->value = nv;
+        memcpy(e->value + old, value, add + 1);
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+        return (long long)(old + add);
+    }
+    if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+        store_resize(s);
+    e = calloc(1, sizeof(Entry));
+    if (!e) return -2;
+    e->key = strdup(key);
+    e->value = strdup(value);
+    if (!e->key || !e->value) {
+        entry_free(e);
+        return -2;
+    }
+    e->type = ENTRY_STRING;
+    e->expire_at = -1;
+    e->last_access = ++s->clock;
+    e->version = ++s->mod_seq;
+    size_t idx = hash_key(key) % s->cap;
+    e->next = s->buckets[idx];
+    s->buckets[idx] = e;
+    s->count++;
+    return (long long)strlen(value);
+}
+
 int store_del(Store *s, const char *key) {
     Entry *prev = NULL;
     (void)prev;

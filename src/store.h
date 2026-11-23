@@ -94,6 +94,10 @@ char *store_get(Store *s, const char *key);
    -3 = out of memory. */
 int store_incr(Store *s, const char *key, long long delta, long long *out);
 int store_del(Store *s, const char *key);
+/* Append value to a string key's value, creating the key when missing.
+   Preserves the key's TTL, as in Redis. Returns the new length,
+   -1 = wrong type, -2 = out of memory. */
+long long store_append(Store *s, const char *key, const char *value);
 int store_exists(Store *s, const char *key);
 int store_expire(Store *s, const char *key, long long expire_at);
 /* -2 = no such key, -1 = key exists with no expiry, otherwise ms remaining. */
