@@ -44,6 +44,9 @@ typedef struct Entry {
     Hash *hash; /* hash values (type == ENTRY_HASH) */
     long long expire_at; /* ms since epoch, -1 = no expiry */
     unsigned long long last_access; /* logical clock, for approximate LRU */
+    unsigned long long version; /* bumped on every real change to this
+                                   key (WATCH compares it); 0 is never
+                                   a live version, it means "no key" */
     struct Entry *next;
 } Entry;
 
@@ -52,6 +55,11 @@ typedef struct Store {
     size_t cap;
     size_t count;
     unsigned long long clock; /* increments on every access */
+    unsigned long long mod_seq; /* increments on every key mutation;
+                                   entry versions come from it */
+    unsigned long long flush_seq; /* increments on every FLUSHALL, so
+                                     a flush invalidates even a watch
+                                     on a key that did not exist */
 } Store;
 
 long long now_ms(void);
@@ -77,6 +85,13 @@ int store_expire(Store *s, const char *key, long long expire_at);
 long long store_ttl_ms(Store *s, const char *key);
 size_t store_size(Store *s);
 void store_flush(Store *s);
+/* Version of a key as WATCH sees it: the entry's version, or 0 when
+   the key is missing or expired. */
+unsigned long long store_key_version(Store *s, const char *key);
+/* How many FLUSHALLs have run; WATCH records it alongside the key
+   version so a flush of a key that did not exist still invalidates
+   the watch. */
+unsigned long long store_flush_seq(Store *s);
 /* Delete expired entries found in a sample of buckets. Returns count removed. */
 size_t store_expire_scan(Store *s, size_t sample_buckets);
 /* Evict approximately-least-recently-used entries until count <= max_entries. */

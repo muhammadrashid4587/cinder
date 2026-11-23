@@ -317,6 +317,14 @@ static Entry *store_find(Store *s, const char *key, Entry ***prev_out) {
     return NULL;
 }
 
+/* Stamp an entry with the next modification sequence number: every
+   real change to a key calls this, so WATCH can tell the key moved.
+   A write that changes nothing (SADD of a member already present,
+   HSET of an identical value) does not touch the version. */
+static void entry_touch(Store *s, Entry *e) {
+    e->version = ++s->mod_seq;
+}
+
 int store_set(Store *s, const char *key, const char *value, long long expire_at) {
     Entry *e = store_find(s, key, NULL);
     if (e) {
@@ -340,6 +348,7 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
         e->value = nv;
         e->expire_at = expire_at;
         e->last_access = ++s->clock;
+        entry_touch(s, e);
         return 1;
     }
     if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
@@ -355,6 +364,7 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
     e->type = ENTRY_STRING;
     e->expire_at = expire_at;
     e->last_access = ++s->clock;
+    e->version = ++s->mod_seq;
     size_t idx = hash_key(key) % s->cap;
     e->next = s->buckets[idx];
     s->buckets[idx] = e;
@@ -402,6 +412,7 @@ int store_incr(Store *s, const char *key, long long delta, long long *out) {
         }
         memcpy(e->value, vbuf, nlen + 1);
         e->last_access = ++s->clock;
+        entry_touch(s, e);
     } else {
         if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
             store_resize(s);
@@ -416,6 +427,7 @@ int store_incr(Store *s, const char *key, long long delta, long long *out) {
         e->type = ENTRY_STRING;
         e->expire_at = -1;
         e->last_access = ++s->clock;
+        e->version = ++s->mod_seq;
         size_t idx = hash_key(key) % s->cap;
         e->next = s->buckets[idx];
         s->buckets[idx] = e;
@@ -445,6 +457,7 @@ int store_expire(Store *s, const char *key, long long expire_at) {
     Entry *e = store_find(s, key, NULL);
     if (!e) return 0;
     e->expire_at = expire_at;
+    entry_touch(s, e);
     return 1;
 }
 
@@ -483,6 +496,19 @@ void store_flush(Store *s) {
         s->buckets[i] = NULL;
     }
     s->count = 0;
+    /* Every key is gone at once, so every watch is dirty — even a
+       watch on a key that did not exist, whose version reads 0
+       before and after. */
+    s->flush_seq++;
+}
+
+unsigned long long store_key_version(Store *s, const char *key) {
+    Entry *e = store_find(s, key, NULL);
+    return e ? e->version : 0;
+}
+
+unsigned long long store_flush_seq(Store *s) {
+    return s->flush_seq;
 }
 
 size_t store_expire_scan(Store *s, size_t sample_buckets) {
@@ -613,6 +639,7 @@ static long long store_list_push(Store *s, const char *key, const char *elem,
                       : list_push_tail(e->list, elem)))
             return -2;
         e->last_access = ++s->clock;
+        entry_touch(s, e);
         return (long long)e->list->len;
     }
     if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
@@ -628,6 +655,7 @@ static long long store_list_push(Store *s, const char *key, const char *elem,
     e->type = ENTRY_LIST;
     e->expire_at = -1;
     e->last_access = ++s->clock;
+    e->version = ++s->mod_seq;
     if (!(at_head ? list_push_head(e->list, elem)
                   : list_push_tail(e->list, elem))) {
         entry_free(e);
@@ -667,6 +695,7 @@ static char *store_list_pop(Store *s, const char *key, int *wrongtype,
         s->count--;
     } else {
         e->last_access = ++s->clock;
+        entry_touch(s, e);
     }
     return el;
 }
@@ -726,7 +755,10 @@ long long store_sadd(Store *s, const char *key, const char *member) {
         if (e->type != ENTRY_SET) return -1;
         int rc = set_add(e->set, member);
         if (rc < 0) return -2;
-        if (rc) e->last_access = ++s->clock;
+        if (rc) {
+            e->last_access = ++s->clock;
+            entry_touch(s, e);
+        }
         return rc;
     }
     if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
@@ -742,6 +774,7 @@ long long store_sadd(Store *s, const char *key, const char *member) {
     e->type = ENTRY_SET;
     e->expire_at = -1;
     e->last_access = ++s->clock;
+    e->version = ++s->mod_seq;
     if (set_add(e->set, member) < 0) {
         entry_free(e);
         return -2;
@@ -766,6 +799,7 @@ long long store_srem(Store *s, const char *key, const char *member) {
         s->count--;
     } else {
         e->last_access = ++s->clock;
+        entry_touch(s, e);
     }
     return 1;
 }
@@ -817,9 +851,17 @@ long long store_hset(Store *s, const char *key, const char *field,
     Entry *e = store_find(s, key, NULL);
     if (e) {
         if (e->type != ENTRY_HASH) return -1;
+        /* A field set to the value it already holds changes nothing,
+           so it does not touch the version; a new field or a changed
+           value does. */
+        long long idx = hash_find(e->hash, field);
+        int changed = idx < 0 || strcmp(e->hash->values[idx], value) != 0;
         int rc = hash_put(e->hash, field, value);
         if (rc < 0) return -2;
-        e->last_access = ++s->clock;
+        if (changed) {
+            e->last_access = ++s->clock;
+            entry_touch(s, e);
+        }
         return rc;
     }
     if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
@@ -835,6 +877,7 @@ long long store_hset(Store *s, const char *key, const char *field,
     e->type = ENTRY_HASH;
     e->expire_at = -1;
     e->last_access = ++s->clock;
+    e->version = ++s->mod_seq;
     if (hash_put(e->hash, field, value) < 0) {
         entry_free(e);
         return -2;
@@ -868,6 +911,7 @@ long long store_hdel(Store *s, const char *key, const char *field) {
         s->count--;
     } else {
         e->last_access = ++s->clock;
+        entry_touch(s, e);
     }
     return 1;
 }

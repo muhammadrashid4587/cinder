@@ -313,6 +313,113 @@ def main():
         check("COMMAND lists MULTI", "MULTI" in c.cmd("COMMAND"), True)
         check("COMMAND lists EXEC", "EXEC" in c.cmd("COMMAND"), True)
         check("COMMAND lists DISCARD", "DISCARD" in c.cmd("COMMAND"), True)
+        # WATCH: optimistic locking for MULTI/EXEC. A watched key that
+        # changes between WATCH and EXEC — by another client, by
+        # expiry, or by FLUSHALL — aborts the transaction with a nil
+        # array and the queued writes never run. UNWATCH, EXEC and
+        # DISCARD all clear the watch set.
+        check("WATCH no keys", c.cmd("WATCH"),
+              ("error", "ERR wrong number of arguments for 'watch' command"))
+        check("UNWATCH no watch", c.cmd("UNWATCH"), "OK")
+        check("SET wkey", c.cmd("SET", "wkey", "v1"), "OK")
+        check("WATCH wkey", c.cmd("WATCH", "wkey"), "OK")
+        check("MULTI watch clean", c.cmd("MULTI"), "OK")
+        check("MULTI watch SET queued", c.cmd("SET", "wkey", "v2"), "QUEUED")
+        check("EXEC watch clean", c.cmd("EXEC"), ["OK"])
+        check("wkey after clean EXEC", c.cmd("GET", "wkey"), "v2")
+        # Dirty via SET by another client: EXEC aborts, queued write
+        # never runs.
+        check("WATCH wkey 2", c.cmd("WATCH", "wkey"), "OK")
+        check("other client SET wkey", c2.cmd("SET", "wkey", "v3"), "OK")
+        check("MULTI watch dirty", c.cmd("MULTI"), "OK")
+        check("MULTI dirty SET queued", c.cmd("SET", "wkey", "v4"), "QUEUED")
+        check("EXEC watch dirty aborts", c.cmd("EXEC"), None)
+        check("wkey unchanged after abort", c.cmd("GET", "wkey"), "v3")
+        # Dirty via creation of a watched-but-missing key.
+        check("WATCH wmissing", c.cmd("WATCH", "wmissing"), "OK")
+        check("other client creates wmissing", c2.cmd("SET", "wmissing", "x"), "OK")
+        check("MULTI watch missing", c.cmd("MULTI"), "OK")
+        check("MULTI missing SET queued", c.cmd("SET", "wkey", "v5"), "QUEUED")
+        check("EXEC watch created aborts", c.cmd("EXEC"), None)
+        check("wkey unchanged after create abort", c.cmd("GET", "wkey"), "v3")
+        # Dirty via DEL of a watched key.
+        check("WATCH wkey 3", c.cmd("WATCH", "wkey"), "OK")
+        check("other client DEL wkey", c2.cmd("DEL", "wkey"), 1)
+        check("MULTI watch deleted", c.cmd("MULTI"), "OK")
+        check("MULTI deleted SET queued", c.cmd("SET", "wkey", "v6"), "QUEUED")
+        check("EXEC watch deleted aborts", c.cmd("EXEC"), None)
+        check("wkey still gone after abort", c.cmd("GET", "wkey"), None)
+        # Dirty via expiry of a watched key.
+        check("SET wexp PX", c.cmd("SET", "wexp", "v", "PX", "100"), "OK")
+        check("WATCH wexp", c.cmd("WATCH", "wexp"), "OK")
+        time.sleep(0.15)
+        check("MULTI watch expired", c.cmd("MULTI"), "OK")
+        check("MULTI expired SET queued", c.cmd("SET", "wexp", "v2"), "QUEUED")
+        check("EXEC watch expired aborts", c.cmd("EXEC"), None)
+        check("wexp gone after expiry", c.cmd("GET", "wexp"), None)
+        # UNWATCH clears the set: a dirty key no longer aborts.
+        check("SET wkey again", c.cmd("SET", "wkey", "v7"), "OK")
+        check("WATCH wkey 4", c.cmd("WATCH", "wkey"), "OK")
+        check("other client SET wkey 2", c2.cmd("SET", "wkey", "v8"), "OK")
+        check("UNWATCH", c.cmd("UNWATCH"), "OK")
+        check("MULTI after UNWATCH", c.cmd("MULTI"), "OK")
+        check("MULTI unwatch SET queued", c.cmd("SET", "wkey", "v9"), "QUEUED")
+        check("EXEC after UNWATCH runs", c.cmd("EXEC"), ["OK"])
+        check("wkey after UNWATCH EXEC", c.cmd("GET", "wkey"), "v9")
+        # WATCH inside MULTI is an error; UNWATCH inside MULTI queues
+        # and runs at EXEC, as in real Redis.
+        check("MULTI watch err", c.cmd("MULTI"), "OK")
+        check("WATCH inside MULTI", c.cmd("WATCH", "wkey"),
+              ("error", "ERR WATCH inside MULTI is not allowed"))
+        check("UNWATCH inside MULTI queues", c.cmd("UNWATCH"), "QUEUED")
+        check("EXEC with queued UNWATCH", c.cmd("EXEC"), ["OK"])
+        # EXEC clears the watch set: a later change does not abort.
+        check("WATCH wkey 5", c.cmd("WATCH", "wkey"), "OK")
+        check("MULTI watch clear", c.cmd("MULTI"), "OK")
+        check("MULTI clear SET queued", c.cmd("SET", "wkey", "v10"), "QUEUED")
+        check("EXEC clears watch", c.cmd("EXEC"), ["OK"])
+        check("other client SET wkey 3", c2.cmd("SET", "wkey", "v11"), "OK")
+        check("MULTI after EXEC", c.cmd("MULTI"), "OK")
+        check("MULTI after EXEC SET queued", c.cmd("SET", "wkey", "v12"), "QUEUED")
+        check("EXEC after EXEC runs", c.cmd("EXEC"), ["OK"])
+        # DISCARD clears the watch set too.
+        check("WATCH wkey 6", c.cmd("WATCH", "wkey"), "OK")
+        check("MULTI discard watch", c.cmd("MULTI"), "OK")
+        check("DISCARD clears watch", c.cmd("DISCARD"), "OK")
+        check("other client SET wkey 4", c2.cmd("SET", "wkey", "v13"), "OK")
+        check("MULTI after DISCARD", c.cmd("MULTI"), "OK")
+        check("MULTI after DISCARD SET queued", c.cmd("SET", "wkey", "v14"), "QUEUED")
+        check("EXEC after DISCARD runs", c.cmd("EXEC"), ["OK"])
+        # A no-op write (SADD of a member already present) does not
+        # invalidate a watch.
+        check("SADD wset m", c.cmd("SADD", "wset", "m"), 1)
+        check("WATCH wset", c.cmd("WATCH", "wset"), "OK")
+        check("other client SADD dup", c2.cmd("SADD", "wset", "m"), 0)
+        check("MULTI noop watch", c.cmd("MULTI"), "OK")
+        check("MULTI noop SET queued", c.cmd("SET", "wkey", "v15"), "QUEUED")
+        check("EXEC noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("watch keys cleanup", c.cmd("DEL", "wkey", "wmissing", "wset"), 3)
+        # FLUSHALL invalidates even a watch on a key that never
+        # existed; it wipes the dataset, so rebuild the four keys the
+        # AOF restart section below expects (after, plist, pset, phash).
+        check("WATCH wnever", c.cmd("WATCH", "wnever"), "OK")
+        check("FLUSHALL watch", c.cmd("FLUSHALL"), "OK")
+        check("MULTI flush watch", c.cmd("MULTI"), "OK")
+        check("MULTI flush SET queued", c.cmd("SET", "wkey", "v16"), "QUEUED")
+        check("EXEC flush watch aborts", c.cmd("EXEC"), None)
+        # The flush also wiped the transaction keys, so rebuild them
+        # for the tx cleanup below, alongside the four keys the AOF
+        # restart section expects.
+        check("rebuild txkey", c.cmd("SET", "txkey", "txval"), "OK")
+        check("rebuild txctr", c.cmd("SET", "txctr", "1"), "OK")
+        check("rebuild txkey2", c.cmd("SET", "txkey2", "v2"), "OK")
+        check("rebuild txlist", c.cmd("RPUSH", "txlist", "a", "b"), 2)
+        check("rebuild after", c.cmd("SET", "after", "flush"), "OK")
+        check("rebuild plist", c.cmd("RPUSH", "plist", "x", "y", "z"), 3)
+        check("rebuild pset", c.cmd("SADD", "pset", "x", "y", "z"), 3)
+        check("rebuild phash", c.cmd("HSET", "phash", "a", "1", "b", "2"), 2)
+        check("COMMAND lists WATCH", "WATCH" in c.cmd("COMMAND"), True)
+        check("COMMAND lists UNWATCH", "UNWATCH" in c.cmd("COMMAND"), True)
         # Clean up the transaction keys: the AOF restart below counts
         # exact keys (4: after, plist, pset, phash).
         check("tx cleanup", c.cmd("DEL", "txkey", "txctr", "txkey2", "txlist"), 4)
@@ -641,7 +748,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.17.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.18.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

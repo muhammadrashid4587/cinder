@@ -38,7 +38,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.17.0"
+#define CINDER_VERSION "0.18.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -176,6 +176,7 @@ static int dbuf_simple(Dbuf *b, const char *msg) { return dbuf_putf(b, "+%s\r\n"
 static int dbuf_error(Dbuf *b, const char *msg) { return dbuf_putf(b, "-ERR %s\r\n", msg); }
 static int dbuf_int(Dbuf *b, long long v) { return dbuf_putf(b, ":%lld\r\n", v); }
 static int dbuf_null(Dbuf *b) { return dbuf_put(b, "$-1\r\n", 5); }
+static int dbuf_null_array(Dbuf *b) { return dbuf_put(b, "*-1\r\n", 5); }
 static int dbuf_bulk(Dbuf *b, const char *str, size_t slen) {
     if (dbuf_putf(b, "$%zu\r\n", slen) < 0) return -1;
     if (dbuf_put(b, str, slen) < 0) return -1;
@@ -604,7 +605,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
-            "MULTI", "EXEC", "DISCARD",
+            "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
             "SYNC", "PSYNC", "REPLICAOF"};
         dbuf_array_header(reply, (long long)(sizeof(names) / sizeof(names[0])));
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
@@ -675,6 +676,15 @@ typedef struct {
     int argc;
 } QueuedCmd;
 
+/* One key a client WATCHed: the key, the version it had when watched
+   (0 = it did not exist), and the store's flush generation then, so
+   a FLUSHALL invalidates even a watch on a key that did not exist. */
+typedef struct {
+    char *key;
+    unsigned long long version;
+    unsigned long long flush_seq;
+} WatchedKey;
+
 typedef struct Client {
     int fd;
     unsigned long long gen; /* generation: distinguishes this client
@@ -690,6 +700,10 @@ typedef struct Client {
     QueuedCmd *queue;   /* queued commands, in the order received */
     size_t queue_len;
     size_t queue_cap;
+    WatchedKey *watch;  /* keys this client WATCHed, with the version
+                           each had when watched */
+    size_t watch_len;
+    size_t watch_cap;
     unsigned long long deferred_last_target; /* append seq of this
         client's most recent deferred reply (0 = none pending) */
     size_t deferred_count; /* replies of this client still queued */
@@ -786,6 +800,62 @@ static int multi_queue(Client *c, char **argv, int argc) {
     return 0;
 }
 
+/* Drop a client's whole WATCH set, freeing the key copies. A no-op
+   on a client that never watched anything. */
+static void watch_clear(Client *c) {
+    for (size_t i = 0; i < c->watch_len; i++)
+        free(c->watch[i].key);
+    free(c->watch);
+    c->watch = NULL;
+    c->watch_len = 0;
+    c->watch_cap = 0;
+}
+
+/* Record a key in a client's WATCH set with the version it has right
+   now (0 when it does not exist) and the store's flush generation.
+   Re-watching a key refreshes its recorded version, as in Redis.
+   Returns 0 on success, -1 on allocation failure. */
+static int watch_add(Client *c, const char *key) {
+    unsigned long long ver = store_key_version(g_store, key);
+    unsigned long long fs = store_flush_seq(g_store);
+    for (size_t i = 0; i < c->watch_len; i++) {
+        if (strcmp(c->watch[i].key, key) == 0) {
+            c->watch[i].version = ver;
+            c->watch[i].flush_seq = fs;
+            return 0;
+        }
+    }
+    if (c->watch_len == c->watch_cap) {
+        size_t ncap = c->watch_cap ? c->watch_cap * 2 : 8;
+        WatchedKey *nw = realloc(c->watch, ncap * sizeof(WatchedKey));
+        if (!nw) return -1;
+        c->watch = nw;
+        c->watch_cap = ncap;
+    }
+    c->watch[c->watch_len].key = strdup(key);
+    if (!c->watch[c->watch_len].key) return -1;
+    c->watch[c->watch_len].version = ver;
+    c->watch[c->watch_len].flush_seq = fs;
+    c->watch_len++;
+    return 0;
+}
+
+/* Has any key this client WATCHed changed since it was watched: a
+   different version now (created, modified, deleted, or expired —
+   expiry deletes the entry, so its version reads 0), or a FLUSHALL
+   since, which bumps the flush generation even for keys that never
+   existed. 1 = dirty, EXEC must abort. */
+static int watch_dirty(Client *c) {
+    unsigned long long fs = store_flush_seq(g_store);
+    for (size_t i = 0; i < c->watch_len; i++) {
+        if (c->watch[i].flush_seq != fs) return 1;
+        if (store_key_version(g_store, c->watch[i].key) !=
+            c->watch[i].version)
+            return 1;
+    }
+    return 0;
+}
+
 /* Recompute a client's epoll interest from its current state and
    update the registration only when it changed. Called once per loop
    iteration for every client, before epoll_wait: the poll() loop this
@@ -816,6 +886,7 @@ static void client_remove(size_t idx) {
     /* A client that disconnects mid-transaction drops its queue with
        it: nothing queued ever executes. */
     multi_clear(&g_clients[idx]);
+    watch_clear(&g_clients[idx]);
     g_clients[idx] = g_clients[--g_nclients];
 }
 
@@ -1431,17 +1502,42 @@ static void gen_replid(char out[41]) {
    array waits for the sync covering the last append it made, like
    any mutating reply. A QUIT queued in the transaction closes the
    client once the array is sent; a queued SHUTDOWN stops the server
-   (via *shutdown_out). WATCH is not implemented: it is an unknown
-   command, so queueing it answers +QUEUED and EXEC reports the
-   error in the array. */
+   (via *shutdown_out). WATCH is optimistic locking: if any key the
+   client watched changed since it was watched — created, modified,
+   deleted, expired, or flushed away — EXEC aborts, answers a nil
+   array, and the queue never runs. The watch set is cleared after
+   EXEC either way, and after DISCARD, as in Redis. A queued UNWATCH
+   runs at EXEC and clears the set, which is a no-op by then: the
+   dirty check already ran. */
 static void handle_exec(Client *c, int *shutdown_out) {
     Dbuf reply = {0};
+    if (watch_dirty(c)) {
+        /* Optimistic lock lost: the queue never runs, the client gets
+           a nil multi-bulk reply, and the watch set is gone. */
+        dbuf_null_array(&reply);
+        multi_clear(c);
+        watch_clear(c);
+        c->in_multi = 0;
+        client_reply(c, &reply, 0);
+        free(reply.data);
+        return;
+    }
     dbuf_array_header(&reply, (long long)c->queue_len);
     unsigned long long last_seq = 0;
     int quit = 0;
     for (size_t i = 0; i < c->queue_len; i++) {
         QueuedCmd *q = &c->queue[i];
         Dbuf sub = {0};
+        if (strcasecmp(q->argv[0], "UNWATCH") == 0) {
+            /* UNWATCH queues like any other command inside MULTI (as
+               in real Redis) and runs at EXEC: it clears the watch
+               set and answers +OK, and is never AOF-logged. */
+            watch_clear(c);
+            dbuf_simple(&sub, "OK");
+            dbuf_put(&reply, sub.data, sub.len);
+            free(sub.data);
+            continue;
+        }
         int drc = dispatch(q->argv, q->argc, &sub);
         if (drc == 1 && !g_replaying) {
             last_seq = aof_append(q->argv, q->argc);
@@ -1456,6 +1552,7 @@ static void handle_exec(Client *c, int *shutdown_out) {
         if (drc == 3) *shutdown_out = 1;
     }
     multi_clear(c);
+    watch_clear(c);
     c->in_multi = 0;
     client_reply(c, &reply, last_seq);
     free(reply.data);
@@ -1850,11 +1947,15 @@ int main(int argc, char **argv) {
                     } else if (c->in_multi &&
                                strcasecmp(cargv[0], "MULTI") != 0 &&
                                strcasecmp(cargv[0], "EXEC") != 0 &&
-                               strcasecmp(cargv[0], "DISCARD") != 0) {
+                               strcasecmp(cargv[0], "DISCARD") != 0 &&
+                               strcasecmp(cargv[0], "WATCH") != 0) {
                         /* Inside MULTI, every other command queues
                            instead of executing: the client gets
                            +QUEUED and the command runs at EXEC, in
-                           order, atomically with the rest. */
+                           order, atomically with the rest. WATCH is
+                           not queued: it runs at once and errors
+                           inside MULTI, as in Redis. UNWATCH does
+                           queue, as in Redis, and runs at EXEC. */
                         Dbuf reply = {0};
                         if (multi_queue(c, cargv, cargc) < 0)
                             dbuf_error(&reply, "ERR out of memory");
@@ -1907,11 +2008,11 @@ int main(int argc, char **argv) {
                             free(reply.data);
                         }
                     } else {
-                        /* MULTI/EXEC/DISCARD are transaction control,
-                           handled here rather than in dispatch: they
-                           are per-client state, not store operations,
-                           and they are never AOF-logged or replicated
-                           — only the commands EXEC runs are. */
+                        /* MULTI/EXEC/DISCARD/WATCH/UNWATCH are transaction
+                           control, handled here rather than in dispatch:
+                           they are per-client state, not store
+                           operations, and they are never AOF-logged or
+                           replicated — only the commands EXEC runs are. */
                         if (strcasecmp(cargv[0], "MULTI") == 0) {
                             Dbuf reply = {0};
                             if (cargc != 1)
@@ -1946,7 +2047,39 @@ int main(int argc, char **argv) {
                                 dbuf_error(&reply, "DISCARD without MULTI");
                             else {
                                 multi_clear(c);
+                                watch_clear(c);
                                 c->in_multi = 0;
+                                dbuf_simple(&reply, "OK");
+                            }
+                            client_reply(c, &reply, 0);
+                            free(reply.data);
+                        } else if (strcasecmp(cargv[0], "WATCH") == 0) {
+                            Dbuf reply = {0};
+                            if (cargc < 2)
+                                dbuf_error(&reply, "wrong number of arguments for 'watch' command");
+                            else if (c->in_multi)
+                                dbuf_error(&reply, "WATCH inside MULTI is not allowed");
+                            else {
+                                int bad = 0;
+                                for (int k = 1; k < cargc; k++) {
+                                    if (watch_add(c, cargv[k]) < 0) {
+                                        bad = 1;
+                                        break;
+                                    }
+                                }
+                                if (bad)
+                                    dbuf_error(&reply, "ERR out of memory");
+                                else
+                                    dbuf_simple(&reply, "OK");
+                            }
+                            client_reply(c, &reply, 0);
+                            free(reply.data);
+                        } else if (strcasecmp(cargv[0], "UNWATCH") == 0) {
+                            Dbuf reply = {0};
+                            if (cargc != 1)
+                                dbuf_error(&reply, "wrong number of arguments for 'unwatch' command");
+                            else {
+                                watch_clear(c);
                                 dbuf_simple(&reply, "OK");
                             }
                             client_reply(c, &reply, 0);

@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.17.0.
+Version 0.18.0.
 
 ## Why
 
@@ -67,7 +67,8 @@ OK
 | `SISMEMBER key member` | `1` if member, `0` if not |
 | `SCARD key` | Set size (`0` when missing) |
 | `HSET key field value [field value ...]` | Set fields; returns number of new fields (updates return `0` for that field) |
-| `MULTI`, `EXEC`, `DISCARD` | Transactions: `MULTI` queues commands (`+QUEUED` per command, nested `MULTI` is an error), `EXEC` runs the queue in order and returns one reply per command (an error inside the transaction takes its place in the array and the rest still run), `DISCARD` drops the queue; `EXEC`/`DISCARD` without `MULTI` are errors. Queued writes are invisible to other clients until `EXEC` runs, and the commands `EXEC` runs are AOF-logged and replicated individually, never `MULTI`/`EXEC` themselves. `WATCH` is not supported yet (future work) |
+| `MULTI`, `EXEC`, `DISCARD` | Transactions: `MULTI` queues commands (`+QUEUED` per command, nested `MULTI` is an error), `EXEC` runs the queue in order and returns one reply per command (an error inside the transaction takes its place in the array and the rest still run), `DISCARD` drops the queue; `EXEC`/`DISCARD` without `MULTI` are errors. Queued writes are invisible to other clients until `EXEC` runs, and the commands `EXEC` runs are AOF-logged and replicated individually, never `MULTI`/`EXEC` themselves |
+| `WATCH key [key ...]`, `UNWATCH` | Optimistic locking for `MULTI`/`EXEC`: `WATCH` records the version each key has right now (0 when it does not exist); if any watched key is created, modified, deleted, expired, or flushed away before `EXEC`, `EXEC` aborts with a nil array and the queue never runs. `UNWATCH` clears the watch set, as do `EXEC` and `DISCARD`; `WATCH` inside `MULTI` is an error, while `UNWATCH` inside `MULTI` queues and runs at `EXEC`, as in real Redis. A write that changes nothing (SADD of a member already present, HSET of an identical value) does not invalidate a watch. Limitation: a watched key that did not exist, was created and deleted again before `EXEC`, reads as version 0 again, so the abort is not detected — the version scheme cannot see a create-plus-delete round trip |
 | `HGET key field` | Field value (`nil` when missing) |
 | `HDEL key field [field ...]` | Delete fields; returns number removed; emptying the hash deletes the key |
 | `HEXISTS key field` | `1` if the field exists, `0` if not |
@@ -319,7 +320,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # is a startup error), and a benchmark-tool check
             # (`tools/bench.py` runs against a live server, exits 0, and
             # prints one table row per operation, and `INFO` reports
-            # version 0.17.0), and `always`-policy checks (a pipeline
+            # version 0.18.0), and `always`-policy checks (a pipeline
             # mixing writes and reads returns its replies in command
             # order, two clients writing at once each get their own
             # +OK, a QUIT sent in the same packet as a SET still
@@ -334,7 +335,14 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # still running, `DISCARD` drops the queue, an empty
             # `EXEC` returns an empty array, a nested array reply
             # comes back nested inside the `EXEC` array, and `COMMAND`
-            # lists `MULTI`, `EXEC` and `DISCARD`)
+            # lists `MULTI`, `EXEC` and `DISCARD`), and WATCH checks
+            # (a clean `EXEC` runs, a `SET`/`DEL`/create/expiry/`FLUSHALL`
+            # of a watched key by another client aborts `EXEC` with a
+            # nil array and the queued write never runs, `UNWATCH`/`EXEC`/
+            # `DISCARD` clear the watch set, `WATCH` inside `MULTI` is
+            # an error while `UNWATCH` inside `MULTI` queues and runs
+            # at `EXEC`, a no-op `SADD` does not invalidate a watch,
+            # and `COMMAND` lists `WATCH` and `UNWATCH`)
 ```
 
 ## Roadmap
@@ -396,7 +404,17 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       error inside a transaction takes its place in the array and the
       rest still run, queued writes are invisible to other clients
       until `EXEC`, and the commands `EXEC` runs are AOF-logged and
-      replicated individually. `WATCH` is not supported yet — it is
-      an unknown command, so queueing it answers `+QUEUED` and
-      `EXEC` reports the error in the array; optimistic locking
-      (`WATCH`/`UNWATCH`) is the follow-up slice
+      replicated individually
+- [x] Optimistic locking: `WATCH`/`UNWATCH` (0.18.0): every key
+      carries a modification version (a global sequence, bumped on
+      every real change to a key; a no-op write does not bump it),
+      `WATCH` records the version each key has then, and `EXEC`
+      aborts with a nil array when any watched key moved — created,
+      modified, deleted, expired, or flushed away (`FLUSHALL` bumps
+      a separate generation, so even a watch on a key that never
+      existed is invalidated). `UNWATCH`, `EXEC` and `DISCARD` clear
+      the watch set; `WATCH` inside `MULTI` is an error, `UNWATCH`
+      inside `MULTI` queues and runs at `EXEC`, as in real Redis.
+      Known limitation: a watched key that did not exist, was created
+      and deleted again before `EXEC`, reads as version 0 again, so
+      that round trip is not detected
