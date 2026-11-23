@@ -37,7 +37,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.14.0"
+#define CINDER_VERSION "0.15.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -558,6 +558,15 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_putf(&info, "keys:%zu\r\n", store_size(g_store));
         dbuf_putf(&info, "max_entries:%zu\r\n", g_max_entries);
         dbuf_putf(&info, "aof_fsync_policy:%s\r\n", aof_policy_name());
+        {
+            AofFlushInfo fi;
+            aof_flush_info(&fi);
+            dbuf_putf(&info, "aof_flush_thread:%d\r\n", fi.thread_running);
+            dbuf_putf(&info, "aof_flush_in_progress:%d\r\n", fi.flush_in_progress);
+            dbuf_putf(&info, "aof_flushes_completed:%lld\r\n", fi.flushes_completed);
+            dbuf_putf(&info, "aof_dirty:%d\r\n", fi.dirty);
+            dbuf_putf(&info, "aof_last_fsync_seconds_ago:%lld\r\n", fi.seconds_since_fsync);
+        }
         dbuf_putf(&info, "# Replication\r\n");
         dbuf_putf(&info, "role:%s\r\n", repl_is_replica() ? "replica" : "master");
         if (repl_is_replica()) {

@@ -319,11 +319,29 @@ def main():
     try:
         c = Client(PORT)
         check("everysec INFO policy", "aof_fsync_policy:everysec" in c.cmd("INFO"), True)
+        check("everysec INFO flush thread", "aof_flush_thread:1" in c.cmd("INFO"), True)
         check("everysec SET", c.cmd("SET", "eskey", "esval"), "OK")
         check("everysec GET", c.cmd("GET", "eskey"), "esval")
         with open(os.path.join(es_dir, "appendonly.aof"), "rb") as f:
             aof = f.read()
         check("everysec AOF has record", b"eskey" in aof and b"esval" in aof, True)
+        # The background flush thread syncs on its own: poll INFO until
+        # it reports a completed flush, with no SAVE in between.
+        def flushes(info):
+            for line in info.split("\r\n"):
+                if line.startswith("aof_flushes_completed:"):
+                    return int(line.split(":", 1)[1])
+            return -1
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if flushes(c.cmd("INFO")) >= 1:
+                break
+            time.sleep(0.1)
+        check("everysec background flush ran", flushes(c.cmd("INFO")) >= 1, True)
+        check("everysec not dirty after flush", "aof_dirty:0" in c.cmd("INFO"), True)
+        # SAVE still forces a sync: a key written right before SAVE,
+        # with no time for the background flush, must survive SIGKILL.
+        check("everysec SET 2", c.cmd("SET", "eskey2", "esval2"), "OK")
         check("everysec SAVE", c.cmd("SAVE"), "OK")
         c.close()
         proc.kill()  # unclean shutdown: no graceful flush
@@ -336,6 +354,7 @@ def main():
     try:
         c = Client(PORT)
         check("everysec replay after SIGKILL", c.cmd("GET", "eskey"), "esval")
+        check("everysec replay SAVE key after SIGKILL", c.cmd("GET", "eskey2"), "esval2")
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -498,7 +517,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.14.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.15.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

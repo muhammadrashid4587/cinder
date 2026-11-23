@@ -27,6 +27,18 @@ void aof_fsync(void);
 /* Call regularly from the event loop: fsyncs if the everysec policy is
    due. Cheap no-op otherwise. */
 void aof_tick(void);
+
+/* Snapshot of the background flush thread's state, for INFO. */
+typedef struct {
+    int thread_running;        /* flush thread alive (0 = synchronous fallback) */
+    int flush_in_progress;     /* thread is inside fdatasync right now */
+    long long flushes_completed; /* syncs the thread has finished */
+    int dirty;                 /* writes not yet covered by a completed sync */
+    int last_flush_error;      /* errno of the last failed sync, 0 = none */
+    long long seconds_since_fsync; /* -1 if no sync has completed yet */
+} AofFlushInfo;
+void aof_flush_info(AofFlushInfo *out);
+
 void aof_close(void);
 
 #endif

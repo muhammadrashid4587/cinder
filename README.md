@@ -4,11 +4,13 @@ A Redis-compatible in-memory key-value store, written in C from scratch.
 Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, lists,
 sets and hashes with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
-that runs background saves (`BGSAVE`) off the event loop. No dependencies
+that runs background saves (`BGSAVE`) off the event loop, and a dedicated
+flush thread that does the once-a-second AOF sync under `everysec`,
+so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.14.0.
+Version 0.15.0.
 
 ## Why
 
@@ -25,8 +27,9 @@ make
 
 `--aof-fsync` is `always` (default) or `everysec`: under `always` every
 mutating command is `fdatasync`ed before it is acknowledged, under
-`everysec` writes go to the log immediately and the file is synced at
-most once a second, so up to a second of acknowledged writes can be
+`everysec` writes go to the log immediately and a background flush
+thread syncs the file at most once a second, so the event loop never
+waits on the disk and up to a second of acknowledged writes can be
 lost on a machine crash. `SAVE` forces a sync under either policy.
 
 Then, with `redis-cli` (or any RESP client):
@@ -88,7 +91,13 @@ src/
              hashes (parallel field/value arrays, insertion order)
   resp.c     RESP parser (array + inline commands) and encoders
   aof.c      append-only log: every mutation is a RESP array, replayed on start;
-             fsync policy `always` or `everysec`
+             fsync policy `always` or `everysec`; under `everysec` a
+             dedicated flush thread does the once-a-second `fdatasync`
+             off the event loop, `SAVE` forces a sync through it (it
+             waits until a sync covers every append made before the
+             call), a clean shutdown flushes and joins the thread, and
+             `INFO` reports `aof_flush_in_progress`,
+             `aof_flushes_completed` and `aof_dirty`
   rdb.c      RDB-style snapshots: `SAVE` writes the whole dataset (all
              types, TTLs as absolute expiries) to `dump.rdb` in a compact
              binary format, atomically via `dump.rdb.tmp` + rename; the
@@ -105,9 +114,9 @@ src/
   server samples 5 entries and evicts the least recently used of the sample.
 - **Durability**: every mutating command is appended to `appendonly.aof` as a
   RESP array and synced according to `--aof-fsync`: `always` (the default)
-  `fdatasync`s after every write; `everysec` writes immediately and syncs at
-  most once a second via a timer in the event loop, and always syncs on a
-  clean shutdown or `SAVE`. On startup the file is replayed through the
+  `fdatasync`s after every write; `everysec` writes immediately and a
+  dedicated flush thread syncs at most once a second, and always syncs
+  on a clean shutdown or `SAVE`. On startup the file is replayed through the
   same dispatcher live clients use, so the log is the dataset. `SAVE`
   additionally writes a snapshot of the whole dataset to `dump.rdb`
   (strings, lists, sets and hashes, with TTLs stored as absolute
@@ -322,7 +331,11 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       type pre-check — both now measure at parity with Redis 8.12.0
       on the same hardware, mean of 3 interleaved A/B runs each;
       pipelined SET, ~1.4x behind, is the remaining gap)
-- [ ] Background AOF flush: move AOF writes off the event loop (under
-      `always` the reply must wait for the fsync, so this needs
-      deferred replies and ordering guarantees; the `everysec` sync
-      is the first slice)
+- [x] Background AOF flush, `everysec` slice (0.15.0): the once-a-second
+      `fdatasync` runs on a dedicated flush thread, so a slow disk never
+      stalls the event loop; `SAVE` still forces a sync (it waits for a
+      sync covering every append before the call) and a clean shutdown
+      flushes and joins the thread; `INFO` reports the flush state
+- [ ] Background AOF flush, `always` slice: under `always` the reply must
+      wait for the fsync, so this needs deferred replies and ordering
+      guarantees
