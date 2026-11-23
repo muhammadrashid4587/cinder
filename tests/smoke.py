@@ -148,6 +148,22 @@ def main():
         check("FLUSHALL", c.cmd("FLUSHALL"), "OK")
         check("DBSIZE after flush", c.cmd("DBSIZE"), 0)
         check("SET after flush", c.cmd("SET", "after", "flush"), "OK")
+        # Many concurrent clients at once: exercises the epoll loop with
+        # dozens of ready fds in a single epoll_wait batch, and the
+        # fd-to-client lookup when the client array is large.
+        conc = [Client(PORT) for _ in range(64)]
+        try:
+            for i, cc in enumerate(conc):
+                check(f"concurrent SET {i}", cc.cmd("SET", f"conc:{i}", str(i)), "OK")
+            ok = all(cc.cmd("GET", f"conc:{i}") == str(i) for i, cc in enumerate(conc))
+            check("concurrent GET all", ok, True)
+            check("DBSIZE after concurrent", c.cmd("DBSIZE"), 65)
+            # Clean up: later tests (AOF restart) count exact keys.
+            check("concurrent DEL all", c.cmd("DEL", *[f"conc:{i}" for i in range(64)]), 64)
+            check("DBSIZE after concurrent cleanup", c.cmd("DBSIZE"), 1)
+        finally:
+            for cc in conc:
+                cc.close()
         # Lists: push/pop at both ends, length, range, wrong type, TTL.
         check("RPUSH", c.cmd("RPUSH", "mylist", "a", "b", "c"), 3)
         check("LLEN", c.cmd("LLEN", "mylist"), 3)

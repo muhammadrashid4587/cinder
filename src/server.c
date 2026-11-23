@@ -1,6 +1,6 @@
 /* cinder: a Redis-compatible in-memory key-value store in C.
  *
- * Single-threaded, poll()-based event loop. String values with TTLs,
+ * Single-threaded, epoll-based event loop. String values with TTLs,
  * approximate LRU eviction, an append-only file for durability, and
  * RDB-style snapshots (SAVE) that are reloaded on startup.
  * Speaks RESP so real redis clients (redis-cli, redis-benchmark, and
@@ -14,14 +14,15 @@
 #include <getopt.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -32,7 +33,7 @@
 #include "resp.h"
 #include "store.h"
 
-#define CINDER_VERSION "0.10.0"
+#define CINDER_VERSION "0.11.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -585,7 +586,13 @@ typedef struct Client {
                             full-sync dump; dump bytes are the snapshot,
                             not the live stream, so they do not advance
                             the slave offset */
+    uint32_t epoll_events; /* interest currently registered with epoll
+                              for this fd (0 until client_add registers
+                              it); client_sync_interest keeps it in step
+                              with out.len / repl_connecting */
 } Client;
+
+static int g_epollfd = -1; /* created once in main, before the loop */
 
 static size_t g_clients_cap;
 
@@ -600,9 +607,46 @@ static void client_add(int fd) {
     Client *c = &g_clients[g_nclients++];
     memset(c, 0, sizeof(*c));
     c->fd = fd;
+    /* Register with epoll for reads; EPOLLOUT is added by
+       client_sync_interest when the client has output pending or its
+       outbound replication connect is still completing. */
+    if (g_epollfd >= 0) {
+        struct epoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        ev.data.fd = fd;
+        if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, fd, &ev) == 0)
+            c->epoll_events = EPOLLIN;
+        else
+            perror("epoll_ctl ADD");
+    }
+}
+
+/* Recompute a client's epoll interest from its current state and
+   update the registration only when it changed. Called once per loop
+   iteration for every client, before epoll_wait: the poll() loop this
+   replaces recomputed interest every iteration for free, and with
+   epoll the same recompute is what catches output queued for a client
+   by another client's command (forward_to_replicas) or by a full sync
+   (send_full_sync / backlog_send). */
+static void client_sync_interest(Client *c) {
+    if (g_epollfd < 0 || c->epoll_events == 0) return;
+    uint32_t want = EPOLLIN;
+    if (c->out.len > 0 || c->repl_connecting) want |= EPOLLOUT;
+    if (want == c->epoll_events) return;
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = want;
+    ev.data.fd = c->fd;
+    if (epoll_ctl(g_epollfd, EPOLL_CTL_MOD, c->fd, &ev) == 0)
+        c->epoll_events = want;
+    else
+        perror("epoll_ctl MOD");
 }
 
 static void client_remove(size_t idx) {
+    if (g_epollfd >= 0)
+        epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_clients[idx].fd, NULL);
     close(g_clients[idx].fd);
     free(g_clients[idx].out.data);
     g_clients[idx] = g_clients[--g_nclients];
@@ -938,7 +982,7 @@ static void send_psync_request(Client *link) {
 
 /* Open the outbound link to a primary. On success the socket is a
    client with is_repl_link set; PSYNC is sent as soon as the connect
-   completes (immediately for localhost, on POLLOUT otherwise). */
+   completes (immediately for localhost, on EPOLLOUT otherwise). */
 static int replicaof_connect(const char *host, int port, Dbuf *reply) {
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", port);
@@ -1219,43 +1263,63 @@ int main(int argc, char **argv) {
            CINDER_VERSION, port, data_dir, g_max_entries, aof_policy_name(), g_backlog_cap);
     fflush(stdout);
 
+    /* The event loop is epoll-based: the listener and every client fd
+       are registered once (client_add / client_remove), and each
+       iteration syncs each client's interest (EPOLLOUT while it has
+       output pending or a replication connect is completing) before
+       waiting. Level-triggered, like the poll() loop it replaces, so a
+       ready fd is reported on every wait until its condition clears.
+       Unlike that loop, the ready set is fixed when epoll_wait returns,
+       so a client added mid-iteration (REPLICAOF) cannot run past the
+       end of the event array. */
+    g_epollfd = epoll_create1(0);
+    if (g_epollfd < 0) {
+        perror("epoll_create1");
+        return 1;
+    }
+    struct epoll_event lev;
+    memset(&lev, 0, sizeof(lev));
+    lev.events = EPOLLIN;
+    lev.data.fd = listener;
+    if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, listener, &lev) < 0) {
+        perror("epoll_ctl listener");
+        return 1;
+    }
+
     long long loop = 0;
     while (g_running) {
-        size_t nfds = g_nclients + 1;
-        struct pollfd *pfds = malloc(nfds * sizeof(struct pollfd));
-        if (!pfds) break;
-        pfds[0].fd = listener;
-        pfds[0].events = POLLIN;
-        pfds[0].revents = 0;
-        for (size_t i = 0; i < g_nclients; i++) {
-            pfds[i + 1].fd = g_clients[i].fd;
-            pfds[i + 1].events = POLLIN;
-            /* A link still completing its connect needs POLLOUT so
-               the completion is reported. */
-            if (g_clients[i].out.len > 0 || g_clients[i].repl_connecting)
-                pfds[i + 1].events |= POLLOUT;
-            pfds[i + 1].revents = 0;
-        }
-        int rc = poll(pfds, (nfds_t)nfds, 100);
-        if (rc < 0) {
-            if (errno == EINTR) { free(pfds); continue; }
-            perror("poll");
-            free(pfds);
+        for (size_t i = 0; i < g_nclients; i++)
+            client_sync_interest(&g_clients[i]);
+        struct epoll_event events[128];
+        int nev = epoll_wait(g_epollfd, events, 128, 100);
+        if (nev < 0) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait");
             break;
         }
-        if (pfds[0].revents & POLLIN) {
-            for (;;) {
-                int cfd = accept(listener, NULL, NULL);
-                if (cfd < 0) break;
-                set_nonblocking(cfd);
-                client_add(cfd);
+        for (int e = 0; e < nev; e++) {
+            uint32_t re = events[e].events;
+            int fd = events[e].data.fd;
+            if (fd == listener) {
+                if (re & EPOLLIN) {
+                    for (;;) {
+                        int cfd = accept(listener, NULL, NULL);
+                        if (cfd < 0) break;
+                        set_nonblocking(cfd);
+                        client_add(cfd);
+                    }
+                }
+                continue;
             }
-        }
-        for (size_t i = 0; i < g_nclients; i++) {
-            Client *c = &g_clients[i];
-            short re = pfds[i + 1].revents;
-            if (re & (POLLERR | POLLHUP | POLLNVAL)) { c->dead = 1; continue; }
-            if (c->is_repl_link && c->repl_connecting && (re & POLLOUT)) {
+            /* Find the client by fd: the client array compacts on
+               removal, so an index is never stable across the loop. */
+            size_t idx = g_nclients; /* sentinel: already gone */
+            for (size_t i = 0; i < g_nclients; i++)
+                if (g_clients[i].fd == fd) { idx = i; break; }
+            if (idx == g_nclients) continue;
+            Client *c = &g_clients[idx];
+            if (re & (EPOLLERR | EPOLLHUP)) { c->dead = 1; continue; }
+            if (c->is_repl_link && c->repl_connecting && (re & EPOLLOUT)) {
                 /* Non-blocking connect finished: check for an error,
                    then ask the primary for a full sync. */
                 int err = 0;
@@ -1270,7 +1334,7 @@ int main(int argc, char **argv) {
                 c->repl_connecting = 0;
                 send_psync_request(c);
             }
-            if (re & POLLOUT && c->out.len > 0) {
+            if (re & EPOLLOUT && c->out.len > 0) {
                 ssize_t w = write(c->fd, c->out.data, c->out.len);
                 if (w > 0) {
                     memmove(c->out.data, c->out.data + w, c->out.len - (size_t)w);
@@ -1280,7 +1344,7 @@ int main(int argc, char **argv) {
                     continue;
                 }
             }
-            if (re & POLLIN) {
+            if (re & EPOLLIN) {
                 ssize_t r = read(c->fd, c->inbuf + c->inlen, sizeof(c->inbuf) - c->inlen);
                 if (r == 0) { c->dead = 1; continue; }
                 if (r < 0) {
@@ -1424,7 +1488,7 @@ int main(int argc, char **argv) {
                         free(reply.data);
                         /* handle_replicaof may add a client, which
                            can move the client array. */
-                        c = &g_clients[i];
+                        c = &g_clients[idx];
                     } else if (c->is_replica) {
                         /* A replica connection is read-only; it only
                            ever sends PING to check the link. */
@@ -1465,7 +1529,6 @@ int main(int argc, char **argv) {
             if (g_clients[i].dead) client_remove(i);
             else i++;
         }
-        free(pfds);
         /* everysec AOF policy: flush pending writes once a second. */
         aof_tick();
         if ((++loop % 100) == 0) store_expire_scan(g_store, 20);
@@ -1496,6 +1559,7 @@ int main(int argc, char **argv) {
     }
     free(g_clients);
     free(g_backlog);
+    close(g_epollfd);
     close(listener);
     aof_close();
     store_free(g_store);

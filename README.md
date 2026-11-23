@@ -1,12 +1,12 @@
 # cinder
 
 A Redis-compatible in-memory key-value store, written in C from scratch.
-Single-threaded, `poll()`-based event loop, RESP protocol, strings, lists,
+Single-threaded, `epoll`-based event loop, RESP protocol, strings, lists,
 sets and hashes with TTLs, approximate LRU eviction, and an append-only file for
 durability. No dependencies beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.10.0.
+Version 0.11.0.
 
 ## Why
 
@@ -78,7 +78,7 @@ OK
 
 ```
 src/
-  server.c   TCP listener, poll() event loop, command dispatch
+  server.c   TCP listener, epoll event loop, command dispatch
   store.c    hash table (djb2, chaining, resize at 0.75 load), TTLs,
              strings, lists (circular-buffer lists, O(1) push/pop),
              sets (unordered member arrays, dedup on insert) and
@@ -111,7 +111,14 @@ src/
   replay reproduces the exact final state either way, and a corrupt
   snapshot is only a warning, never a failed start.
 - **Event loop**: one thread, non-blocking sockets, per-client input/output
-  buffers. A slow client never blocks other clients.
+  buffers. A slow client never blocks other clients. The loop is
+  `epoll`-based (level-triggered): the listener and every client fd are
+  registered once, and each iteration re-syncs each client's interest
+  (`EPOLLOUT` while it has output pending or a replication connect is
+  still completing) before `epoll_wait`. Unlike the `poll()` loop it
+  replaced, no fd array is allocated per iteration, and the ready set is
+  fixed when `epoll_wait` returns, so a client added mid-iteration
+  cannot run past the end of the event array.
 - **Replication**: a replica connects with `REPLICAOF host port` (non-blocking
   connect, `PSYNC` sent when it completes) and the primary streams a full
   sync — `FLUSHALL` plus one rebuild command per key (`SET` with `PX` for
@@ -216,7 +223,9 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # promoted node accepts writes, the old primary's later
             # writes stop flowing, promoting again is a no-op, and
             # reattaching to the old primary full-syncs, wiping the
-            # writes made while promoted)
+            # writes made while promoted), and a concurrent-clients
+            # check (64 clients SET/GET at once, exercising the epoll
+            # loop with dozens of ready fds in one epoll_wait batch)
 ```
 
 ## Roadmap
@@ -238,5 +247,8 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
       and reports `role:master` in `INFO`; a clean replica restart
       resumes from its persisted stream position instead of
       full-syncing)
-- [ ] `epoll` backend and a thread pool for the event loop
+- [x] `epoll` backend for the event loop (replaces `poll()`; listener
+      and client fds registered once, interest re-synced per iteration,
+      no per-iteration fd array allocation)
+- [ ] Thread pool for the event loop
 - [ ] Benchmarks against real Redis on the same hardware
