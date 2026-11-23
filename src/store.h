@@ -217,6 +217,18 @@ int store_zrank(Store *s, const char *key, const char *member, int reverse,
 int store_zrange(Store *s, const char *key, long long start, long long stop,
                  int reverse, char ***members_out, double **scores_out,
                  size_t *n_out);
+/* Members whose scores fall in [min, max], ascending by score, with
+   an endpoint excluded when its flag is set. `offset` matches are
+   skipped and at most `count` are returned (`count < 0` means all).
+   Returns 0 on success (*n_out is 0 for a missing key or an empty
+   range, including min > max), -1 = wrong type, -2 = out of memory.
+   *members_out is a malloc'd array of malloc'd strings and
+   *scores_out a malloc'd array of the matching scores; the caller
+   frees both. */
+int store_zrangebyscore(Store *s, const char *key, double min, int min_excl,
+                        double max, int max_excl, long long offset,
+                        long long count, char ***members_out,
+                        double **scores_out, size_t *n_out);
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing

@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.22.0"
+#define CINDER_VERSION "0.23.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -208,6 +208,20 @@ static int parse_double(const char *s, double *out) {
     if (errno != 0 || end == s || *end != '\0' || isnan(v)) return 0;
     *out = v;
     return 1;
+}
+
+/* Parse a score bound for ZRANGEBYSCORE: an optional leading '('
+   makes the bound exclusive, the rest is a plain double ("-inf",
+   "+inf", "inf" included). NaN is rejected, as in parse_double. */
+static int parse_score_bound(const char *s, double *out, int *excl) {
+    *excl = 0;
+    if (!s || !*s) return 0;
+    if (s[0] == '(') {
+        *excl = 1;
+        s++;
+        if (!*s) return 0;
+    }
+    return parse_double(s, out);
 }
 
 /* Format a score the way Redis does: %.17g round-trips a double
@@ -748,6 +762,56 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(scores);
         return 0;
     }
+    if (strcasecmp(cmd, "ZRANGEBYSCORE") == 0) {
+        if (argc < 4)
+            return dbuf_error(reply, "wrong number of arguments for 'zrangebyscore' command"), 0;
+        double min, max;
+        int min_excl, max_excl;
+        if (!parse_score_bound(argv[2], &min, &min_excl) ||
+            !parse_score_bound(argv[3], &max, &max_excl))
+            return dbuf_error(reply, "value is not a valid float"), 0;
+        int withscores = 0;
+        int have_limit = 0;
+        long long offset = 0, count = -1;
+        for (int i = 4; i < argc; i++) {
+            if (strcasecmp(argv[i], "WITHSCORES") == 0) {
+                withscores = 1;
+            } else if (strcasecmp(argv[i], "LIMIT") == 0) {
+                if (i + 2 >= argc || have_limit)
+                    return dbuf_error(reply, "syntax error"), 0;
+                if (!parse_ll(argv[i + 1], &offset) ||
+                    !parse_ll(argv[i + 2], &count) || offset < 0)
+                    return dbuf_error(reply, "syntax error"), 0;
+                have_limit = 1;
+                i += 2;
+            } else {
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        }
+        char **members = NULL;
+        double *scores = NULL;
+        size_t n = 0;
+        int rc = store_zrangebyscore(g_store, argv[1], min, min_excl,
+                                     max, max_excl, offset, count,
+                                     &members, &scores, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_array_header(reply, (long long)(withscores ? n * 2 : n));
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, members[i], strlen(members[i]));
+            if (withscores) {
+                char buf[32];
+                format_score(buf, sizeof(buf), scores[i]);
+                dbuf_bulk(reply, buf, strlen(buf));
+            }
+            free(members[i]);
+        }
+        free(members);
+        free(scores);
+        return 0;
+    }
     if (strcasecmp(cmd, "ZREM") == 0) {
         if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'zrem' command"), 0;
         long long removed = 0;
@@ -861,7 +925,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
-            "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZREM",
+            "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE", "ZREM",
             "ZRANK", "ZINCRBY",
             "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",

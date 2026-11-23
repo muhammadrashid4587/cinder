@@ -1232,6 +1232,66 @@ int store_zrange(Store *s, const char *key, long long start, long long stop,
     return 0;
 }
 
+/* Members whose scores fall in [min, max], ascending by score, with
+   an endpoint excluded when its flag is set. Skips `offset` matches
+   and returns at most `count` (`count < 0` means all). The array is
+   already sorted by (score, member), so one linear scan finds the
+   matching slice. */
+int store_zrangebyscore(Store *s, const char *key, double min, int min_excl,
+                        double max, int max_excl, long long offset,
+                        long long count, char ***members_out,
+                        double **scores_out, size_t *n_out) {
+    *members_out = NULL;
+    *scores_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    e->last_access = ++s->clock;
+    ZSet *z = e->zset;
+    if (min > max) return 0;
+    /* Count the matches first so the result arrays are sized once. */
+    size_t total = 0;
+    for (size_t i = 0; i < z->len; i++) {
+        double sc = z->scores[i];
+        if ((min_excl ? sc <= min : sc < min) ||
+            (max_excl ? sc >= max : sc > max))
+            continue;
+        total++;
+    }
+    if ((long long)total <= offset) return 0;
+    size_t avail = total - (size_t)offset;
+    size_t n = count < 0 || (long long)avail <= count ? avail : (size_t)count;
+    char **members = malloc(n * sizeof(char *));
+    double *scores = malloc(n * sizeof(double));
+    if (!members || !scores) {
+        free(members);
+        free(scores);
+        return -2;
+    }
+    size_t seen = 0, out = 0;
+    for (size_t i = 0; i < z->len && out < n; i++) {
+        double sc = z->scores[i];
+        if ((min_excl ? sc <= min : sc < min) ||
+            (max_excl ? sc >= max : sc > max))
+            continue;
+        if ((long long)seen++ < offset) continue;
+        members[out] = strdup(z->members[i]);
+        if (!members[out]) {
+            for (size_t j = 0; j < out; j++) free(members[j]);
+            free(members);
+            free(scores);
+            return -2;
+        }
+        scores[out] = sc;
+        out++;
+    }
+    *members_out = members;
+    *scores_out = scores;
+    *n_out = n;
+    return 0;
+}
+
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing

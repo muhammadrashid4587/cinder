@@ -376,6 +376,52 @@ def main():
         check("ZINCRBY new key", c.cmd("ZINCRBY", "newzset", "-2.5", "m"), "-2.5")
         check("ZINCRBY bad float", c.cmd("ZINCRBY", "myzset", "xx", "a"),
               ("error", "ERR value is not a valid float"))
+        # Ranges by score. myzset holds c=0.5, d=1.5, a=5, b=5 here
+        # (a before b on the score tie, member order).
+        check("ZRANGEBYSCORE all", c.cmd("ZRANGEBYSCORE", "myzset", "0", "10"),
+              ["c", "d", "a", "b"])
+        check("ZRANGEBYSCORE slice", c.cmd("ZRANGEBYSCORE", "myzset", "1", "5"),
+              ["d", "a", "b"])
+        check("ZRANGEBYSCORE excl min", c.cmd("ZRANGEBYSCORE", "myzset", "(1", "5"),
+              ["d", "a", "b"])
+        check("ZRANGEBYSCORE excl max", c.cmd("ZRANGEBYSCORE", "myzset", "0", "(5"),
+              ["c", "d"])
+        check("ZRANGEBYSCORE excl both", c.cmd("ZRANGEBYSCORE", "myzset", "(0.5", "(5"),
+              ["d"])
+        check("ZRANGEBYSCORE infinities", c.cmd("ZRANGEBYSCORE", "myzset", "-inf", "+inf"),
+              ["c", "d", "a", "b"])
+        check("ZRANGEBYSCORE withscores",
+              c.cmd("ZRANGEBYSCORE", "myzset", "-inf", "+inf", "WITHSCORES"),
+              ["c", "0.5", "d", "1.5", "a", "5", "b", "5"])
+        check("ZRANGEBYSCORE limit", c.cmd("ZRANGEBYSCORE", "myzset", "0", "10",
+                                           "LIMIT", "1", "2"), ["d", "a"])
+        check("ZRANGEBYSCORE limit all", c.cmd("ZRANGEBYSCORE", "myzset", "0", "10",
+                                               "LIMIT", "0", "-1"),
+              ["c", "d", "a", "b"])
+        check("ZRANGEBYSCORE limit past end", c.cmd("ZRANGEBYSCORE", "myzset", "0", "10",
+                                                    "LIMIT", "10", "5"), [])
+        check("ZRANGEBYSCORE limit withscores",
+              c.cmd("ZRANGEBYSCORE", "myzset", "0", "10", "WITHSCORES", "LIMIT", "2", "1"),
+              ["a", "5"])
+        check("ZRANGEBYSCORE reversed bounds", c.cmd("ZRANGEBYSCORE", "myzset", "10", "0"), [])
+        check("ZRANGEBYSCORE empty slice", c.cmd("ZRANGEBYSCORE", "myzset", "2", "3"), [])
+        check("ZRANGEBYSCORE missing", c.cmd("ZRANGEBYSCORE", "ghostzset", "-inf", "+inf"), [])
+        check("ZRANGEBYSCORE wrong args", c.cmd("ZRANGEBYSCORE", "myzset", "0"),
+              ("error", "ERR wrong number of arguments for 'zrangebyscore' command"))
+        check("ZRANGEBYSCORE bad bound", c.cmd("ZRANGEBYSCORE", "myzset", "xx", "10"),
+              ("error", "ERR value is not a valid float"))
+        check("ZRANGEBYSCORE bad bound paren", c.cmd("ZRANGEBYSCORE", "myzset", "(", "10"),
+              ("error", "ERR value is not a valid float"))
+        check("ZRANGEBYSCORE bad option", c.cmd("ZRANGEBYSCORE", "myzset", "0", "10", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYSCORE limit missing count",
+              c.cmd("ZRANGEBYSCORE", "myzset", "0", "10", "LIMIT", "1"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYSCORE limit negative offset",
+              c.cmd("ZRANGEBYSCORE", "myzset", "0", "10", "LIMIT", "-1", "5"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYSCORE wrongtype", c.cmd("ZRANGEBYSCORE", "after", "0", "10"), wrongtype)
+        check("COMMAND lists ZRANGEBYSCORE", "ZRANGEBYSCORE" in c.cmd("COMMAND"), True)
         check("ZREM one", c.cmd("ZREM", "myzset", "b"), 1)
         check("ZCARD after ZREM", c.cmd("ZCARD", "myzset"), 3)
         check("ZRANK removed member", c.cmd("ZRANK", "myzset", "b"), None)
@@ -892,7 +938,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.22.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.23.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
