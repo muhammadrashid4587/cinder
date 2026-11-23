@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.24.0.
+Version 0.25.0.
 
 ## Why
 
@@ -78,7 +78,7 @@ OK
 | `HEXISTS key field` | `1` if the field exists, `0` if not |
 | `HLEN key` | Number of fields (`0` when missing) |
 | `HGETALL key` | Flat `[field, value, ...]` array in insertion order |
-| `ZADD key score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing) |
+| `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZCARD key` | Number of members (`0` when missing) |
 | `ZRANGE key start stop [WITHSCORES]` | Members in index range, lowest score first; negative indices count from the end, `WITHSCORES` interleaves each score after its member |
@@ -297,7 +297,11 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # takes the last score, bad-score error applies nothing,
             # wrong-type errors, sorted-set TTL expiry, AOF restart
             # and RDB snapshot and replication full-sync checks for
-            # scores), and score-range checks (inclusive and exclusive
+            # scores), ZADD option checks (`NX`/`XX`/`GT`/`LT`/`CH`/
+            # `INCR`, including the conflict errors, nil replies when
+            # a condition blocks an `INCR`, `GT`/`LT` comparing the
+            # resulting score under `INCR`, and the NaN-result error),
+            # and score-range checks (inclusive and exclusive
             # bounds, infinities, WITHSCORES, LIMIT offset/count,
             # reversed bounds, missing key, bad bounds and options),
             # and reversed score-range checks (max-first bounds,
@@ -348,7 +352,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # is a startup error), and a benchmark-tool check
             # (`tools/bench.py` runs against a live server, exits 0, and
             # prints one table row per operation, and `INFO` reports
-            # version 0.24.0), and `always`-policy checks (a pipeline
+            # version 0.25.0), and `always`-policy checks (a pipeline
             # mixing writes and reads returns its replies in command
             # order, two clients writing at once each get their own
             # +OK, a QUIT sent in the same packet as a SET still
@@ -499,7 +503,24 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       The reversed scan walks the same sorted array from the top
       down. Limitation: member lookup is still a linear scan, so
       large sorted sets are slower than a skip list would be
+- [x] Sorted-set `ZADD` options (0.25.0): `NX` / `XX` / `GT` / `LT` /
+      `CH` / `INCR`, following Redis semantics — `NX` only adds new
+      members, `XX` only updates existing ones, `GT`/`LT` only update
+      when the new score is greater/smaller (new members are still
+      added, and `XX` combines with `GT`/`LT`), `CH` counts changed
+      members instead of only new ones, `INCR` acts like `ZINCRBY`
+      for a single member and returns the new score (nil when a
+      condition blocks the update, and `GT`/`LT` compare the
+      resulting score). Conflicting options are errors with Redis's
+      messages (`NX` with `XX`/`GT`/`LT`, `GT` with `LT`, more than
+      one pair with `INCR`, an increment that yields NaN). The
+      options are parsed before the first score, every score is
+      parsed before any pair is applied, and the raw command is
+      AOF-logged and replicated only when something actually changed,
+      so the log replays identically. Limitation: member lookup is
+      still a linear scan, so large sorted sets are slower than a
+      skip list would be
 
 ## Next
 
-- [ ] Sorted-set `ZADD` options (`NX`/`XX`/`GT`/`LT`/`CH`/`INCR`)
+- [ ] `SCAN` (cursor-based keyspace iteration, with `MATCH` and `COUNT`)

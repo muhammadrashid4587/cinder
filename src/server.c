@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.24.0"
+#define CINDER_VERSION "0.25.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -663,44 +663,121 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         return 0;
     }
     if (strcasecmp(cmd, "ZADD") == 0) {
-        if (argc < 4 || (argc % 2) != 0)
+        if (argc < 4)
             return dbuf_error(reply, "wrong number of arguments for 'zadd' command"), 0;
+        /* Options come after the key and before the first score:
+           NX | XX | GT | LT | CH | INCR. Anything after the first
+           score is a score/member pair, never an option. */
+        int nx = 0, xx = 0, gt = 0, lt = 0, ch = 0, incr = 0;
+        int i = 2;
+        for (; i < argc; i++) {
+            if (strcasecmp(argv[i], "NX") == 0) nx = 1;
+            else if (strcasecmp(argv[i], "XX") == 0) xx = 1;
+            else if (strcasecmp(argv[i], "GT") == 0) gt = 1;
+            else if (strcasecmp(argv[i], "LT") == 0) lt = 1;
+            else if (strcasecmp(argv[i], "CH") == 0) ch = 1;
+            else if (strcasecmp(argv[i], "INCR") == 0) incr = 1;
+            else break;
+        }
+        /* Conflicting options are errors, as in Redis: NX clashes
+           with XX and with GT/LT, and GT clashes with LT. XX can
+           combine with GT or LT. */
+        if (nx && xx)
+            return dbuf_error(reply, "XX and NX options at the same time are not compatible"), 0;
+        if ((gt && lt) || (gt && nx) || (lt && nx))
+            return dbuf_error(reply, "GT, LT, and/or NX options at the same time are not compatible"), 0;
+        int nrest = argc - i;
+        if (nrest < 2 || (nrest % 2) != 0)
+            return dbuf_error(reply, "wrong number of arguments for 'zadd' command"), 0;
+        size_t npairs = (size_t)nrest / 2;
+        if (incr && npairs != 1)
+            return dbuf_error(reply, "INCR option supports a single increment-element pair"), 0;
         /* Parse every score before applying any pair, so a bad score
-           errors without a partial apply. Only the plain form is
-           supported for now: no NX/XX/GT/LT/CH/INCR options (those
-           are a syntax error, as an unknown option would be). */
-        size_t npairs = (size_t)(argc - 2) / 2;
+           errors without a partial apply. */
         double *scores = malloc(npairs * sizeof(double));
         if (!scores)
             return dbuf_error(reply, "out of memory"), 0;
-        for (size_t i = 0; i < npairs; i++) {
-            if (!parse_double(argv[2 + 2 * i], &scores[i])) {
+        for (size_t k = 0; k < npairs; k++) {
+            if (!parse_double(argv[i + 2 * k], &scores[k])) {
                 free(scores);
                 return dbuf_error(reply, "value is not a valid float"), 0;
             }
         }
-        long long added = 0;
-        int changed = 0;
-        for (size_t i = 0; i < npairs; i++) {
-            long long rc = store_zadd(g_store, argv[1], argv[3 + 2 * i],
-                                      scores[i]);
-            if (rc == -1) {
+        /* Wrong type is an error before any pair is considered: even
+           a pair the options would skip still errors on a key
+           holding another type, as in Redis. */
+        int zt = store_type(g_store, argv[1]);
+        if (zt != 0 && zt != 5) {
+            free(scores);
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        }
+        if (incr) {
+            /* INCR acts like ZINCRBY for one member: the score is
+               an increment, and GT/LT compare the resulting score
+               against the current one. A condition that rejects the
+               update answers nil, as in Redis; CH does not affect
+               the reply. */
+            const char *member = argv[i + 1];
+            double cur = 0;
+            int exists = store_zscore(g_store, argv[1], member, &cur) == 1;
+            if ((nx && exists) || (xx && !exists)) {
                 free(scores);
-                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+                return dbuf_null(reply), 0;
             }
+            double next = cur + scores[0];
+            if (isnan(next)) {
+                free(scores);
+                return dbuf_error(reply, "resulting score is not a number (NaN)"), 0;
+            }
+            if (exists && ((gt && next <= cur) || (lt && next >= cur))) {
+                free(scores);
+                return dbuf_null(reply), 0;
+            }
+            double out;
+            int rc = store_zincrby(g_store, argv[1], member, scores[0], &out);
+            free(scores);
+            if (rc == -2)
+                return dbuf_error(reply, "out of memory"), 0;
+            char buf[32];
+            format_score(buf, sizeof(buf), out);
+            dbuf_bulk(reply, buf, strlen(buf));
+            if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+            /* A 0 increment on an existing member changes nothing,
+               so like the ZADD no-op it is neither logged nor a
+               WATCH invalidation. */
+            return rc == 2 ? 0 : 1;
+        }
+        long long added = 0, updated = 0;
+        int changed = 0;
+        for (size_t k = 0; k < npairs; k++) {
+            const char *member = argv[i + 1 + 2 * k];
+            double score = scores[k];
+            /* The conditions only gate updates of members already
+               there: a new member is always added (GT/LT do not
+               block new members), so read the current score first.
+               Re-reading each pair also makes a duplicate member in
+               one call see the score the earlier pair just set. */
+            double cur = 0;
+            int exists = store_zscore(g_store, argv[1], member, &cur) == 1;
+            if ((nx && exists) || (xx && !exists)) continue;
+            if (exists && ((gt && score <= cur) || (lt && score >= cur)))
+                continue;
+            long long rc = store_zadd(g_store, argv[1], member, score);
             if (rc == -2) {
                 free(scores);
                 return dbuf_error(reply, "out of memory"), 0;
             }
             if (rc == 1) added++;
+            if (rc == 0) updated++;
             if (rc != 2) changed = 1;
         }
         free(scores);
         if (g_max_entries) store_evict_lru(g_store, g_max_entries);
-        dbuf_int(reply, added);
+        dbuf_int(reply, ch ? added + updated : added);
         /* Log only when something actually changed: re-adding a
-           member with its current score is a no-op, like SADD of a
-           member already present. */
+           member with its current score, or a pair the options
+           skipped, is a no-op, like SADD of a member already
+           present. */
         return changed ? 1 : 0;
     }
     if (strcasecmp(cmd, "ZSCORE") == 0) {
