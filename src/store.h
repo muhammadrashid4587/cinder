@@ -64,6 +64,12 @@ void store_free(Store *s);
 int store_set(Store *s, const char *key, const char *value, long long expire_at);
 /* Returns a malloc'd copy of the value, or NULL if missing/expired/wrong type. */
 char *store_get(Store *s, const char *key);
+/* Increment a string key's integer value by delta, in one hash lookup.
+   Creates the key when missing (or expired). The TTL is untouched, so
+   INCR preserves it, as in Redis. Returns 0 on success (*out is the
+   new value), -1 = wrong type, -2 = value is not an integer,
+   -3 = out of memory. */
+int store_incr(Store *s, const char *key, long long delta, long long *out);
 int store_del(Store *s, const char *key);
 int store_exists(Store *s, const char *key);
 int store_expire(Store *s, const char *key, long long expire_at);

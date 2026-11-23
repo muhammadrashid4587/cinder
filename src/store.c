@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "store.h"
 
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
@@ -365,6 +367,62 @@ char *store_get(Store *s, const char *key) {
     if (!e || e->type != ENTRY_STRING) return NULL;
     e->last_access = ++s->clock;
     return strdup(e->value);
+}
+
+/* Strict integer parse: the whole string must be one integer. */
+static int parse_ll(const char *s, long long *out) {
+    if (!s || !*s) return 0;
+    char *end = NULL;
+    errno = 0;
+    long long v = strtoll(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') return 0;
+    *out = v;
+    return 1;
+}
+
+int store_incr(Store *s, const char *key, long long delta, long long *out) {
+    Entry *e = store_find(s, key, NULL);
+    long long v = 0;
+    if (e) {
+        if (e->type != ENTRY_STRING) return -1;
+        if (!parse_ll(e->value, &v)) return -2;
+    }
+    v += delta;
+    char vbuf[32];
+    snprintf(vbuf, sizeof(vbuf), "%lld", v);
+    if (e) {
+        /* Update the stored string in place when it fits; grow the
+           allocation only when the new decimal form is longer than
+           the old one. The expiry is untouched, so the TTL survives. */
+        size_t nlen = strlen(vbuf);
+        if (nlen > strlen(e->value)) {
+            char *nv = realloc(e->value, nlen + 1);
+            if (!nv) return -3;
+            e->value = nv;
+        }
+        memcpy(e->value, vbuf, nlen + 1);
+        e->last_access = ++s->clock;
+    } else {
+        if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+            store_resize(s);
+        e = calloc(1, sizeof(Entry));
+        if (!e) return -3;
+        e->key = strdup(key);
+        e->value = strdup(vbuf);
+        if (!e->key || !e->value) {
+            entry_free(e);
+            return -3;
+        }
+        e->type = ENTRY_STRING;
+        e->expire_at = -1;
+        e->last_access = ++s->clock;
+        size_t idx = hash_key(key) % s->cap;
+        e->next = s->buckets[idx];
+        s->buckets[idx] = e;
+        s->count++;
+    }
+    *out = v;
+    return 0;
 }
 
 int store_del(Store *s, const char *key) {

@@ -8,7 +8,7 @@ that runs background saves (`BGSAVE`) off the event loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.13.0.
+Version 0.14.0.
 
 ## Why
 
@@ -190,29 +190,36 @@ operation, pipeline depth 50, mean of 3 runs each), cinder and real
 Redis 8.12.0 back-to-back on the same dev VM. Redis ran with
 persistence off (`--save '' --appendonly no`); cinder ran with its
 AOF on. The VM is a shared, noisy host, so treat these as
-same-ballpark numbers (±20% run to run), not lab precision.
+same-ballpark numbers (±20% run to run), not lab precision. The
+Redis column is the mean of 9 runs in the same sessions.
 
 | Operation | cinder `always` | cinder `everysec` | Redis 8.12.0 |
 | --- | ---: | ---: | ---: |
-| `SET` | ~27,000 | ~26,000 | ~33,000 |
-| `GET` | ~30,000 | ~33,000 | ~35,000 |
-| `INCR` | ~19,000 | ~24,000 | ~37,000 |
-| `LPUSH` | ~21,000 | ~22,000 | ~38,000 |
-| `HSET` | ~25,000 | ~22,000 | ~34,000 |
-| `SET` pipelined | ~149,000 | ~146,000 | ~209,000 |
-| `GET` pipelined | ~241,000 | ~229,000 | ~207,000 |
+| `SET` | ~34,000 | ~35,000 | ~35,000 |
+| `GET` | ~36,000 | ~37,000 | ~34,000 |
+| `INCR` | ~35,000 | ~35,000 | ~34,000 |
+| `LPUSH` | ~36,000 | ~33,000 | ~35,000 |
+| `HSET` | ~33,000 | ~32,000 | ~35,000 |
+| `SET` pipelined | ~166,000 | ~163,000 | ~240,000 |
+| `GET` pipelined | ~261,000 | ~259,000 | ~228,000 |
 
 Sequential single-client throughput is latency-bound, so cinder and
-Redis land in the same ballpark on `SET`/`GET`/`HSET` and on
-pipelined `GET` (where cinder is ahead). `INCR` and `LPUSH` trail
-Redis by roughly 2x, and pipelined `SET` by ~1.4x — those are the
-known gaps to close next. `SET` pays one `fdatasync` per write under
-the `always` policy, but on this dev VM `fdatasync` is cheap, so
-`always` and `everysec` measure about the same; the policy still
-matters where fsync is expensive, and the sync count is the real
-difference — verified with `strace`, 200 sequential SETs cost 201
-`fdatasync`s under `always` and 2 under `everysec` (one at the first
-write, one on shutdown). Reproduce with:
+Redis land in the same ballpark on every sequential operation now,
+including `INCR` and `LPUSH` — both were ~2x behind in the 0.13.0
+table, but the 0.14.0 change does each increment in one hash lookup
+and updates the stored value in place, and drops the redundant type
+pre-check on push. An interleaved A/B of the 0.13.0 and 0.14.0
+binaries on the same host put `LPUSH` at 28,500 → 35,800 ops/sec
+mean with a much tighter spread, while `INCR` measured ~35,000 on
+both binaries — so the old 19,000 figure did not reproduce and was
+likely host noise at measurement time. Pipelined `SET` still trails
+Redis by ~1.4x; that is the remaining known gap. `SET` pays one
+`fdatasync` per write under the `always` policy, but on this dev VM
+`fdatasync` is cheap, so `always` and `everysec` measure about the
+same; the policy still matters where fsync is expensive, and the sync
+count is the real difference — verified with `strace`, 200 sequential
+SETs cost 201 `fdatasync`s under `always` and 2 under `everysec`
+(one at the first write, one on shutdown). Reproduce with:
 
 ```sh
 python3 tools/bench.py --port 7777 --compare-port 7780 --label redis
@@ -221,7 +228,10 @@ python3 tools/bench.py --port 7777 --compare-port 7780 --label redis
 ## Tests
 
 ```sh
-make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
+make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
+            # INCR checks (INCR preserves the key's TTL, the stored value
+            # grows across digit boundaries, 99→100 and 999→1000, and
+            # INCR on an expired key restarts at the delta), list
             # checks (push/pop both ends, length, range with negative
             # indexes, wrong-type errors, list TTL expiry), set checks
             # (add/dedup, membership, remove, wrong-type errors, set
@@ -273,7 +283,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # is a startup error), and a benchmark-tool check
             # (`tools/bench.py` runs against a live server, exits 0, and
             # prints one table row per operation, and `INFO` reports
-            # version 0.13.0)
+            # version 0.14.0)
 ```
 
 ## Roadmap
@@ -306,3 +316,13 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
       HSET vs Redis 8.12.0, mean of 3 runs each, recorded in the
       Benchmarks section — same ballpark on SET/GET/HSET and
       pipelined GET, ~2x behind on INCR/LPUSH)
+- [x] Close the INCR/LPUSH gap vs real Redis (`store_incr` does the
+      whole increment in one hash lookup and updates the stored value
+      in place, preserving the TTL; LPUSH/RPUSH drop the redundant
+      type pre-check — both now measure at parity with Redis 8.12.0
+      on the same hardware, mean of 3 interleaved A/B runs each;
+      pipelined SET, ~1.4x behind, is the remaining gap)
+- [ ] Background AOF flush: move AOF writes off the event loop (under
+      `always` the reply must wait for the fsync, so this needs
+      deferred replies and ordering guarantees; the `everysec` sync
+      is the first slice)

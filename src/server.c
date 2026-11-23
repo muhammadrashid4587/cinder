@@ -37,7 +37,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.13.0"
+#define CINDER_VERSION "0.14.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -313,27 +313,13 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         } else if (argc != 2) {
             return dbuf_error(reply, "wrong number of arguments"), 0;
         }
-        if (store_type(g_store, argv[1]) > 1)
+        long long v;
+        int rc = store_incr(g_store, argv[1], delta, &v);
+        if (rc == -1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
-        char *cur = store_get(g_store, argv[1]);
-        long long v = 0;
-        if (cur) {
-            if (!parse_ll(cur, &v)) {
-                free(cur);
-                return dbuf_error(reply, "value is not an integer or out of range"), 0;
-            }
-            free(cur);
-        }
-        v += delta;
-        char vbuf[32];
-        snprintf(vbuf, sizeof(vbuf), "%lld", v);
-        long long exp = -1;
-        /* INCR preserves the key's TTL. */
-        {
-            long long ttl = store_ttl_ms(g_store, argv[1]);
-            if (ttl > 0) exp = now_ms() + ttl;
-        }
-        if (!store_set(g_store, argv[1], vbuf, exp))
+        if (rc == -2)
+            return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        if (rc == -3)
             return dbuf_error(reply, "out of memory"), 0;
         if (g_max_entries) store_evict_lru(g_store, g_max_entries);
         dbuf_int(reply, v);
@@ -354,9 +340,6 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
     if (strcasecmp(cmd, "LPUSH") == 0 || strcasecmp(cmd, "RPUSH") == 0) {
         if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'lpush' command"), 0;
         int at_head = strcasecmp(cmd, "LPUSH") == 0;
-        int t = store_type(g_store, argv[1]);
-        if (t != 0 && t != 2)
-            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         long long len = 0;
         for (int i = 2; i < argc; i++) {
             len = at_head ? store_lpush(g_store, argv[1], argv[i])
