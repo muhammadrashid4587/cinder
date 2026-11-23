@@ -32,6 +32,17 @@
    -1 on any I/O error (errno set). */
 int rdb_save(Store *s, const char *path);
 
+/* Serialize a snapshot of the store to a freshly malloc'd buffer.
+   No disk I/O: the bytes are for a worker thread to write with
+   rdb_write_snapshot. Returns 0 on success, -1 on error. */
+int rdb_serialize(Store *s, char **out, size_t *outlen);
+
+/* Write already-serialized snapshot bytes to path atomically
+   (path + tmp_suffix, fsync, rename, fsync the directory). Safe
+   from a worker thread. Returns 0 on success, -1 on error. */
+int rdb_write_snapshot(const char *path, const char *tmp_suffix,
+                       const char *data, size_t len);
+
 /* Load a snapshot into the store. Meant for a fresh (empty) store at
    startup. Returns the number of keys loaded, or -1 when the file is
    missing (errno ENOENT) or malformed (errno EINVAL). Keys parsed

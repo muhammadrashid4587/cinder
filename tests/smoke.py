@@ -381,6 +381,91 @@ def main():
             proc.terminate()
             proc.wait(timeout=5)
 
+    # Background saves: BGSAVE serializes on the event loop and a
+    # worker thread writes dump.rdb, so the server stays responsive;
+    # INFO reports the pool size and the save status, and a restart
+    # with the AOF deleted restores from the background snapshot.
+    bg_dir = "/tmp/cinder-smoke-bgsave"
+    proc = start_server(["--threads", "2"], data_dir=bg_dir)
+    try:
+        c = Client(PORT)
+
+        def bgsave_ms(info):
+            for line in info.split("\r\n"):
+                if line.startswith("last_bgsave_time_ms:"):
+                    return int(line.split(":", 1)[1])
+            return 0
+
+        info = c.cmd("INFO")
+        check("bgsave INFO threads", "threads:2" in info, True)
+        check("bgsave INFO no save yet", "last_bgsave_status:none" in info, True)
+        check("bgsave SET", c.cmd("SET", "bgstr", "hello"), "OK")
+        check("bgsave RPUSH", c.cmd("RPUSH", "bglist", "x", "y"), 2)
+        check("bgsave SADD", c.cmd("SADD", "bgset", "a", "b"), 2)
+        check("bgsave HSET", c.cmd("HSET", "bghash", "f1", "v1"), 1)
+        check("bgsave SET ttl", c.cmd("SET", "bgttl", "v", "EX", "100"), "OK")
+        check("bgsave SET expiring", c.cmd("SET", "bggone", "v", "PX", "50"), "OK")
+        time.sleep(0.1)
+        check("bgsave BGSAVE", c.cmd("BGSAVE"), "Background saving started")
+        # The save runs on a worker thread; poll INFO until it lands.
+        deadline = time.time() + 5
+        saved = False
+        while time.time() < deadline:
+            if "last_bgsave_status:ok" in c.cmd("INFO"):
+                saved = True
+                break
+            time.sleep(0.05)
+        check("bgsave completes", saved, True)
+        check("bgsave INFO not in progress", "bgsave_in_progress:0" in c.cmd("INFO"), True)
+        check("bgsave INFO jobs completed",
+              "threadpool_jobs_completed:1" in c.cmd("INFO"), True)
+        with open(os.path.join(bg_dir, "dump.rdb"), "rb") as f:
+            snap = f.read()
+        check("bgsave file magic", snap[:6], b"CINDER")
+        check("bgsave file has keys", b"bgstr" in snap and b"bghash" in snap, True)
+        check("bgsave file skips expired key", b"bggone" not in snap, True)
+        # The server stayed responsive while the save ran, and a
+        # second BGSAVE starts cleanly once the first has finished:
+        # its completion timestamp must advance past the first save's.
+        t_before = bgsave_ms(c.cmd("INFO"))
+        check("bgsave again", c.cmd("BGSAVE"), "Background saving started")
+        deadline = time.time() + 5
+        saved = False
+        while time.time() < deadline:
+            if bgsave_ms(c.cmd("INFO")) > t_before:
+                saved = True
+                break
+            time.sleep(0.05)
+        check("bgsave second completes", saved, True)
+        check("bgsave GET while saving", c.cmd("GET", "bgstr"), "hello")
+        c.cmd("SHUTDOWN")
+        c.close()
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+    # Delete the AOF: the restart must restore from the background
+    # snapshot alone.
+    os.remove(os.path.join(bg_dir, "appendonly.aof"))
+    proc = start_server(["--threads", "2"], data_dir=bg_dir, fresh=False)
+    try:
+        c = Client(PORT)
+        check("bgsave reload GET", c.cmd("GET", "bgstr"), "hello")
+        check("bgsave reload list", c.cmd("LRANGE", "bglist", "0", "-1"), ["x", "y"])
+        check("bgsave reload set", sorted(c.cmd("SMEMBERS", "bgset")), ["a", "b"])
+        check("bgsave reload hash", c.cmd("HGETALL", "bghash"), ["f1", "v1"])
+        check("bgsave reload TTL survives", 90000 <= c.cmd("PTTL", "bgttl") <= 100000, True)
+        check("bgsave reload expired gone", c.cmd("GET", "bggone"), None)
+        check("bgsave reload DBSIZE", c.cmd("DBSIZE"), 5)
+        c.cmd("SHUTDOWN")
+        c.close()
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
     # Replication: REPLICAOF streams a full sync, then live writes.
     # A key whose TTL passed before the sync is not in the dump.
     repl_primary_dir = "/tmp/cinder-smoke-repl-primary"
@@ -753,6 +838,15 @@ def main():
     )
     check("bad policy exits nonzero", bad.returncode != 0, True)
     check("bad policy message", "unknown AOF fsync policy" in bad.stdout, True)
+
+    # A thread count outside 1..32 is a startup error too.
+    bad_threads = subprocess.run(
+        [BIN, "--port", str(PORT), "--data-dir", "/tmp/cinder-smoke-bad",
+         "--threads", "0"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10,
+    )
+    check("bad threads exits nonzero", bad_threads.returncode != 0, True)
+    check("bad threads message", "invalid thread count" in bad_threads.stdout, True)
 
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")

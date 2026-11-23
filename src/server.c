@@ -1,8 +1,10 @@
 /* cinder: a Redis-compatible in-memory key-value store in C.
  *
- * Single-threaded, epoll-based event loop. String values with TTLs,
- * approximate LRU eviction, an append-only file for durability, and
- * RDB-style snapshots (SAVE) that are reloaded on startup.
+ * Single-threaded, epoll-based event loop for commands, plus a small
+ * worker thread pool that runs background saves (BGSAVE) off the
+ * loop. String values with TTLs, approximate LRU eviction, an
+ * append-only file for durability, and RDB-style snapshots (SAVE)
+ * that are reloaded on startup.
  * Speaks RESP so real redis clients (redis-cli, redis-benchmark, and
  * any RESP client library) work against it.
  */
@@ -14,6 +16,7 @@
 #include <getopt.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -32,8 +35,9 @@
 #include "rdb.h"
 #include "resp.h"
 #include "store.h"
+#include "threadpool.h"
 
-#define CINDER_VERSION "0.11.0"
+#define CINDER_VERSION "0.12.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -71,6 +75,52 @@ static long long g_backlog_start;
 static char g_master_host[256];
 static long long g_master_port;
 static volatile sig_atomic_t g_running = 1;
+
+/* ---------- thread pool and background saves ----------
+ * The event loop stays single-threaded for commands: the store is
+ * never touched off it. The pool exists for work that is safe to
+ * move, which today is exactly one job: BGSAVE. The loop serializes
+ * the store to memory (a consistent picture, taken while the loop
+ * owns the store), and a worker writes those bytes to dump.rdb
+ * (temp file, fsync, rename) while the server keeps answering
+ * commands. The worker touches only its own buffer and the snapshot
+ * files; the only shared state is the small status block below,
+ * guarded by g_bgsave_mu. */
+static ThreadPool *g_pool;
+static int g_nthreads = 1; /* worker threads; --threads, default 1 */
+static pthread_mutex_t g_bgsave_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_bgsave_in_progress;
+static int g_bgsave_last_status; /* 0 = none yet, 1 = ok, -1 = error */
+static long long g_bgsave_last_ms; /* epoch ms of the last finished save, 0 = never */
+
+typedef struct {
+    char *data; /* serialized snapshot bytes; the worker frees them */
+    size_t len;
+    char path[1024]; /* dump.rdb path, copied at submit time */
+} BgsaveJob;
+
+static void bgsave_run(void *arg) {
+    BgsaveJob *job = arg;
+    int rc = rdb_write_snapshot(job->path, ".bgsave.tmp", job->data, job->len);
+    free(job->data);
+    free(job);
+    pthread_mutex_lock(&g_bgsave_mu);
+    g_bgsave_in_progress = 0;
+    g_bgsave_last_status = rc == 0 ? 1 : -1;
+    g_bgsave_last_ms = now_ms();
+    pthread_mutex_unlock(&g_bgsave_mu);
+    printf("cinder: background save %s\n", rc == 0 ? "finished" : "failed");
+    fflush(stdout);
+}
+
+/* Copy the background-save status out from under the mutex. */
+static void bgsave_info(int *in_progress, int *last_status, long long *last_ms) {
+    pthread_mutex_lock(&g_bgsave_mu);
+    *in_progress = g_bgsave_in_progress;
+    *last_status = g_bgsave_last_status;
+    *last_ms = g_bgsave_last_ms;
+    pthread_mutex_unlock(&g_bgsave_mu);
+}
 
 static void on_signal(int sig) {
     (void)sig;
@@ -510,6 +560,17 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_putf(&info, "cinder_version:%s\r\n", CINDER_VERSION);
         dbuf_putf(&info, "uptime_in_seconds:%lld\r\n", (now_ms() - g_start_ms) / 1000);
         dbuf_putf(&info, "total_commands_processed:%lld\r\n", g_commands_processed);
+        dbuf_putf(&info, "threads:%d\r\n", g_nthreads);
+        dbuf_putf(&info, "threadpool_jobs_completed:%lld\r\n", tp_jobs_completed(g_pool));
+        {
+            int in_progress = 0, last_status = 0;
+            long long last_ms = 0;
+            bgsave_info(&in_progress, &last_status, &last_ms);
+            dbuf_putf(&info, "bgsave_in_progress:%d\r\n", in_progress);
+            dbuf_putf(&info, "last_bgsave_status:%s\r\n",
+                      last_status == 0 ? "none" : last_status == 1 ? "ok" : "error");
+            dbuf_putf(&info, "last_bgsave_time_ms:%lld\r\n", last_ms);
+        }
         dbuf_putf(&info, "# Keyspace\r\n");
         dbuf_putf(&info, "keys:%zu\r\n", store_size(g_store));
         dbuf_putf(&info, "max_entries:%zu\r\n", g_max_entries);
@@ -544,7 +605,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
-            "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE",
+            "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "SYNC", "PSYNC", "REPLICAOF"};
         dbuf_array_header(reply, (long long)(sizeof(names) / sizeof(names[0])));
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
@@ -560,6 +621,46 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             return dbuf_error(reply, "ERR failed to write snapshot"), 0;
         aof_fsync();
         dbuf_simple(reply, "OK");
+        return 0;
+    }
+    if (strcasecmp(cmd, "BGSAVE") == 0) {
+        if (argc != 1)
+            return dbuf_error(reply, "wrong number of arguments for 'bgsave' command"), 0;
+        /* One background save at a time: a second BGSAVE while one is
+           in progress is rejected rather than queued behind it, so a
+           client never waits on a stale snapshot. */
+        int in_progress = 0, last_status = 0;
+        long long last_ms = 0;
+        bgsave_info(&in_progress, &last_status, &last_ms);
+        if (in_progress)
+            return dbuf_error(reply, "background save already in progress"), 0;
+        /* Serialize on the event-loop thread: the snapshot is a
+           consistent picture of the store, and the worker only ever
+           touches the bytes, never the store. */
+        char *data = NULL;
+        size_t len = 0;
+        if (rdb_serialize(g_store, &data, &len) < 0)
+            return dbuf_error(reply, "failed to serialize snapshot"), 0;
+        BgsaveJob *job = malloc(sizeof(*job));
+        if (!job) {
+            free(data);
+            return dbuf_error(reply, "ERR out of memory"), 0;
+        }
+        job->data = data;
+        job->len = len;
+        snprintf(job->path, sizeof(job->path), "%s", g_rdb_path);
+        pthread_mutex_lock(&g_bgsave_mu);
+        g_bgsave_in_progress = 1;
+        pthread_mutex_unlock(&g_bgsave_mu);
+        if (tp_submit(g_pool, bgsave_run, job) < 0) {
+            pthread_mutex_lock(&g_bgsave_mu);
+            g_bgsave_in_progress = 0;
+            pthread_mutex_unlock(&g_bgsave_mu);
+            free(job->data);
+            free(job);
+            return dbuf_error(reply, "background save could not start"), 0;
+        }
+        dbuf_simple(reply, "Background saving started");
         return 0;
     }
     dbuf_error(reply, "unknown command");
@@ -1131,13 +1232,14 @@ static void gen_replid(char out[41]) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [--port N] [--data-dir DIR] [--max-entries N] [--aof-fsync POLICY]\n"
-        "       [--repl-backlog-size N]\n"
+        "       [--repl-backlog-size N] [--threads N]\n"
         "  --port        TCP port to listen on (default 6379)\n"
         "  --data-dir    directory for the append-only log (default ./data)\n"
         "  --max-entries evict approximately-LRU keys past this many (default 0 = unlimited)\n"
         "  --aof-fsync   AOF fsync policy: always (default) or everysec\n"
         "  --repl-backlog-size bytes of recent replication stream kept for\n"
-        "                partial resync (default 1048576, 0 disables it)\n",
+        "                partial resync (default 1048576, 0 disables it)\n"
+        "  --threads     worker threads for background saves (default 1, 1..32)\n",
         prog);
 }
 
@@ -1150,11 +1252,12 @@ int main(int argc, char **argv) {
         {"max-entries", required_argument, NULL, 'm'},
         {"aof-fsync", required_argument, NULL, 'f'},
         {"repl-backlog-size", required_argument, NULL, 'b'},
+        {"threads", required_argument, NULL, 't'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:d:m:f:b:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:d:m:f:b:t:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': port = atoi(optarg); break;
         case 'd': data_dir = optarg; break;
@@ -1173,6 +1276,15 @@ int main(int argc, char **argv) {
                 return 1;
             }
             g_backlog_cap = (size_t)n;
+            break;
+        }
+        case 't': {
+            long long n = atoll(optarg);
+            if (n < 1 || n > 32) {
+                fprintf(stderr, "cinder: invalid thread count %s (want 1..32)\n", optarg);
+                return 1;
+            }
+            g_nthreads = (int)n;
             break;
         }
         case 'h': usage(argv[0]); return 0;
@@ -1203,6 +1315,16 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_start_ms = now_ms();
+
+    /* The worker pool starts before the AOF replay: a background save
+       is only ever requested by a live client, but the pool is part
+       of the server's steady state, so it is up before any command
+       runs. */
+    g_pool = tp_create(g_nthreads);
+    if (!g_pool) {
+        fprintf(stderr, "cinder: cannot start thread pool (%d threads)\n", g_nthreads);
+        return 1;
+    }
 
     if (mkdir(data_dir, 0755) < 0 && errno != EEXIST) {
         fprintf(stderr, "cinder: cannot create data dir %s: %s\n", data_dir, strerror(errno));
@@ -1259,8 +1381,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     set_nonblocking(listener);
-    printf("cinder %s listening on port %d (data dir %s, max entries %zu, aof fsync %s, repl backlog %zu bytes)\n",
-           CINDER_VERSION, port, data_dir, g_max_entries, aof_policy_name(), g_backlog_cap);
+    printf("cinder %s listening on port %d (data dir %s, max entries %zu, aof fsync %s, repl backlog %zu bytes, threads %d)\n",
+           CINDER_VERSION, port, data_dir, g_max_entries, aof_policy_name(), g_backlog_cap, g_nthreads);
     fflush(stdout);
 
     /* The event loop is epoll-based: the listener and every client fd
@@ -1535,6 +1657,11 @@ int main(int argc, char **argv) {
     }
 
     printf("\ncinder: shutting down, %zu keys in memory\n", store_size(g_store));
+    /* Wait for the pool to drain before the store is freed and the
+       process exits, so a background save that already started
+       always lands its snapshot. */
+    tp_shutdown(g_pool);
+    g_pool = NULL;
     /* Persist the replication stream position, if this node is a
        replica, so a clean restart can resume from it. */
     repl_state_save();

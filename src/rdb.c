@@ -106,6 +106,21 @@ static int save_entry(const Entry *e, void *arg) {
     return 0;
 }
 
+/* Write the whole snapshot (magic, version, one record per key,
+   end marker) to an already-open stream. Shared by rdb_save (which
+   writes straight to the temp file) and rdb_serialize (which writes
+   to a memory stream, so the event loop can hand the bytes to a
+   worker thread instead of doing disk I/O itself). */
+static int rdb_write_stream(FILE *f, Store *s) {
+    if (fwrite(RDB_MAGIC, 1, RDB_MAGIC_LEN, f) != RDB_MAGIC_LEN) return -1;
+    if (w_u32(f, RDB_VERSION) < 0) return -1;
+    SaveCtx ctx = {.f = f, .err = 0};
+    store_foreach(s, save_entry, &ctx);
+    if (ctx.err) return -1;
+    if (w_u8(f, RDB_END) < 0) return -1;
+    return 0;
+}
+
 int rdb_save(Store *s, const char *path) {
     char *tmp = malloc(strlen(path) + 5);
     if (!tmp) return -1;
@@ -118,12 +133,7 @@ int rdb_save(Store *s, const char *path) {
         return -1;
     }
     int rc = -1;
-    if (fwrite(RDB_MAGIC, 1, RDB_MAGIC_LEN, f) != RDB_MAGIC_LEN) goto done;
-    if (w_u32(f, RDB_VERSION) < 0) goto done;
-    SaveCtx ctx = {.f = f, .err = 0};
-    store_foreach(s, save_entry, &ctx);
-    if (ctx.err) goto done;
-    if (w_u8(f, RDB_END) < 0) goto done;
+    if (rdb_write_stream(f, s) < 0) goto done;
     if (fflush(f) != 0) goto done;
     if (fsync(fileno(f)) != 0) goto done;
     if (fclose(f) != 0) {
@@ -135,6 +145,62 @@ int rdb_save(Store *s, const char *path) {
     fsync_dir_of(path);
     rc = 0;
 done:
+    if (f) fclose(f);
+    if (rc != 0) unlink(tmp);
+    free(tmp);
+    return rc;
+}
+
+/* Serialize the store to a freshly malloc'd buffer (*out, *outlen).
+   The caller owns the buffer. Returns 0 on success, -1 on error
+   (errno set when it comes from the stream). No disk I/O happens
+   here: the bytes are meant to be handed to a worker thread, which
+   writes them with rdb_write_snapshot. */
+int rdb_serialize(Store *s, char **out, size_t *outlen) {
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *f = open_memstream(&buf, &len);
+    if (!f) return -1;
+    int wrc = rdb_write_stream(f, s);
+    int crc = fclose(f);
+    /* On a failed fclose the C library releases the buffer, so
+       nothing is freed here on either error path; on success buf/len
+       are the serialized snapshot. */
+    if (wrc < 0 || crc != 0) return -1;
+    *out = buf;
+    *outlen = len;
+    return 0;
+}
+
+/* Write already-serialized snapshot bytes to path atomically: to
+   path + tmp_suffix, fsync, rename over path, fsync the directory.
+   Safe to call from a worker thread: it touches only the bytes it
+   was given and the files it creates. The caller picks tmp_suffix so
+   a background save (".bgsave.tmp") never clobbers a concurrent
+   synchronous SAVE (".tmp"); both snapshots are valid, and the last
+   rename wins. Returns 0 on success, -1 on any I/O error. */
+int rdb_write_snapshot(const char *path, const char *tmp_suffix,
+                       const char *data, size_t len) {
+    size_t tmplen = strlen(path) + strlen(tmp_suffix) + 1;
+    char *tmp = malloc(tmplen);
+    if (!tmp) return -1;
+    snprintf(tmp, tmplen, "%s%s", path, tmp_suffix);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        int e = errno;
+        free(tmp);
+        errno = e;
+        return -1;
+    }
+    int rc = -1;
+    if (fwrite(data, 1, len, f) == len && fflush(f) == 0 &&
+        fsync(fileno(f)) == 0 && fclose(f) == 0) {
+        f = NULL; /* closed by the fclose above */
+        if (rename(tmp, path) == 0) {
+            fsync_dir_of(path);
+            rc = 0;
+        }
+    }
     if (f) fclose(f);
     if (rc != 0) unlink(tmp);
     free(tmp);

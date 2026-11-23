@@ -1,8 +1,8 @@
 CC      ?= gcc
-CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g
+CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g -pthread
 LDFLAGS ?=
 
-SRC := src/server.c src/store.c src/resp.c src/aof.c src/rdb.c
+SRC := src/server.c src/store.c src/resp.c src/aof.c src/rdb.c src/threadpool.c
 OBJ := $(SRC:.c=.o)
 BIN := cinder
 

@@ -1,12 +1,14 @@
 # cinder
 
 A Redis-compatible in-memory key-value store, written in C from scratch.
-Single-threaded, `epoll`-based event loop, RESP protocol, strings, lists,
+Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, lists,
 sets and hashes with TTLs, approximate LRU eviction, and an append-only file for
-durability. No dependencies beyond libc. Real `redis-cli` and any RESP
+durability, plus a small worker thread pool (`--threads`, default 1)
+that runs background saves (`BGSAVE`) off the event loop. No dependencies
+beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.11.0.
+Version 0.12.0.
 
 ## Why
 
@@ -69,6 +71,7 @@ OK
 | `KEYS pattern` | Glob match (`*` and `?`) |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
 | `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` writes a snapshot of the dataset to `dump.rdb` and forces the AOF to disk |
+| `BGSAVE` | Snapshot the dataset to `dump.rdb` in the background: the event loop serializes the store to memory and a worker thread writes the file, so the server keeps answering commands while it saves; answers `Background saving started`, a second `BGSAVE` while one is in progress is an error, and `INFO` reports `bgsave_in_progress` and `last_bgsave_status` |
 | `SYNC` | Ask this server for a full sync: it marks the connection a replica, streams a rebuild of the whole dataset (one command per key, with TTLs), then streams every later write live |
 | `PSYNC replid offset` | Ask to resume replication from a stream offset; when the replid matches this server's run id and the offset is still in the replication backlog (the last 1 MB of the write stream by default, `--repl-backlog-size`), the primary answers `+CONTINUE <replid> <offset>` and streams only the missed bytes, otherwise `+FULLRESYNC <replid> <offset>` and a full sync |
 | `REPLICAOF host port`, `REPLICAOF NO ONE` | Make this server a replica of `host:port` (PSYNC, then streamed writes, applied and AOF-logged locally); `NO ONE` promotes it to primary: the link drops, the replica state (primary run id and stream offset) is forgotten, the replicated data stays, and the node accepts writes as a primary. Reattaching to the old primary afterwards full-syncs |
@@ -89,7 +92,11 @@ src/
   rdb.c      RDB-style snapshots: `SAVE` writes the whole dataset (all
              types, TTLs as absolute expiries) to `dump.rdb` in a compact
              binary format, atomically via `dump.rdb.tmp` + rename; the
-             snapshot is loaded on startup before the AOF is replayed
+             snapshot is loaded on startup before the AOF is replayed;
+             `rdb_serialize` renders the same bytes to memory so a
+             worker thread can write them for `BGSAVE`
+  threadpool.c FIFO job queue with N worker threads (`--threads`); jobs
+             touch no shared state unless they take a lock
 ```
 
 - **Store**: chained hash table, doubling resize, lazy expiry on access plus
@@ -119,6 +126,21 @@ src/
   replaced, no fd array is allocated per iteration, and the ready set is
   fixed when `epoll_wait` returns, so a client added mid-iteration
   cannot run past the end of the event array.
+- **Thread pool**: a FIFO job queue with N worker threads (`--threads`,
+  default 1, max 32). Commands still run only on the event-loop thread —
+  the store is never touched off it, so the single-threaded correctness
+  guarantees are unchanged — and the pool exists for work that is safe
+  to move. Today that is `BGSAVE`: the loop serializes the store to
+  memory (a consistent picture, taken while the loop owns the store),
+  then a worker writes those bytes to `dump.rdb.bgsave.tmp`, fsyncs,
+  and renames it over `dump.rdb`, while the server keeps answering
+  commands. A second `BGSAVE` while one is in progress is rejected
+  rather than queued, and `SAVE` racing a `BGSAVE` uses a different
+  temp file, so both snapshots stay valid and the last rename wins.
+  On shutdown the loop waits for the pool to drain, so a save that
+  already started always lands its snapshot. `INFO` reports
+  `threads`, `threadpool_jobs_completed`, `bgsave_in_progress`,
+  `last_bgsave_status` (`none`/`ok`/`error`) and `last_bgsave_time_ms`.
 - **Replication**: a replica connects with `REPLICAOF host port` (non-blocking
   connect, `PSYNC` sent when it completes) and the primary streams a full
   sync — `FLUSHALL` plus one rebuild command per key (`SET` with `PX` for
@@ -225,7 +247,14 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
             # reattaching to the old primary full-syncs, wiping the
             # writes made while promoted), and a concurrent-clients
             # check (64 clients SET/GET at once, exercising the epoll
-            # loop with dozens of ready fds in one epoll_wait batch)
+            # loop with dozens of ready fds in one epoll_wait batch), and
+            # background-save checks (`BGSAVE` with `--threads 2` writes
+            # `dump.rdb` with all four types, skips a key whose TTL passed,
+            # reports `threads:2` and `last_bgsave_status:ok` in `INFO`, a
+            # second `BGSAVE` completes after the first, and a restart
+            # with the AOF deleted restores every key from the background
+            # snapshot alone, with a surviving TTL preserved; `--threads 0`
+            # is a startup error)
 ```
 
 ## Roadmap
@@ -250,5 +279,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, list
 - [x] `epoll` backend for the event loop (replaces `poll()`; listener
       and client fds registered once, interest re-synced per iteration,
       no per-iteration fd array allocation)
-- [ ] Thread pool for the event loop
+- [x] Thread pool for the event loop (FIFO job queue, `--threads`,
+      default 1; `BGSAVE` serializes on the loop and a worker writes
+      the snapshot off-loop, `INFO` reports pool size and save status)
 - [ ] Benchmarks against real Redis on the same hardware
