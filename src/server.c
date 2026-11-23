@@ -38,7 +38,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.18.0"
+#define CINDER_VERSION "0.19.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -273,6 +273,65 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (!v) return dbuf_null(reply), 0;
         dbuf_bulk(reply, v, strlen(v));
         free(v);
+        return 0;
+    }
+    if (strcasecmp(cmd, "GETDEL") == 0) {
+        if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'getdel' command"), 0;
+        if (store_type(g_store, argv[1]) > 1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        char *v = store_get(g_store, argv[1]);
+        if (!v) return dbuf_null(reply), 0;
+        dbuf_bulk(reply, v, strlen(v));
+        free(v);
+        /* The value is already copied into the reply, so deleting
+           after answering cannot lose it. Only a real delete is a
+           mutation: a missing key logs and replicates nothing. */
+        int deleted = store_del(g_store, argv[1]);
+        return deleted ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "GETEX") == 0) {
+        if (argc < 2 || argc > 4)
+            return dbuf_error(reply, "wrong number of arguments for 'getex' command"), 0;
+        if (store_type(g_store, argv[1]) > 1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        /* expire_at == -2 means "leave the TTL alone" (no option
+           given, or PERSIST on a key that has none). */
+        long long expire_at = -2;
+        int persist = 0;
+        if (argc == 3) {
+            if (strcasecmp(argv[2], "PERSIST") == 0) {
+                persist = 1;
+            } else {
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        } else if (argc == 4) {
+            long long t;
+            if (!parse_ll(argv[3], &t) || t <= 0)
+                return dbuf_error(reply, "invalid expire time in 'getex' command"), 0;
+            if (strcasecmp(argv[2], "EX") == 0) {
+                expire_at = now_ms() + t * 1000;
+            } else if (strcasecmp(argv[2], "PX") == 0) {
+                expire_at = now_ms() + t;
+            } else {
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        }
+        char *v = store_get(g_store, argv[1]);
+        if (!v) return dbuf_null(reply), 0;
+        dbuf_bulk(reply, v, strlen(v));
+        free(v);
+        if (persist) {
+            /* PERSIST is only a mutation when a TTL actually exists
+               to remove; on a key with no expiry it changes nothing
+               and must not be logged or replicated. */
+            if (store_ttl_ms(g_store, argv[1]) == -1) return 0;
+            store_expire(g_store, argv[1], -1);
+            return 1;
+        }
+        if (expire_at != -2) {
+            store_expire(g_store, argv[1], expire_at);
+            return 1;
+        }
         return 0;
     }
     if (strcasecmp(cmd, "DEL") == 0) {
@@ -600,6 +659,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
     }
     if (strcasecmp(cmd, "COMMAND") == 0) {
         static const char *names[] = {"PING", "ECHO", "QUIT", "SHUTDOWN", "SET", "GET",
+            "GETDEL", "GETEX",
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",

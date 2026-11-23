@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.18.0.
+Version 0.19.0.
 
 ## Why
 
@@ -53,6 +53,8 @@ OK
 | `PING [msg]`, `ECHO msg` | Connectivity |
 | `SET key value [EX s \| PX ms] [NX \| XX]` | String set with TTL and conditional write |
 | `GET key` | String get |
+| `GETDEL key` | Return the value and delete the key (`nil` when missing) |
+| `GETEX key [EX s \| PX ms \| PERSIST]` | Return the value and set, refresh, or remove its TTL (`nil` when missing; no option leaves the TTL alone) |
 | `DEL key [key ...]`, `EXISTS key [key ...]` | Multi-key delete / existence |
 | `EXPIRE key s`, `PEXPIRE key ms` | Set a TTL |
 | `TTL key`, `PTTL key` | Remaining TTL (`-2` missing, `-1` no expiry) |
@@ -418,3 +420,10 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       Known limitation: a watched key that did not exist, was created
       and deleted again before `EXEC`, reads as version 0 again, so
       that round trip is not detected
+- [x] `GETDEL` / `GETEX` (0.19.0): `GETDEL` returns the value and
+      deletes the key, `GETEX` returns the value and sets (`EX`/`PX`),
+      refreshes, or removes (`PERSIST`) its TTL; both are
+      `WRONGTYPE` on a non-string key, `nil` when missing, AOF-logged
+      and replicated only when they actually change state (a missing
+      key, a bare `GETEX`, or `PERSIST` on a key with no TTL logs
+      nothing)
