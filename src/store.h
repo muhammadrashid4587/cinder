@@ -117,6 +117,29 @@ int store_getrange(Store *s, const char *key, long long start, long long stop,
    -1 = wrong type, -2 = out of memory, -3 = negative offset. */
 long long store_setrange(Store *s, const char *key, long long offset,
                          const char *value, size_t vlen);
+/* Set the bit at offset in a string value, Redis SETBIT semantics:
+   bit 0 is the high bit of byte 0; creates the key zero-padded when
+   missing (even when the bit being set is 0, the key comes into
+   being), extends the value with zero bytes when the offset runs
+   past the end, and preserves the key's TTL, as in Redis. Returns 0
+   on success (*old_out is the bit's previous value, 0 or 1;
+   *changed_out is 1 when the stored bytes actually changed, 0 when
+   the bit already held the requested value), -1 = wrong type,
+   -2 = out of memory, -3 = offset out of range (negative or
+   >= 2^32, the largest offset in a 512 MB string). */
+int store_setbit(Store *s, const char *key, long long offset, int value,
+                 int *old_out, int *changed_out);
+/* The bit at offset: 0 for a missing key or an offset past the end
+   of the value. Returns 0 on success (*out is 0 or 1),
+   -1 = wrong type, -3 = offset out of range. */
+int store_getbit(Store *s, const char *key, long long offset, int *out);
+/* Count set bits in a string value, Redis BITCOUNT semantics: when
+   has_range is set, start/end are byte indexes (negative counts
+   from the end, out-of-range ends are clamped); an empty range
+   counts 0. Returns 0 on success (*out is the count),
+   -1 = wrong type. */
+int store_bitcount(Store *s, const char *key, long long start, long long end,
+                   int has_range, long long *out);
 /* Increment a string key's integer value by delta, in one hash lookup.
    Creates the key when missing (or expired). The TTL is untouched, so
    INCR preserves it, as in Redis. Returns 0 on success (*out is the

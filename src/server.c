@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.28.0"
+#define CINDER_VERSION "0.29.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -508,6 +508,56 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (vlen == 0) return 0;
         if (g_max_entries) store_evict_lru(g_store, g_max_entries);
         return 1;
+    }
+    if (strcasecmp(cmd, "SETBIT") == 0) {
+        if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'setbit' command"), 0;
+        long long offset;
+        if (!parse_ll(argv[2], &offset) || offset < 0 || offset > 4294967295LL)
+            return dbuf_error(reply, "bit offset is not an integer or out of range"), 0;
+        long long bit;
+        if (!parse_ll(argv[3], &bit) || (bit != 0 && bit != 1))
+            return dbuf_error(reply, "bit is not an integer or out of range"), 0;
+        int old = 0, changed = 0;
+        int rc = store_setbit(g_store, argv[1], offset, (int)bit, &old, &changed);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_int(reply, old);
+        /* Only a real change is logged and replicated: setting a bit
+           that already holds the requested value changes nothing. */
+        if (changed) {
+            if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+            return 1;
+        }
+        return 0;
+    }
+    if (strcasecmp(cmd, "GETBIT") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'getbit' command"), 0;
+        long long offset;
+        if (!parse_ll(argv[2], &offset) || offset < 0 || offset > 4294967295LL)
+            return dbuf_error(reply, "bit offset is not an integer or out of range"), 0;
+        int bit = 0;
+        int rc = store_getbit(g_store, argv[1], offset, &bit);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_int(reply, bit);
+        return 0;
+    }
+    if (strcasecmp(cmd, "BITCOUNT") == 0) {
+        if (argc != 2 && argc != 4)
+            return dbuf_error(reply, "wrong number of arguments for 'bitcount' command"), 0;
+        long long start = 0, end = 0;
+        if (argc == 4) {
+            if (!parse_ll(argv[2], &start) || !parse_ll(argv[3], &end))
+                return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        }
+        long long n = 0;
+        int rc = store_bitcount(g_store, argv[1], start, end, argc == 4, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_int(reply, n);
+        return 0;
     }
     if (strcasecmp(cmd, "DEL") == 0) {
         if (argc < 2) return dbuf_error(reply, "wrong number of arguments for 'del' command"), 0;
@@ -1169,7 +1219,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         static const char *names[] = {"PING", "ECHO", "QUIT", "SHUTDOWN", "SET", "GET",
             "MSET", "MGET", "GETDEL", "GETEX",
             "SETNX", "SETEX", "GETSET", "APPEND", "STRLEN",
-            "GETRANGE", "SETRANGE",
+            "GETRANGE", "SETRANGE", "SETBIT", "GETBIT", "BITCOUNT",
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
@@ -1846,10 +1896,11 @@ static int sync_emit_entry(const Entry *e, void *arg) {
            Rebuild it instead as a SET of the leading non-zero run
            (carrying the PX when the key has a TTL) plus one SETRANGE
            per later non-zero run; SETRANGE zero-pads the gaps, so
-           the replica ends up byte-identical. Values never end in
-           a NUL through the current command set — a SETRANGE write
-           always ends with a byte from argv, which holds no NULs —
-           so the last run always reaches the end of the value. */
+           the replica ends up byte-identical. A value whose last
+           byte is a zero byte (SETBIT can produce one) loses its
+           tail in that rebuild, since a NUL cannot ride an argv
+           string either, so a trailing SETBIT of the last bit
+           extends the value back to its full length. */
         size_t i = 0, len = e->value_len;
         int first = 1;
         while (i <= len) {
@@ -1876,6 +1927,18 @@ static int sync_emit_entry(const Entry *e, void *arg) {
                 dbuf_bulk(out, e->value + i, j - i);
             }
             i = j + 1; /* skip the NUL (or step past the end) */
+        }
+        if (len > 0 && e->value[len - 1] == '\0') {
+            /* SETBIT of the last bit (to 0) zero-pads the value out
+               to this byte, restoring the trailing zero bytes the
+               SET/SETRANGE rebuild above could not carry. */
+            char offbuf[32];
+            snprintf(offbuf, sizeof(offbuf), "%zu", (len - 1) * 8);
+            dbuf_array_header(out, 4);
+            dbuf_bulk(out, "SETBIT", 6);
+            dbuf_bulk(out, e->key, strlen(e->key));
+            dbuf_bulk(out, offbuf, strlen(offbuf));
+            dbuf_bulk(out, "0", 1);
         }
         return 0;
     }

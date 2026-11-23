@@ -718,6 +718,127 @@ long long store_setrange(Store *s, const char *key, long long offset,
     return (long long)newlen;
 }
 
+/* Bit offsets are byte-major: bit 0 is the high bit of byte 0, as in
+   Redis. The largest legal offset is 2^32-1 bits, the last bit of a
+   512 MB string, which is Redis's maximum string size. */
+#define BIT_MAX_OFFSET 4294967295LL
+
+int store_setbit(Store *s, const char *key, long long offset, int value,
+                 int *old_out, int *changed_out) {
+    if (offset < 0 || offset > BIT_MAX_OFFSET) return -3;
+    size_t byte = (size_t)(offset / 8);
+    unsigned char mask = (unsigned char)(0x80 >> (offset % 8));
+    Entry *e = store_find(s, key, NULL);
+    if (e) {
+        if (e->type != ENTRY_STRING) return -1;
+        if (byte >= e->value_len) {
+            /* The bit is past the end, so it reads 0, and setting it
+               grows the value with zero bytes; the expiry is
+               untouched, so SETBIT preserves the TTL, as in Redis. */
+            size_t newlen = byte + 1;
+            char *nv = realloc(e->value, newlen + 1);
+            if (!nv) return -2;
+            e->value = nv;
+            memset(e->value + e->value_len, 0, newlen - e->value_len);
+            e->value[newlen] = '\0';
+            e->value_len = newlen;
+            if (value) e->value[byte] |= (char)mask;
+            e->last_access = ++s->clock;
+            entry_touch(s, e);
+            *old_out = 0;
+            *changed_out = 1;
+            return 0;
+        }
+        int old = (((unsigned char)e->value[byte] & mask) != 0);
+        *old_out = old;
+        if (old == value) {
+            /* The bit already holds the requested value: nothing
+               changes, so no version bump and no log — a no-op write
+               does not invalidate a WATCH, as with SADD of a member
+               already present. */
+            *changed_out = 0;
+            e->last_access = ++s->clock;
+            return 0;
+        }
+        if (value) e->value[byte] |= (char)mask;
+        else e->value[byte] &= (char)~mask;
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+        *changed_out = 1;
+        return 0;
+    }
+    /* A missing key is created zero-padded up to the byte, as in
+       Redis — even when the bit being set is 0, the key comes into
+       being, holding a string of zero bytes. */
+    if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+        store_resize(s);
+    e = calloc(1, sizeof(Entry));
+    if (!e) return -2;
+    e->key = strdup(key);
+    size_t newlen = byte + 1;
+    e->value = calloc(newlen + 1, 1);
+    if (!e->key || !e->value) {
+        entry_free(e);
+        return -2;
+    }
+    if (value) e->value[byte] |= (char)mask;
+    e->value_len = newlen;
+    e->type = ENTRY_STRING;
+    e->expire_at = -1;
+    e->last_access = ++s->clock;
+    e->version = ++s->mod_seq;
+    size_t idx = hash_key(key) % s->cap;
+    e->next = s->buckets[idx];
+    s->buckets[idx] = e;
+    s->count++;
+    *old_out = 0;
+    *changed_out = 1;
+    return 0;
+}
+
+int store_getbit(Store *s, const char *key, long long offset, int *out) {
+    if (offset < 0 || offset > BIT_MAX_OFFSET) return -3;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) {
+        *out = 0;
+        return 0;
+    }
+    if (e->type != ENTRY_STRING) return -1;
+    e->last_access = ++s->clock;
+    size_t byte = (size_t)(offset / 8);
+    if (byte >= e->value_len) {
+        *out = 0;
+        return 0;
+    }
+    *out = (((unsigned char)e->value[byte] >> (7 - (offset % 8))) & 1);
+    return 0;
+}
+
+int store_bitcount(Store *s, const char *key, long long start, long long end,
+                   int has_range, long long *out) {
+    Entry *e = store_find(s, key, NULL);
+    *out = 0;
+    if (!e) return 0; /* missing key: 0, as in Redis */
+    if (e->type != ENTRY_STRING) return -1;
+    e->last_access = ++s->clock;
+    long long len = (long long)e->value_len;
+    long long lo = 0, hi = len - 1;
+    if (has_range) {
+        /* Byte indexes, Redis GETRANGE-style: negative counts from
+           the end, out-of-range ends are clamped. */
+        lo = start < 0 ? start + len : start;
+        hi = end < 0 ? end + len : end;
+        if (lo < 0) lo = 0;
+        if (hi >= len) hi = len - 1;
+        if (lo > hi || lo >= len) return 0;
+    }
+    long long n = 0;
+    for (long long i = lo; i <= hi; i++)
+        n += __builtin_popcount((unsigned char)e->value[i]);
+    *out = n;
+    return 0;
+}
+
 int store_del(Store *s, const char *key) {
     Entry *prev = NULL;
     (void)prev;

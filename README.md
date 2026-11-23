@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.28.0.
+Version 0.29.0.
 
 ## Why
 
@@ -64,6 +64,9 @@ OK
 | `STRLEN key` | Length of a string (`0` when missing) |
 | `GETRANGE key start end` | Substring; negative indexes count from the end, out-of-range ends are clamped, empty string when missing or the range is empty |
 | `SETRANGE key offset value` | Overwrite a string starting at `offset`, creating the key zero-padded when missing; returns the new length; preserves the TTL; an empty value changes nothing |
+| `SETBIT key offset value` | Set one bit (`0` or `1`, bit 0 is the high bit of byte 0), creating the key zero-padded when missing; returns the old bit; preserves the TTL; setting a bit that already holds the value changes nothing and is not logged |
+| `GETBIT key offset` | Bit value (`0` when missing or out of range) |
+| `BITCOUNT key [start end]` | Count set bits, optionally over a byte range (negative indexes count from the end, out-of-range ends are clamped); `0` when missing |
 | `DEL key [key ...]`, `EXISTS key [key ...]` | Multi-key delete / existence |
 | `EXPIRE key s`, `PEXPIRE key ms` | Set a TTL |
 | `TTL key`, `PTTL key` | Remaining TTL (`-2` missing, `-1` no expiry) |
@@ -360,7 +363,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # is a startup error), and a benchmark-tool check
             # (`tools/bench.py` runs against a live server, exits 0, and
             # prints one table row per operation, and `INFO` reports
-            # version 0.28.0), and `always`-policy checks (a pipeline
+            # version 0.29.0), and `always`-policy checks (a pipeline
             # mixing writes and reads returns its replies in command
             # order, two clients writing at once each get their own
             # +OK, a QUIT sent in the same packet as a SET still
@@ -400,7 +403,17 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # through `GET`/`GETRANGE`/`STRLEN`, `APPEND` appends
             # after the padding, `INCR` on it is not an integer, and
             # the padding survives an AOF restart and an RDB
-            # snapshot reload)
+            # snapshot reload), and string-bit checks (`SETBIT`
+            # returns the old bit, creates a missing key zero-padded
+            # even for a `0` bit, grows past the end, preserves the
+            # TTL, and a no-op set changes nothing; `GETBIT` returns
+            # `0` for a missing key or an out-of-range offset;
+            # `BITCOUNT` counts the whole value and byte ranges with
+            # negative indexes and clamping; bad offsets, bad bit
+            # values, wrong-type and wrong-argument errors; `COMMAND`
+            # lists all three; and a replication full sync rebuilds
+            # bit keys byte-identically, including values ending in a
+            # zero byte)
 ```
 
 ## Roadmap
@@ -585,15 +598,30 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       per non-zero run (the dispatcher reads argv as C strings, so
       a single `SET` would truncate at the first zero byte). The
       AOF log and live replication carry the raw `SETRANGE` command,
-      so those paths needed no change. Limitation: a value whose
-      last byte is a zero byte cannot be produced through the
-      current command set, and would lose its trailing zero bytes
-      on a full sync; a client-sent value holding a zero byte is
-      still truncated at the first zero byte by `SET`, as before,
-      because the dispatcher reads argv as C strings
+      so those paths needed no change. Limitation: a client-sent
+      value holding a zero byte is still truncated at the first zero
+      byte by `SET`, as before, because the dispatcher reads argv
+      as C strings
+
+- [x] String bit commands: `SETBIT` / `GETBIT` / `BITCOUNT` (0.29.0):
+      bit operations on string values, building on the length-tracked
+      strings this release added. `SETBIT` returns the old bit, bit 0
+      is the high bit of byte 0, the offset caps at 2^32-1 (the last
+      bit of a 512 MB string), a missing key is created zero-padded
+      even when the bit being set is 0, a write past the end extends
+      the value with zero bytes, and the TTL is preserved; setting a
+      bit that already holds the requested value changes nothing, so
+      it is not AOF-logged or replicated and does not invalidate a
+      `WATCH`. `GETBIT` returns `0` for a missing key or an
+      out-of-range offset. `BITCOUNT` counts set bits over the whole
+      value or an optional byte range (negative indexes, clamping,
+      empty range counts 0). `COMMAND` lists all three. A replication
+      full sync rebuilds bit values byte-identically: the `SET` /
+      `SETRANGE` rebuild cannot carry a trailing zero byte, so a
+      value ending in one gets a trailing `SETBIT` of its last bit,
+      which zero-pads it back to its full length
 
 ## Next
 
-- [ ] String bit commands: `SETBIT` / `GETBIT` / `BITCOUNT` (bit
-      operations on string values, building on the length-tracked
-      strings this release added)
+- [ ] `BITOP` (bitwise `AND` / `OR` / `XOR` / `NOT` across string
+      keys, the natural follow-on to the bit commands)

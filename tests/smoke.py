@@ -370,6 +370,74 @@ def main():
         check("COMMAND lists GETRANGE", "GETRANGE" in c.cmd("COMMAND"), True)
         check("COMMAND lists SETRANGE", "SETRANGE" in c.cmd("COMMAND"), True)
         check("string ranges cleanup", c.cmd("DEL", "gr", "sr", "srt", "grl"), 4)
+        # String bits: SETBIT / GETBIT / BITCOUNT.
+        check("GETBIT missing", c.cmd("GETBIT", "ghost", "7"), 0)
+        check("BITCOUNT missing", c.cmd("BITCOUNT", "ghost"), 0)
+        check("SETBIT new returns old 0", c.cmd("SETBIT", "bits", "7", "1"), 0)
+        check("GETBIT set bit", c.cmd("GETBIT", "bits", "7"), 1)
+        check("GETBIT unset bit", c.cmd("GETBIT", "bits", "0"), 0)
+        check("BITCOUNT one bit", c.cmd("BITCOUNT", "bits"), 1)
+        check("SETBIT same bit returns old 1", c.cmd("SETBIT", "bits", "7", "1"), 1)
+        check("SETBIT clear returns old 1", c.cmd("SETBIT", "bits", "7", "0"), 1)
+        check("GETBIT cleared", c.cmd("GETBIT", "bits", "7"), 0)
+        check("BITCOUNT after clear", c.cmd("BITCOUNT", "bits"), 0)
+        # Bit 0 is the high bit of byte 0: SETBIT 0 makes 0x80.
+        check("SETBIT high bit", c.cmd("SETBIT", "bits", "0", "1"), 0)
+        check("GETBIT high bit", c.cmd("GETBIT", "bits", "0"), 1)
+        check("BITCOUNT high bit", c.cmd("BITCOUNT", "bits"), 1)
+        # A bit past the end grows the value zero-padded.
+        check("SETBIT far bit", c.cmd("SETBIT", "bits", "15", "1"), 0)
+        check("STRLEN after far SETBIT", c.cmd("STRLEN", "bits"), 2)
+        check("BITCOUNT two bits", c.cmd("BITCOUNT", "bits"), 2)
+        check("BITCOUNT byte 0", c.cmd("BITCOUNT", "bits", "0", "0"), 1)
+        check("BITCOUNT byte 1", c.cmd("BITCOUNT", "bits", "1", "1"), 1)
+        check("BITCOUNT negative range", c.cmd("BITCOUNT", "bits", "-1", "-1"), 1)
+        check("BITCOUNT empty range", c.cmd("BITCOUNT", "bits", "1", "0"), 0)
+        check("BITCOUNT past end", c.cmd("BITCOUNT", "bits", "5", "10"), 0)
+        check("BITCOUNT clamp end", c.cmd("BITCOUNT", "bits", "0", "100"), 2)
+        check("GETBIT past end", c.cmd("GETBIT", "bits", "100"), 0)
+        # SETBIT with value 0 still creates the key, zero-padded.
+        check("SETBIT zero creates", c.cmd("SETBIT", "zb", "7", "0"), 0)
+        check("EXISTS after zero SETBIT", c.cmd("EXISTS", "zb"), 1)
+        check("STRLEN zero SETBIT", c.cmd("STRLEN", "zb"), 1)
+        check("BITCOUNT zero SETBIT", c.cmd("BITCOUNT", "zb"), 0)
+        check("GET zero SETBIT", c.cmd("GET", "zb"), "\x00")
+        # SETBIT preserves the TTL.
+        check("SET EX bit ttl", c.cmd("SET", "bt", "x", "EX", "100"), "OK")
+        check("SETBIT preserves TTL", c.cmd("SETBIT", "bt", "7", "1"), 0)
+        check("TTL after SETBIT ~", 99 <= c.cmd("TTL", "bt") <= 100, True)
+        # Errors.
+        check("SETBIT bad offset", c.cmd("SETBIT", "bits", "x", "1"),
+              ("error", "ERR bit offset is not an integer or out of range"))
+        check("SETBIT negative offset", c.cmd("SETBIT", "bits", "-1", "1"),
+              ("error", "ERR bit offset is not an integer or out of range"))
+        check("SETBIT huge offset", c.cmd("SETBIT", "bits", "4294967296", "1"),
+              ("error", "ERR bit offset is not an integer or out of range"))
+        check("SETBIT bad bit", c.cmd("SETBIT", "bits", "0", "2"),
+              ("error", "ERR bit is not an integer or out of range"))
+        check("SETBIT wrong args", c.cmd("SETBIT", "bits", "0"),
+              ("error", "ERR wrong number of arguments for 'setbit' command"))
+        check("GETBIT bad offset", c.cmd("GETBIT", "bits", "x"),
+              ("error", "ERR bit offset is not an integer or out of range"))
+        check("GETBIT negative offset", c.cmd("GETBIT", "bits", "-1"),
+              ("error", "ERR bit offset is not an integer or out of range"))
+        check("GETBIT wrong args", c.cmd("GETBIT", "bits"),
+              ("error", "ERR wrong number of arguments for 'getbit' command"))
+        check("BITCOUNT bad range", c.cmd("BITCOUNT", "bits", "x", "1"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("BITCOUNT wrong args", c.cmd("BITCOUNT", "bits", "0"),
+              ("error", "ERR wrong number of arguments for 'bitcount' command"))
+        check("RPUSH bit list", c.cmd("RPUSH", "bl", "a"), 1)
+        check("SETBIT wrongtype", c.cmd("SETBIT", "bl", "0", "1"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("GETBIT wrongtype", c.cmd("GETBIT", "bl", "0"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("BITCOUNT wrongtype", c.cmd("BITCOUNT", "bl"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("COMMAND lists SETBIT", "SETBIT" in c.cmd("COMMAND"), True)
+        check("COMMAND lists GETBIT", "GETBIT" in c.cmd("COMMAND"), True)
+        check("COMMAND lists BITCOUNT", "BITCOUNT" in c.cmd("COMMAND"), True)
+        check("string bits cleanup", c.cmd("DEL", "bits", "zb", "bt", "bl"), 4)
         # MSET / MGET: set and get several string keys at once.
         check("MSET", c.cmd("MSET", "m1", "one", "m2", "two", "m3", "three"), "OK")
         check("MGET all", c.cmd("MGET", "m1", "m2", "m3"), ["one", "two", "three"])
@@ -1236,7 +1304,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.28.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.29.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -1260,6 +1328,11 @@ def main():
         check("repl ZADD", p.cmd("ZADD", "repzset", "1.5", "a", "2", "b"), 2)
         check("repl SET ttl", p.cmd("SET", "repttl", "v", "EX", "100"), "OK")
         check("repl SET gone soon", p.cmd("SET", "repgone", "v", "PX", "50"), "OK")
+        # Bit keys, including values ending in a zero byte, which the
+        # full sync rebuilds with a trailing SETBIT.
+        check("repl SETBIT trailing NUL", p.cmd("SETBIT", "repbits", "7", "0"), 0)
+        check("repl SETBIT mixed", p.cmd("SETBIT", "repbits2", "7", "1"), 0)
+        check("repl SETBIT mixed tail", p.cmd("SETBIT", "repbits2", "15", "0"), 0)
         time.sleep(0.1)  # repgone expires before the sync: it must not appear
         replica = start_server(port=7778, data_dir=repl_replica_dir)
         r = Client(7778)
@@ -1286,6 +1359,11 @@ def main():
         check("repl sync zset score", r.cmd("ZSCORE", "repzset", "a"), "1.5")
         check("repl sync TTL survives", 90000 <= r.cmd("PTTL", "repttl") <= 100000, True)
         check("repl sync skips expired key", r.cmd("GET", "repgone"), None)
+        check("repl sync bit key trailing NUL", r.cmd("STRLEN", "repbits"), 1)
+        check("repl sync bit key bit", r.cmd("GETBIT", "repbits", "7"), 0)
+        check("repl sync bit key mixed len", r.cmd("STRLEN", "repbits2"), 2)
+        check("repl sync bit key mixed bit", r.cmd("GETBIT", "repbits2", "7"), 1)
+        check("repl sync bit key mixed count", r.cmd("BITCOUNT", "repbits2"), 1)
         check("repl INFO replica role", "role:replica" in r.cmd("INFO"), True)
         check("repl INFO replicas", "connected_replicas:1" in p.cmd("INFO"), True)
         # Live writes stream after the sync.
