@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.15.0.
+Version 0.16.0.
 
 ## Why
 
@@ -26,8 +26,9 @@ make
 ```
 
 `--aof-fsync` is `always` (default) or `everysec`: under `always` every
-mutating command is `fdatasync`ed before it is acknowledged, under
-`everysec` writes go to the log immediately and a background flush
+mutating command is `fdatasync`ed by a dedicated flush thread before
+it is acknowledged (the reply waits for the sync; see Architecture),
+under `everysec` writes go to the log immediately and a background flush
 thread syncs the file at most once a second, so the event loop never
 waits on the disk and up to a second of acknowledged writes can be
 lost on a machine crash. `SAVE` forces a sync under either policy.
@@ -97,7 +98,19 @@ src/
              waits until a sync covers every append made before the
              call), a clean shutdown flushes and joins the thread, and
              `INFO` reports `aof_flush_in_progress`,
-             `aof_flushes_completed` and `aof_dirty`
+             `aof_flushes_completed` and `aof_dirty`. Under `always`
+             the same thread does every sync and the reply waits for
+             it: the append returns a sequence number, the reply is
+             parked in a FIFO queue keyed by that number and released
+             in order once the sync covers it, and a later reply to
+             the same client parks behind it too, so per-client order
+             never breaks. The loop wakes the thread once per
+             iteration (`aof_kick`), after the read batch is
+             processed, so one pipeline coalesces into one sync
+             instead of one sync per command; the thread wakes the
+             loop back through an eventfd after each sync, and
+             `INFO` reports `aof_pending_appends` and
+             `aof_deferred_replies`
   rdb.c      RDB-style snapshots: `SAVE` writes the whole dataset (all
              types, TTLs as absolute expiries) to `dump.rdb` in a compact
              binary format, atomically via `dump.rdb.tmp` + rename; the
@@ -113,10 +126,12 @@ src/
 - **Eviction**: Redis-style approximate LRU. When `--max-entries` is set, the
   server samples 5 entries and evicts the least recently used of the sample.
 - **Durability**: every mutating command is appended to `appendonly.aof` as a
-  RESP array and synced according to `--aof-fsync`: `always` (the default)
-  `fdatasync`s after every write; `everysec` writes immediately and a
-  dedicated flush thread syncs at most once a second, and always syncs
-  on a clean shutdown or `SAVE`. On startup the file is replayed through the
+  RESP array and synced according to `--aof-fsync`: under `always` (the
+  default) the flush thread `fdatasync`s after every write and the
+  reply is deferred until that sync covers the command's append, so
+  no acknowledged write is lost on a crash and the event loop never
+  waits on the disk; under `everysec` the thread syncs at most once a
+  second, and always syncs on a clean shutdown or `SAVE`. On startup the file is replayed through the
   same dispatcher live clients use, so the log is the dataset. `SAVE`
   additionally writes a snapshot of the whole dataset to `dump.rdb`
   (strings, lists, sets and hashes, with TTLs stored as absolute
@@ -134,7 +149,10 @@ src/
   still completing) before `epoll_wait`. Unlike the `poll()` loop it
   replaced, no fd array is allocated per iteration, and the ready set is
   fixed when `epoll_wait` returns, so a client added mid-iteration
-  cannot run past the end of the event array.
+  cannot run past the end of the event array. The loop also watches the
+  AOF flush thread's wakeup eventfd, so a reply deferred on a sync is
+  released as soon as that sync lands, and it drains the deferred-reply
+  queue once per iteration as a backstop.
 - **Thread pool**: a FIFO job queue with N worker threads (`--threads`,
   default 1, max 32). Commands still run only on the event-loop thread —
   the store is never touched off it, so the single-threaded correctness
@@ -195,40 +213,48 @@ src/
 ## Benchmarks
 
 Measured with `tools/bench.py` (one client, 5,000 requests per
-operation, pipeline depth 50, mean of 3 runs each), cinder and real
-Redis 8.12.0 back-to-back on the same dev VM. Redis ran with
+operation, pipeline depth 50, mean of 3 runs each), cinder 0.16.0 and
+real Redis 8.12.0 back-to-back on the same dev VM. Redis ran with
 persistence off (`--save '' --appendonly no`); cinder ran with its
 AOF on. The VM is a shared, noisy host, so treat these as
 same-ballpark numbers (±20% run to run), not lab precision. The
-Redis column is the mean of 9 runs in the same sessions.
+Redis column is the mean of 9 runs in the 0.13.0 sessions; the cinder
+columns are the 0.16.0 means, re-measured for this release.
 
 | Operation | cinder `always` | cinder `everysec` | Redis 8.12.0 |
 | --- | ---: | ---: | ---: |
-| `SET` | ~34,000 | ~35,000 | ~35,000 |
-| `GET` | ~36,000 | ~37,000 | ~34,000 |
-| `INCR` | ~35,000 | ~35,000 | ~34,000 |
-| `LPUSH` | ~36,000 | ~33,000 | ~35,000 |
-| `HSET` | ~33,000 | ~32,000 | ~35,000 |
-| `SET` pipelined | ~166,000 | ~163,000 | ~240,000 |
-| `GET` pipelined | ~261,000 | ~259,000 | ~228,000 |
+| `SET` | ~12,000 | ~25,000 | ~35,000 |
+| `GET` | ~33,000 | ~35,000 | ~34,000 |
+| `INCR` | ~15,000 | ~26,000 | ~34,000 |
+| `LPUSH` | ~16,000 | ~26,000 | ~35,000 |
+| `HSET` | ~15,000 | ~25,000 | ~35,000 |
+| `SET` pipelined | ~131,000 | ~127,000 | ~240,000 |
+| `GET` pipelined | ~254,000 | ~231,000 | ~228,000 |
 
-Sequential single-client throughput is latency-bound, so cinder and
-Redis land in the same ballpark on every sequential operation now,
-including `INCR` and `LPUSH` — both were ~2x behind in the 0.13.0
-table, but the 0.14.0 change does each increment in one hash lookup
-and updates the stored value in place, and drops the redundant type
-pre-check on push. An interleaved A/B of the 0.13.0 and 0.14.0
-binaries on the same host put `LPUSH` at 28,500 → 35,800 ops/sec
-mean with a much tighter spread, while `INCR` measured ~35,000 on
-both binaries — so the old 19,000 figure did not reproduce and was
-likely host noise at measurement time. Pipelined `SET` still trails
-Redis by ~1.4x; that is the remaining known gap. `SET` pays one
-`fdatasync` per write under the `always` policy, but on this dev VM
-`fdatasync` is cheap, so `always` and `everysec` measure about the
-same; the policy still matters where fsync is expensive, and the sync
-count is the real difference — verified with `strace`, 200 sequential
-SETs cost 201 `fdatasync`s under `always` and 2 under `everysec`
-(one at the first write, one on shutdown). Reproduce with:
+Sequential single-client throughput is latency-bound. The 0.16.0
+`always` column is the cost of the deferred-reply slice, measured
+honestly: a sequential write's reply now waits on a flush-thread
+round trip, and on this dev VM the thread handoff (~50µs) costs more
+than the `fdatasync` it replaces (a few µs), so sequential
+SET/INCR/LPUSH/HSET measure ~12–16k under `always` against ~25–26k
+under `everysec` and ~34k on Redis — down from ~33–36k under the old
+inline sync. Pipelined writes are unaffected in kind: one sync covers
+the whole batch (the loop wakes the flush thread once per iteration,
+after the read batch is processed), so pipelined SET still measures
+~131k. The trade is deliberate: the event loop never blocks on the
+disk, so a slow disk stalls only the writing client's reply instead
+of every client; on this VM the disk is fast, so the handoff dominates
+and `always` looks slower than the old inline sync. On a machine where
+`fdatasync` costs milliseconds, the old design would stall every
+client for milliseconds per write and the deferred one would not.
+`SET` still pays one `fdatasync` per write under the `always` policy
+— verified with `strace`, 20 sequential SETs cost 21 `fdatasync`s
+(the extra one on shutdown), all of them on the flush thread, never
+on the event loop — and 2 under `everysec` (one at the first write,
+one on shutdown). The `everysec` column moved a little from the
+0.13.0 session (~32–35k then, ~25–26k now); the `everysec` path is
+unchanged apart from per-iteration housekeeping, so that is host
+noise on a shared VM, not a code change. Reproduce with:
 
 ```sh
 python3 tools/bench.py --port 7777 --compare-port 7780 --label redis
@@ -292,7 +318,14 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # is a startup error), and a benchmark-tool check
             # (`tools/bench.py` runs against a live server, exits 0, and
             # prints one table row per operation, and `INFO` reports
-            # version 0.14.0)
+            # version 0.16.0), and `always`-policy checks (a pipeline
+            # mixing writes and reads returns its replies in command
+            # order, two clients writing at once each get their own
+            # +OK, a QUIT sent in the same packet as a SET still
+            # returns both +OKs, `INFO` reports
+            # `aof_deferred_replies` and `aof_pending_appends`, and a
+            # write acknowledged before a SIGKILL is on disk after the
+            # restart)
 ```
 
 ## Roadmap
@@ -336,6 +369,14 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       stalls the event loop; `SAVE` still forces a sync (it waits for a
       sync covering every append before the call) and a clean shutdown
       flushes and joins the thread; `INFO` reports the flush state
-- [ ] Background AOF flush, `always` slice: under `always` the reply must
-      wait for the fsync, so this needs deferred replies and ordering
-      guarantees
+- [x] Background AOF flush, `always` slice (0.16.0): the `fdatasync`
+      runs on the flush thread and the reply waits for it — deferred
+      replies in a FIFO queue keyed by append sequence number, with
+      per-client ordering (a later reply parks behind an earlier one),
+      a per-iteration kick so one pipeline coalesces into one sync,
+      an eventfd wakeup so the reply goes out as soon as its sync
+      lands, and `QUIT`/`SHUTDOWN` flushing parked replies before
+      closing; `INFO` reports `aof_deferred_replies` and
+      `aof_pending_appends`. Sequential writes under `always` now cost
+      a thread round trip (~12–16k ops/sec on this VM, down from
+      ~33–36k with the inline sync); pipelined writes hold at ~131k

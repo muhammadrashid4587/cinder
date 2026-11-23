@@ -26,6 +26,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -37,7 +38,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.15.0"
+#define CINDER_VERSION "0.16.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -204,6 +205,9 @@ static int parse_ll(const char *s, long long *out) {
 typedef struct Client Client;
 static Client *g_clients;
 static size_t g_nclients;
+static size_t g_deferred_count; /* replies parked across all clients;
+                                   defined with the deferred-reply
+                                   queue below; INFO reads it here */
 static int repl_is_replica(void);
 static size_t repl_connected_replicas(void);
 static void repl_info_replicas(Dbuf *info);
@@ -566,6 +570,8 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             dbuf_putf(&info, "aof_flushes_completed:%lld\r\n", fi.flushes_completed);
             dbuf_putf(&info, "aof_dirty:%d\r\n", fi.dirty);
             dbuf_putf(&info, "aof_last_fsync_seconds_ago:%lld\r\n", fi.seconds_since_fsync);
+            dbuf_putf(&info, "aof_pending_appends:%lld\r\n", fi.pending_appends);
+            dbuf_putf(&info, "aof_deferred_replies:%zu\r\n", g_deferred_count);
         }
         dbuf_putf(&info, "# Replication\r\n");
         dbuf_putf(&info, "role:%s\r\n", repl_is_replica() ? "replica" : "master");
@@ -663,10 +669,17 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
 
 typedef struct Client {
     int fd;
+    unsigned long long gen; /* generation: distinguishes this client
+                               from a later one that reuses its fd, so
+                               a deferred reply is never delivered to
+                               the wrong connection */
     char inbuf[INBUF_CAP];
     size_t inlen;
     Dbuf out;
     int dead;
+    unsigned long long deferred_last_target; /* append seq of this
+        client's most recent deferred reply (0 = none pending) */
+    size_t deferred_count; /* replies of this client still queued */
     int is_replica;     /* primary side: this client is a replica (SYNC'd);
                            only PING is accepted from it, writes are
                            streamed to it */
@@ -686,8 +699,11 @@ typedef struct Client {
 } Client;
 
 static int g_epollfd = -1; /* created once in main, before the loop */
+static int g_aof_wakeup_fd = -1; /* eventfd the AOF flush thread writes
+                                    to after every completed sync */
 
 static size_t g_clients_cap;
+static unsigned long long g_client_gen; /* bumped per client_add */
 
 static void client_add(int fd) {
     if (g_nclients >= g_clients_cap) {
@@ -700,6 +716,7 @@ static void client_add(int fd) {
     Client *c = &g_clients[g_nclients++];
     memset(c, 0, sizeof(*c));
     c->fd = fd;
+    c->gen = ++g_client_gen;
     /* Register with epoll for reads; EPOLLOUT is added by
        client_sync_interest when the client has output pending or its
        outbound replication connect is still completing. */
@@ -749,6 +766,133 @@ static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* ---------- deferred replies (the `always` fsync slice) ----------
+ * Under `always` a mutating command's reply must wait for the fsync
+ * covering its AOF append, but the fdatasync runs on the flush
+ * thread, not on the event loop. The reply is therefore parked in a
+ * FIFO queue keyed by the append sequence number it waits for, and
+ * released in order once aof_synced_through() reaches it. The queue
+ * is global (one ordering across all clients, matching command
+ * execution order) and entries carry the client's fd plus its
+ * generation, because the client array compacts on removal and an fd
+ * can be reused: an entry whose client is gone, or whose generation
+ * no longer matches, is dropped at drain time.
+ *
+ * Per-client order is the subtle part: while a client has a reply
+ * parked, every later reply to that client — even a read that needs
+ * no sync — is parked behind it too, keyed by the client's most
+ * recent parked target. Otherwise a GET sent after a SET could
+ * overtake the SET's +OK on the wire. client_reply() is the single
+ * choke point that enforces this; every command path routes its
+ * reply through it. */
+
+typedef struct DeferredReply {
+    int fd;
+    unsigned long long gen;
+    unsigned long long target; /* append seq the reply waits for */
+    char *data;                /* reply bytes; owned by this entry */
+    size_t len;
+    struct DeferredReply *next;
+} DeferredReply;
+
+static DeferredReply *g_deferred_head;
+static DeferredReply *g_deferred_tail;
+
+/* Park a reply in the queue; takes ownership of reply->data. */
+static void defer_reply(Client *c, Dbuf *reply, unsigned long long target) {
+    DeferredReply *e = malloc(sizeof(*e));
+    if (!e) {
+        /* Out of memory: deliver immediately rather than drop the
+           reply. The durability guarantee is weakened for this one
+           command, but the client is never left hanging. */
+        dbuf_put(&c->out, reply->data, reply->len);
+        return;
+    }
+    e->fd = c->fd;
+    e->gen = c->gen;
+    e->target = target;
+    e->data = reply->data;
+    e->len = reply->len;
+    e->next = NULL;
+    reply->data = NULL;
+    reply->len = 0;
+    if (g_deferred_tail) g_deferred_tail->next = e;
+    else g_deferred_head = e;
+    g_deferred_tail = e;
+    g_deferred_count++;
+    c->deferred_count++;
+    c->deferred_last_target = target;
+}
+
+/* Deliver a reply to a client, deferring it when the `always` policy
+   requires a sync that has not landed yet, or when the client already
+   has replies parked (later replies must not overtake them). `target`
+   is the append sequence number the reply waits for, or 0 when the
+   reply needs no sync. Takes ownership of reply->data only when it
+   parks the reply; otherwise the caller still owns it. */
+static void client_reply(Client *c, Dbuf *reply, unsigned long long target) {
+    if (reply->len == 0) return;
+    if (c->deferred_count > 0) {
+        defer_reply(c, reply, target ? target : c->deferred_last_target);
+        return;
+    }
+    if (target > 0 && aof_always_policy() &&
+        aof_synced_through() < target) {
+        defer_reply(c, reply, target);
+        return;
+    }
+    dbuf_put(&c->out, reply->data, reply->len);
+}
+
+/* Release every parked reply whose sync has landed, in queue order.
+   Targets are non-decreasing along the queue (appends are sequential
+   and a sync covers a prefix of them), so checking the head is
+   enough: once the head is covered, so is everything before it. */
+static void deferred_drain(void) {
+    while (g_deferred_head) {
+        DeferredReply *e = g_deferred_head;
+        if (aof_synced_through() < e->target) break;
+        g_deferred_head = e->next;
+        if (!g_deferred_head) g_deferred_tail = NULL;
+        g_deferred_count--;
+        Client *c = NULL;
+        for (size_t i = 0; i < g_nclients; i++)
+            if (g_clients[i].fd == e->fd && g_clients[i].gen == e->gen) {
+                c = &g_clients[i];
+                break;
+            }
+        if (c) {
+            dbuf_put(&c->out, e->data, e->len);
+            if (c->deferred_count > 0) c->deferred_count--;
+            if (c->deferred_count == 0) c->deferred_last_target = 0;
+        }
+        /* No matching client: it disconnected while the reply was
+           parked; the reply is dropped with it. */
+        free(e->data);
+        free(e);
+    }
+}
+
+/* Wait for the syncs covering a client's parked replies, deliver
+   them, and flush the client's socket before it closes (used for
+   QUIT: without this, a +OK parked behind a write would never reach
+   the client). */
+static void deferred_flush_client(Client *c) {
+    if (c->deferred_count == 0) return;
+    aof_wait_for(c->deferred_last_target);
+    deferred_drain();
+    if (c->out.len > 0) {
+        int flags = fcntl(c->fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(c->fd, F_SETFL, flags & ~O_NONBLOCK);
+        size_t off = 0;
+        while (off < c->out.len) {
+            ssize_t w = write(c->fd, c->out.data + off, c->out.len - off);
+            if (w <= 0) break;
+            off += (size_t)w;
+        }
+    }
 }
 
 /* ---------- replication ----------
@@ -1399,9 +1543,27 @@ int main(int argc, char **argv) {
         perror("epoll_ctl listener");
         return 1;
     }
+    /* The AOF flush thread wakes the loop through this fd after every
+       completed sync, so a reply deferred on that sync goes out at
+       once instead of waiting for the next epoll_wait timeout. */
+    g_aof_wakeup_fd = aof_wakeup_fd();
+    if (g_aof_wakeup_fd >= 0) {
+        struct epoll_event wev;
+        memset(&wev, 0, sizeof(wev));
+        wev.events = EPOLLIN;
+        wev.data.fd = g_aof_wakeup_fd;
+        if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, g_aof_wakeup_fd, &wev) < 0)
+            perror("epoll_ctl aof wakeup");
+    }
 
     long long loop = 0;
     while (g_running) {
+        /* Release replies whose sync landed (the backstop for the
+           wakeup fd, which usually drains them as soon as the sync
+           completes). This runs before the interest sync, so a reply
+           released here is registered for EPOLLOUT in the same
+           iteration and written without waiting out a timeout. */
+        deferred_drain();
         for (size_t i = 0; i < g_nclients; i++)
             client_sync_interest(&g_clients[i]);
         struct epoll_event events[128];
@@ -1423,6 +1585,14 @@ int main(int argc, char **argv) {
                         client_add(cfd);
                     }
                 }
+                continue;
+            }
+            if (fd == g_aof_wakeup_fd) {
+                /* A flush-thread sync landed: drain the wakeup pipe
+                   and release the replies it covers. */
+                uint64_t v;
+                while (read(fd, &v, sizeof(v)) > 0) { }
+                deferred_drain();
                 continue;
             }
             /* Find the client by fd: the client array compacts on
@@ -1598,7 +1768,7 @@ int main(int argc, char **argv) {
                     } else if (strcasecmp(cargv[0], "REPLICAOF") == 0) {
                         Dbuf reply = {0};
                         handle_replicaof(cargv, cargc, &reply);
-                        if (reply.len > 0) dbuf_put(&c->out, reply.data, reply.len);
+                        client_reply(c, &reply, 0);
                         free(reply.data);
                         /* handle_replicaof may add a client, which
                            can move the client array. */
@@ -1609,21 +1779,35 @@ int main(int argc, char **argv) {
                         if (strcasecmp(cargv[0], "PING") == 0) {
                             Dbuf reply = {0};
                             dispatch(cargv, cargc, &reply);
-                            if (reply.len > 0) dbuf_put(&c->out, reply.data, reply.len);
+                            client_reply(c, &reply, 0);
                             free(reply.data);
                         } else {
-                            dbuf_error(&c->out, "replica connection is read-only");
+                            Dbuf reply = {0};
+                            dbuf_error(&reply, "replica connection is read-only");
+                            client_reply(c, &reply, 0);
+                            free(reply.data);
                         }
                     } else {
                         Dbuf reply = {0};
                         int drc = dispatch(cargv, cargc, &reply);
-                        if (reply.len > 0) dbuf_put(&c->out, reply.data, reply.len);
-                        free(reply.data);
+                        unsigned long long aof_seq = 0;
                         if (drc == 1 && !g_replaying) {
-                            aof_append(cargv, cargc);
+                            aof_seq = aof_append(cargv, cargc);
                             forward_to_replicas(raw, rawlen);
                         }
-                        if (drc == 2) c->dead = 1;
+                        /* Under `always` a mutating reply parks until
+                           the flush thread's sync covers its append;
+                           client_reply also parks later replies behind
+                           it, so per-client order never breaks. */
+                        client_reply(c, &reply, aof_seq);
+                        free(reply.data);
+                        if (drc == 2) {
+                            /* QUIT behind parked replies: wait for the
+                               syncs and flush the socket, or the
+                               client never sees the +OKs. */
+                            deferred_flush_client(c);
+                            c->dead = 1;
+                        }
                         if (drc == 3) shutdown = 1;
                     }
                     for (int k = 0; k < cargc; k++) free(cargv[k]);
@@ -1645,6 +1829,9 @@ int main(int argc, char **argv) {
         }
         /* everysec AOF policy: flush pending writes once a second. */
         aof_tick();
+        /* `always` AOF policy: wake the flush thread for the appends
+           made this iteration, now that the burst is fully appended. */
+        aof_kick();
         if ((++loop % 100) == 0) store_expire_scan(g_store, 20);
     }
 
@@ -1657,6 +1844,12 @@ int main(int argc, char **argv) {
     /* Persist the replication stream position, if this node is a
        replica, so a clean restart can resume from it. */
     repl_state_save();
+    /* Deferred `always`-policy replies: wait for the syncs covering
+       them and deliver them into the clients' out buffers before
+       flushing the sockets below, or a SHUTDOWN +OK parked behind a
+       write would never reach its client. */
+    aof_fsync();
+    deferred_drain();
     /* Flush any pending replies (notably the SHUTDOWN +OK) before
        closing client sockets: switch them back to blocking briefly. */
     for (size_t i = 0; i < g_nclients; i++) {

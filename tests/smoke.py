@@ -298,7 +298,17 @@ def main():
         check("AOF replay hash", c.cmd("HGETALL", "phash"), ["a", "1", "b", "2"])
         check("AOF replay hash len", c.cmd("HLEN", "phash"), 2)
         # The replayed PEXPIRE re-arms blinklist's 50 ms TTL from replay
-        # time, so it is briefly alive again; touching it expires it.
+        # time, so it is briefly alive again. The checks above run only
+        # a few ms after the restart, so whether the TTL has passed by
+        # the time they run depends on startup timing — poll until the
+        # three keys are gone instead of assuming enough time passed.
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if (c.cmd("LLEN", "blinklist") == 0 and
+                    c.cmd("SCARD", "blinkset") == 0 and
+                    c.cmd("HLEN", "blinkhash") == 0):
+                break
+            time.sleep(0.01)
         check("AOF replay expired list gone", c.cmd("LLEN", "blinklist"), 0)
         check("AOF replay expired set gone", c.cmd("SCARD", "blinkset"), 0)
         check("AOF replay expired hash gone", c.cmd("HLEN", "blinkhash"), 0)
@@ -355,6 +365,76 @@ def main():
         c = Client(PORT)
         check("everysec replay after SIGKILL", c.cmd("GET", "eskey"), "esval")
         check("everysec replay SAVE key after SIGKILL", c.cmd("GET", "eskey2"), "esval2")
+        c.cmd("SHUTDOWN")
+        c.close()
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    # `always` policy: the fsync runs on the flush thread and the reply
+    # waits for it (deferred replies), so the event loop never blocks
+    # on the disk — but replies still come back in command order, even
+    # when a read follows a write in the same pipeline, and a write
+    # acknowledged before a SIGKILL is on disk after the restart.
+    def raw_cmd(*args):
+        parts = [f"*{len(args)}\r\n".encode()]
+        for a in args:
+            b = a if isinstance(a, bytes) else str(a).encode()
+            parts.append(f"${len(b)}\r\n".encode() + b + b"\r\n")
+        return b"".join(parts)
+
+    al_dir = "/tmp/cinder-smoke-always"
+    proc = start_server(data_dir=al_dir)
+    try:
+        c = Client(PORT)
+        info = c.cmd("INFO")
+        check("always INFO policy", "aof_fsync_policy:always" in info, True)
+        check("always INFO flush thread", "aof_flush_thread:1" in info, True)
+        check("always INFO deferred field", "aof_deferred_replies:" in info, True)
+        check("always INFO pending field", "aof_pending_appends:" in info, True)
+        # A pipeline mixing writes and reads: the GETs must not
+        # overtake the SETs' +OKs — the deferred replies keep
+        # per-client order even though the reads need no sync.
+        c.s.sendall(raw_cmd("SET", "pipe1", "v1") + raw_cmd("GET", "pipe1") +
+                    raw_cmd("SET", "pipe2", "v2") + raw_cmd("GET", "pipe2") +
+                    raw_cmd("INCR", "pipectr"))
+        replies = [c._read_reply() for _ in range(5)]
+        check("always pipeline order", replies, ["OK", "v1", "OK", "v2", 1])
+        check("always queue drained", "aof_deferred_replies:0" in c.cmd("INFO"), True)
+        # Two clients writing at once: each gets its own +OK, and the
+        # values land.
+        c2 = Client(PORT)
+        check("always client2 SET", c2.cmd("SET", "other", "x"), "OK")
+        check("always client1 GET other", c.cmd("GET", "other"), "x")
+        check("always client2 GET pipe1", c2.cmd("GET", "pipe1"), "v1")
+        c2.close()
+        # QUIT sent in the same packet as a SET: the SET's reply is
+        # still parked when QUIT runs, so the server must wait for
+        # the sync and flush both +OKs before closing.
+        cq = Client(PORT)
+        cq.s.sendall(raw_cmd("SET", "quitkey", "qv") + raw_cmd("QUIT"))
+        check("always QUIT SET reply", cq._read_reply(), "OK")
+        check("always QUIT reply", cq._read_reply(), "OK")
+        cq.close()
+        # The acknowledged writes must be on disk: SIGKILL now, and
+        # the restart must see them.
+        check("always SET durable", c.cmd("SET", "killkey", "killval"), "OK")
+        c.close()
+        proc.kill()  # unclean shutdown: no graceful flush
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+    proc = start_server(data_dir=al_dir, fresh=False)
+    try:
+        c = Client(PORT)
+        check("always replay after SIGKILL", c.cmd("GET", "killkey"), "killval")
+        check("always replay pipeline key", c.cmd("GET", "pipe1"), "v1")
+        check("always replay QUIT key", c.cmd("GET", "quitkey"), "qv")
+        check("always replay counter", c.cmd("GET", "pipectr"), "1")
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -517,7 +597,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.15.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.16.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
