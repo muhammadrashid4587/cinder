@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.27.0"
+#define CINDER_VERSION "0.28.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -319,9 +319,10 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'get' command"), 0;
         if (store_type(g_store, argv[1]) > 1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
-        char *v = store_get(g_store, argv[1]);
+        size_t vlen;
+        char *v = store_get_len(g_store, argv[1], &vlen);
         if (!v) return dbuf_null(reply), 0;
-        dbuf_bulk(reply, v, strlen(v));
+        dbuf_bulk(reply, v, vlen);
         free(v);
         return 0;
     }
@@ -335,12 +336,13 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
                 dbuf_null(reply);
                 continue;
             }
-            char *v = store_get(g_store, argv[i]);
+            size_t vlen;
+            char *v = store_get_len(g_store, argv[i], &vlen);
             if (!v) {
                 dbuf_null(reply);
                 continue;
             }
-            dbuf_bulk(reply, v, strlen(v));
+            dbuf_bulk(reply, v, vlen);
             free(v);
         }
         return 0;
@@ -349,9 +351,10 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'getdel' command"), 0;
         if (store_type(g_store, argv[1]) > 1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
-        char *v = store_get(g_store, argv[1]);
+        size_t vlen;
+        char *v = store_get_len(g_store, argv[1], &vlen);
         if (!v) return dbuf_null(reply), 0;
-        dbuf_bulk(reply, v, strlen(v));
+        dbuf_bulk(reply, v, vlen);
         free(v);
         /* The value is already copied into the reply, so deleting
            after answering cannot lose it. Only a real delete is a
@@ -386,9 +389,11 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
                 return dbuf_error(reply, "syntax error"), 0;
             }
         }
-        char *v = store_get(g_store, argv[1]);
+        char *v = NULL;
+        size_t vlen = 0;
+        v = store_get_len(g_store, argv[1], &vlen);
         if (!v) return dbuf_null(reply), 0;
-        dbuf_bulk(reply, v, strlen(v));
+        dbuf_bulk(reply, v, vlen);
         free(v);
         if (persist) {
             /* PERSIST is only a mutation when a TTL actually exists
@@ -432,7 +437,8 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'getset' command"), 0;
         if (store_type(g_store, argv[1]) > 1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
-        char *old = store_get(g_store, argv[1]);
+        size_t oldlen;
+        char *old = store_get_len(g_store, argv[1], &oldlen);
         /* GETSET clears the TTL, like a plain SET. */
         if (!store_set(g_store, argv[1], argv[2], -1)) {
             free(old);
@@ -440,7 +446,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         }
         if (g_max_entries) store_evict_lru(g_store, g_max_entries);
         if (!old) return dbuf_null(reply), 1;
-        dbuf_bulk(reply, old, strlen(old));
+        dbuf_bulk(reply, old, oldlen);
         free(old);
         return 1;
     }
@@ -459,11 +465,49 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'strlen' command"), 0;
         if (store_type(g_store, argv[1]) > 1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
-        char *v = store_get(g_store, argv[1]);
+        size_t vlen;
+        char *v = store_get_len(g_store, argv[1], &vlen);
         if (!v) return dbuf_int(reply, 0), 0;
-        dbuf_int(reply, (long long)strlen(v));
+        dbuf_int(reply, (long long)vlen);
         free(v);
         return 0;
+    }
+    if (strcasecmp(cmd, "GETRANGE") == 0) {
+        if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'getrange' command"), 0;
+        long long start, stop;
+        if (!parse_ll(argv[2], &start) || !parse_ll(argv[3], &stop))
+            return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        if (store_type(g_store, argv[1]) > 1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        char *out = NULL;
+        size_t n = 0;
+        int rc = store_getrange(g_store, argv[1], start, stop, &out, &n);
+        if (rc == -2) return dbuf_error(reply, "out of memory"), 0;
+        /* The slice is length-delimited, so zero bytes from a
+           SETRANGE pad come back intact, as in Redis. */
+        dbuf_bulk(reply, out ? out : "", n);
+        free(out);
+        return 0;
+    }
+    if (strcasecmp(cmd, "SETRANGE") == 0) {
+        if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'setrange' command"), 0;
+        long long offset;
+        if (!parse_ll(argv[2], &offset))
+            return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        if (offset < 0)
+            return dbuf_error(reply, "offset is out of range"), 0;
+        size_t vlen = strlen(argv[3]);
+        long long n = store_setrange(g_store, argv[1], offset, argv[3], vlen);
+        if (n == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (n == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_int(reply, n);
+        /* An empty value changes nothing and logs nothing, as in
+           Redis; any real write is logged and replicated. */
+        if (vlen == 0) return 0;
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        return 1;
     }
     if (strcasecmp(cmd, "DEL") == 0) {
         if (argc < 2) return dbuf_error(reply, "wrong number of arguments for 'del' command"), 0;
@@ -1125,6 +1169,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         static const char *names[] = {"PING", "ECHO", "QUIT", "SHUTDOWN", "SET", "GET",
             "MSET", "MGET", "GETDEL", "GETEX",
             "SETNX", "SETEX", "GETSET", "APPEND", "STRLEN",
+            "GETRANGE", "SETRANGE",
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
@@ -1795,13 +1840,42 @@ static int sync_emit_entry(const Entry *e, void *arg) {
     if (e->expire_at > 0 && ttl <= 0) return 0; /* expired since the scan */
     char ttlbuf[32];
     if (e->type == ENTRY_STRING) {
-        if (ttl > 0) {
-            snprintf(ttlbuf, sizeof(ttlbuf), "%lld", ttl);
-            char *av[] = {"SET", (char *)e->key, (char *)e->value, "PX", ttlbuf};
-            emit_resp_cmd(out, av, 5);
-        } else {
-            char *av[] = {"SET", (char *)e->key, (char *)e->value};
-            emit_resp_cmd(out, av, 3);
+        /* A value holding zero bytes (SETRANGE padding) cannot ride
+           a single SET: the replica's dispatcher reads argv as C
+           strings, so the value would truncate at the first NUL.
+           Rebuild it instead as a SET of the leading non-zero run
+           (carrying the PX when the key has a TTL) plus one SETRANGE
+           per later non-zero run; SETRANGE zero-pads the gaps, so
+           the replica ends up byte-identical. Values never end in
+           a NUL through the current command set — a SETRANGE write
+           always ends with a byte from argv, which holds no NULs —
+           so the last run always reaches the end of the value. */
+        size_t i = 0, len = e->value_len;
+        int first = 1;
+        while (i <= len) {
+            size_t j = i;
+            while (j < len && e->value[j] != '\0') j++;
+            if (first) {
+                dbuf_array_header(out, ttl > 0 ? 5 : 3);
+                dbuf_bulk(out, "SET", 3);
+                dbuf_bulk(out, e->key, strlen(e->key));
+                dbuf_bulk(out, e->value + i, j - i);
+                if (ttl > 0) {
+                    snprintf(ttlbuf, sizeof(ttlbuf), "%lld", ttl);
+                    dbuf_bulk(out, "PX", 2);
+                    dbuf_bulk(out, ttlbuf, strlen(ttlbuf));
+                }
+                first = 0;
+            } else if (j > i) {
+                char offbuf[32];
+                snprintf(offbuf, sizeof(offbuf), "%zu", i);
+                dbuf_array_header(out, 4);
+                dbuf_bulk(out, "SETRANGE", 8);
+                dbuf_bulk(out, e->key, strlen(e->key));
+                dbuf_bulk(out, offbuf, strlen(offbuf));
+                dbuf_bulk(out, e->value + i, j - i);
+            }
+            i = j + 1; /* skip the NUL (or step past the end) */
         }
         return 0;
     }

@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.27.0.
+Version 0.28.0.
 
 ## Why
 
@@ -62,6 +62,8 @@ OK
 | `GETSET key value` | Return the old value and set the new one (`nil` when missing; clears the TTL) |
 | `APPEND key value` | Append to a string, creating the key when missing, and return the new length; preserves the TTL |
 | `STRLEN key` | Length of a string (`0` when missing) |
+| `GETRANGE key start end` | Substring; negative indexes count from the end, out-of-range ends are clamped, empty string when missing or the range is empty |
+| `SETRANGE key offset value` | Overwrite a string starting at `offset`, creating the key zero-padded when missing; returns the new length; preserves the TTL; an empty value changes nothing |
 | `DEL key [key ...]`, `EXISTS key [key ...]` | Multi-key delete / existence |
 | `EXPIRE key s`, `PEXPIRE key ms` | Set a TTL |
 | `TTL key`, `PTTL key` | Remaining TTL (`-2` missing, `-1` no expiry) |
@@ -358,7 +360,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # is a startup error), and a benchmark-tool check
             # (`tools/bench.py` runs against a live server, exits 0, and
             # prints one table row per operation, and `INFO` reports
-            # version 0.25.0), and `always`-policy checks (a pipeline
+            # version 0.28.0), and `always`-policy checks (a pipeline
             # mixing writes and reads returns its replies in command
             # order, two clients writing at once each get their own
             # +OK, a QUIT sent in the same packet as a SET still
@@ -387,7 +389,18 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # `GETSET` returns the old value and clears the TTL;
             # `APPEND` appends or creates and preserves the TTL;
             # `STRLEN` returns the length, `0` for a missing key,
-            # and wrong-type errors for the commands that take one)
+            # and wrong-type errors for the commands that take one),
+            # and string-range checks (`GETRANGE` with negative
+            # indexes and out-of-range clamping, empty string for a
+            # missing key or an empty range, wrong-type and bad-index
+            # errors; `SETRANGE` overwriting, extending, creating a
+            # missing key zero-padded, preserving the TTL, an empty
+            # value changing nothing and creating nothing, negative
+            # and bad offsets; a zero-padded value reads back whole
+            # through `GET`/`GETRANGE`/`STRLEN`, `APPEND` appends
+            # after the padding, `INCR` on it is not an integer, and
+            # the padding survives an AOF restart and an RDB
+            # snapshot reload)
 ```
 
 ## Roadmap
@@ -558,8 +571,29 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       AOF-logged and replicated when they change state (a `SETNX`
       that does not set logs nothing); the mutating ones bump the
       key's version, so `WATCH` sees them. `COMMAND` lists all five
+- [x] String ranges: `GETRANGE` / `SETRANGE` (0.28.0): substring
+      read and overwrite with Redis index semantics (negative
+      indexes, clamping, empty string for a missing key or an empty
+      range); `SETRANGE` creates a missing key zero-padded, extends
+      with zero bytes, preserves the TTL, and an empty value changes
+      nothing. String values are now length-tracked (`value_len` on
+      the entry), so a zero-padded value reads back whole through
+      `GET`/`MGET`/`GETDEL`/`GETEX`/`GETSET`/`STRLEN`/`GETRANGE`,
+      `APPEND` appends after the padding, `INCR` rejects it as not
+      an integer, RDB snapshots store the full bytes, and a
+      replication full sync rebuilds it as `SET` plus `SETRANGE`
+      per non-zero run (the dispatcher reads argv as C strings, so
+      a single `SET` would truncate at the first zero byte). The
+      AOF log and live replication carry the raw `SETRANGE` command,
+      so those paths needed no change. Limitation: a value whose
+      last byte is a zero byte cannot be produced through the
+      current command set, and would lose its trailing zero bytes
+      on a full sync; a client-sent value holding a zero byte is
+      still truncated at the first zero byte by `SET`, as before,
+      because the dispatcher reads argv as C strings
 
 ## Next
 
-- [ ] String ranges: `GETRANGE` / `SETRANGE` (substring read and
-      overwrite, zero-padding past the end)
+- [ ] String bit commands: `SETBIT` / `GETBIT` / `BITCOUNT` (bit
+      operations on string values, building on the length-tracked
+      strings this release added)

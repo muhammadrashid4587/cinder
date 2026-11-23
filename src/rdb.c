@@ -41,6 +41,14 @@ static int w_str(FILE *f, const char *s) {
     return fwrite(s, 1, n, f) == n ? 0 : -1;
 }
 
+/* Length-aware w_str: writes n bytes verbatim, NUL bytes included,
+   so a SETRANGE-padded string value round-trips through a snapshot. */
+static int w_bytes(FILE *f, const char *s, size_t n) {
+    if (n > UINT32_MAX) return -1;
+    if (w_u32(f, (uint32_t)n) < 0) return -1;
+    return fwrite(s, 1, n, f) == n ? 0 : -1;
+}
+
 /* fsync the directory holding path, so the rename below is durable. */
 static void fsync_dir_of(const char *path) {
     char dir[1024];
@@ -77,7 +85,7 @@ static int save_entry(const Entry *e, void *arg) {
         return 1;
     }
     if (e->type == ENTRY_STRING) {
-        if (w_str(f, e->value) < 0) { ctx->err = 1; return 1; }
+        if (w_bytes(f, e->value, e->value_len) < 0) { ctx->err = 1; return 1; }
     } else if (e->type == ENTRY_LIST) {
         List *l = e->list;
         if (w_u32(f, (uint32_t)l->len) < 0) { ctx->err = 1; return 1; }
@@ -255,8 +263,10 @@ static int r_i64(Reader *r, int64_t *out) {
     return 0;
 }
 
-/* Read a length-prefixed string, NUL-terminated. Caller frees. */
-static int r_str(Reader *r, char **out) {
+/* Length-aware string read: *len_out is the stored byte length, NUL
+   bytes included, so a SETRANGE-padded value loads back whole.
+   The buffer is NUL-terminated at [*len_out]. Caller frees. */
+static int r_str_len(Reader *r, char **out, size_t *len_out) {
     uint32_t n;
     if (r_u32(r, &n) < 0) return -1;
     if (r->off + n > r->len) return -1;
@@ -266,7 +276,13 @@ static int r_str(Reader *r, char **out) {
     s[n] = '\0';
     r->off += n;
     *out = s;
+    if (len_out) *len_out = n;
     return 0;
+}
+
+/* Read a length-prefixed string, NUL-terminated. Caller frees. */
+static int r_str(Reader *r, char **out) {
+    return r_str_len(r, out, NULL);
 }
 
 long long rdb_load(Store *s, const char *path) {
@@ -322,8 +338,9 @@ long long rdb_load(Store *s, const char *path) {
         int expired = expire_at != -1 && expire_at <= now_ms();
         if (type == ENTRY_STRING) {
             char *val = NULL;
-            if (r_str(&r, &val) < 0) { free(key); goto malformed; }
-            if (!expired) store_set(s, key, val, expire_at);
+            size_t vlen = 0;
+            if (r_str_len(&r, &val, &vlen) < 0) { free(key); goto malformed; }
+            if (!expired) store_set_len(s, key, val, vlen, expire_at);
             free(val);
         } else if (type == ENTRY_LIST || type == ENTRY_SET) {
             uint32_t n;

@@ -316,6 +316,60 @@ def main():
         check("COMMAND lists APPEND", "APPEND" in c.cmd("COMMAND"), True)
         check("COMMAND lists STRLEN", "STRLEN" in c.cmd("COMMAND"), True)
         check("string misc cleanup", c.cmd("DEL", "nx", "sx", "gs", "gsl", "ap", "nxl"), 6)
+        # String ranges: GETRANGE / SETRANGE.
+        check("SET grange", c.cmd("SET", "gr", "Hello World"), "OK")
+        check("RPUSH grange list", c.cmd("RPUSH", "grl", "a"), 1)
+        check("GETRANGE 0 4", c.cmd("GETRANGE", "gr", "0", "4"), "Hello")
+        check("GETRANGE 6 -1", c.cmd("GETRANGE", "gr", "6", "-1"), "World")
+        check("GETRANGE -5 -1", c.cmd("GETRANGE", "gr", "-5", "-1"), "World")
+        check("GETRANGE 0 -1", c.cmd("GETRANGE", "gr", "0", "-1"), "Hello World")
+        check("GETRANGE clamp stop", c.cmd("GETRANGE", "gr", "0", "100"), "Hello World")
+        check("GETRANGE clamp start", c.cmd("GETRANGE", "gr", "-100", "2"), "Hel")
+        check("GETRANGE start > stop", c.cmd("GETRANGE", "gr", "5", "2"), "")
+        check("GETRANGE past end", c.cmd("GETRANGE", "gr", "20", "30"), "")
+        check("GETRANGE missing", c.cmd("GETRANGE", "ghost", "0", "-1"), "")
+        check("GETRANGE bad index", c.cmd("GETRANGE", "gr", "x", "1"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("GETRANGE wrong args", c.cmd("GETRANGE", "gr", "0"),
+              ("error", "ERR wrong number of arguments for 'getrange' command"))
+        check("GETRANGE wrongtype", c.cmd("GETRANGE", "grl", "0", "-1"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("SETRANGE overwrite", c.cmd("SETRANGE", "gr", "6", "Redis"), 11)
+        check("GET after SETRANGE", c.cmd("GET", "gr"), "Hello Redis")
+        check("SETRANGE at end", c.cmd("SETRANGE", "gr", "11", "!"), 12)
+        check("GET after SETRANGE at end", c.cmd("GET", "gr"), "Hello Redis!")
+        # A missing key is created zero-padded up to the offset.
+        check("SETRANGE missing creates", c.cmd("SETRANGE", "sr", "6", "Redis"), 11)
+        check("STRLEN padded", c.cmd("STRLEN", "sr"), 11)
+        check("GET padded", c.cmd("GET", "sr"), "\x00" * 6 + "Redis")
+        check("GETRANGE padded head", c.cmd("GETRANGE", "sr", "0", "5"), "\x00" * 6)
+        check("GETRANGE padded tail", c.cmd("GETRANGE", "sr", "6", "-1"), "Redis")
+        check("SETRANGE into padding", c.cmd("SETRANGE", "sr", "0", "Hello"), 11)
+        check("GET after SETRANGE into padding", c.cmd("GET", "sr"), "Hello\x00Redis")
+        check("APPEND after padding", c.cmd("APPEND", "sr", "!"), 12)
+        check("GET after APPEND padded", c.cmd("GET", "sr"), "Hello\x00Redis!")
+        check("INCR padded is not an integer", c.cmd("INCR", "sr"),
+              ("error", "ERR value is not an integer or out of range"))
+        # SETRANGE preserves the TTL.
+        check("SET EX setrange ttl", c.cmd("SET", "srt", "hello", "EX", "100"), "OK")
+        check("SETRANGE preserves TTL", c.cmd("SETRANGE", "srt", "5", " world"), 11)
+        check("TTL after SETRANGE ~", 99 <= c.cmd("TTL", "srt") <= 100, True)
+        # An empty value changes nothing and creates nothing.
+        check("SETRANGE empty missing", c.cmd("SETRANGE", "ghost", "5", ""), 0)
+        check("EXISTS after empty SETRANGE", c.cmd("EXISTS", "ghost"), 0)
+        check("SETRANGE empty existing", c.cmd("SETRANGE", "gr", "0", ""), 12)
+        check("GET after empty SETRANGE", c.cmd("GET", "gr"), "Hello Redis!")
+        check("SETRANGE negative offset", c.cmd("SETRANGE", "gr", "-1", "x"),
+              ("error", "ERR offset is out of range"))
+        check("SETRANGE bad offset", c.cmd("SETRANGE", "gr", "x", "y"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("SETRANGE wrong args", c.cmd("SETRANGE", "gr", "0"),
+              ("error", "ERR wrong number of arguments for 'setrange' command"))
+        check("SETRANGE wrongtype", c.cmd("SETRANGE", "grl", "0", "x"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("COMMAND lists GETRANGE", "GETRANGE" in c.cmd("COMMAND"), True)
+        check("COMMAND lists SETRANGE", "SETRANGE" in c.cmd("COMMAND"), True)
+        check("string ranges cleanup", c.cmd("DEL", "gr", "sr", "srt", "grl"), 4)
         # MSET / MGET: set and get several string keys at once.
         check("MSET", c.cmd("MSET", "m1", "one", "m2", "two", "m3", "three"), "OK")
         check("MGET all", c.cmd("MGET", "m1", "m2", "m3"), ["one", "two", "three"])
@@ -826,13 +880,16 @@ def main():
         check("rebuild pset", c.cmd("SADD", "pset", "x", "y", "z"), 3)
         check("rebuild phash", c.cmd("HSET", "phash", "a", "1", "b", "2"), 2)
         check("rebuild pzset", c.cmd("ZADD", "pzset", "1.5", "x", "2.25", "y", "10", "z"), 3)
+        # A zero-padded string, so the restart proves SETRANGE padding
+        # survives an AOF replay byte-for-byte.
+        check("rebuild prange", c.cmd("SETRANGE", "prange", "5", "pad"), 8)
         check("COMMAND lists WATCH", "WATCH" in c.cmd("COMMAND"), True)
         check("COMMAND lists UNWATCH", "UNWATCH" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZADD", "ZADD" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZSCORE", "ZSCORE" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZCARD", "ZCARD" in c.cmd("COMMAND"), True)
         # Clean up the transaction keys: the AOF restart below counts
-        # exact keys (5: after, plist, pset, phash, pzset).
+        # exact keys (6: after, plist, pset, phash, pzset, prange).
         # ZINCRBY and ZREM on pzset before the restart, so the AOF
         # replay section below can prove they were logged.
         check("AOF pre-restart ZINCRBY", c.cmd("ZINCRBY", "pzset", "1", "x"), "2.5")
@@ -868,6 +925,9 @@ def main():
         check("AOF replay zset incr score", c.cmd("ZSCORE", "pzset", "x"), "2.5")
         check("AOF replay zset range", c.cmd("ZRANGE", "pzset", "0", "-1"), ["y", "x"])
         check("AOF replay zset removed gone", c.cmd("ZSCORE", "pzset", "z"), None)
+        check("AOF replay padded GET", c.cmd("GET", "prange"), "\x00" * 5 + "pad")
+        check("AOF replay padded STRLEN", c.cmd("STRLEN", "prange"), 8)
+        check("AOF replay padded GETRANGE", c.cmd("GETRANGE", "prange", "0", "4"), "\x00" * 5)
         # The replayed PEXPIRE re-arms blinklist's 50 ms TTL from replay
         # time, so it is briefly alive again. The checks above run only
         # a few ms after the restart, so whether the TTL has passed by
@@ -885,7 +945,7 @@ def main():
         check("AOF replay expired set gone", c.cmd("SCARD", "blinkset"), 0)
         check("AOF replay expired hash gone", c.cmd("HLEN", "blinkhash"), 0)
         check("AOF replay expired zset gone", c.cmd("ZCARD", "blinkzset"), 0)
-        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 5)
+        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 6)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -1031,6 +1091,7 @@ def main():
         check("rdb ZADD", c.cmd("ZADD", "snapzset", "1.5", "a", "2", "b"), 2)
         check("rdb SET ttl", c.cmd("SET", "snapttl", "v", "EX", "100"), "OK")
         check("rdb SET expiring", c.cmd("SET", "snapgone", "v", "PX", "50"), "OK")
+        check("rdb SETRANGE pad", c.cmd("SETRANGE", "snappad", "3", "pad"), 6)
         time.sleep(0.1)
         check("rdb SAVE", c.cmd("SAVE"), "OK")
         with open(os.path.join(rdb_dir, "dump.rdb"), "rb") as f:
@@ -1058,7 +1119,9 @@ def main():
         check("rdb reload zset score", c.cmd("ZSCORE", "snapzset", "a"), "1.5")
         check("rdb reload TTL survives", 90000 <= c.cmd("PTTL", "snapttl") <= 100000, True)
         check("rdb reload expired gone", c.cmd("GET", "snapgone"), None)
-        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 6)
+        check("rdb reload padded GET", c.cmd("GET", "snappad"), "\x00" * 3 + "pad")
+        check("rdb reload padded STRLEN", c.cmd("STRLEN", "snappad"), 6)
+        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 7)
         check("rdb reload SET still works", c.cmd("SET", "afterload", "1"), "OK")
         check("rdb SAVE again", c.cmd("SAVE"), "OK")
         c.cmd("SHUTDOWN")
@@ -1173,7 +1236,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.27.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.28.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

@@ -447,10 +447,17 @@ static void entry_touch(Store *s, Entry *e) {
 }
 
 int store_set(Store *s, const char *key, const char *value, long long expire_at) {
+    return store_set_len(s, key, value, strlen(value), expire_at);
+}
+
+int store_set_len(Store *s, const char *key, const char *value, size_t vlen,
+                  long long expire_at) {
     Entry *e = store_find(s, key, NULL);
     if (e) {
-        char *nv = strdup(value);
+        char *nv = malloc(vlen + 1);
         if (!nv) return 0;
+        memcpy(nv, value, vlen);
+        nv[vlen] = '\0';
         if (e->type == ENTRY_LIST) {
             /* SET replaces the key wholesale, whatever it held. */
             list_free(e->list);
@@ -471,6 +478,7 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
         }
         free(e->value);
         e->value = nv;
+        e->value_len = vlen;
         e->expire_at = expire_at;
         e->last_access = ++s->clock;
         entry_touch(s, e);
@@ -481,11 +489,14 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
     e = calloc(1, sizeof(Entry));
     if (!e) return 0;
     e->key = strdup(key);
-    e->value = strdup(value);
+    e->value = malloc(vlen + 1);
     if (!e->key || !e->value) {
         entry_free(e);
         return 0;
     }
+    memcpy(e->value, value, vlen);
+    e->value[vlen] = '\0';
+    e->value_len = vlen;
     e->type = ENTRY_STRING;
     e->expire_at = expire_at;
     e->last_access = ++s->clock;
@@ -498,10 +509,20 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
 }
 
 char *store_get(Store *s, const char *key) {
+    size_t len;
+    return store_get_len(s, key, &len);
+}
+
+char *store_get_len(Store *s, const char *key, size_t *len_out) {
     Entry *e = store_find(s, key, NULL);
     if (!e || e->type != ENTRY_STRING) return NULL;
     e->last_access = ++s->clock;
-    return strdup(e->value);
+    char *copy = malloc(e->value_len + 1);
+    if (!copy) return NULL;
+    memcpy(copy, e->value, e->value_len);
+    copy[e->value_len] = '\0';
+    if (len_out) *len_out = e->value_len;
+    return copy;
 }
 
 /* Strict integer parse: the whole string must be one integer. */
@@ -520,7 +541,9 @@ int store_incr(Store *s, const char *key, long long delta, long long *out) {
     long long v = 0;
     if (e) {
         if (e->type != ENTRY_STRING) return -1;
-        if (!parse_ll(e->value, &v)) return -2;
+        /* A value holding a NUL byte is not an integer, even when it
+           starts with digits: parse_ll would stop at the NUL. */
+        if (e->value_len != strlen(e->value) || !parse_ll(e->value, &v)) return -2;
     }
     v += delta;
     char vbuf[32];
@@ -530,12 +553,13 @@ int store_incr(Store *s, const char *key, long long delta, long long *out) {
            allocation only when the new decimal form is longer than
            the old one. The expiry is untouched, so the TTL survives. */
         size_t nlen = strlen(vbuf);
-        if (nlen > strlen(e->value)) {
+        if (nlen > e->value_len) {
             char *nv = realloc(e->value, nlen + 1);
             if (!nv) return -3;
             e->value = nv;
         }
         memcpy(e->value, vbuf, nlen + 1);
+        e->value_len = nlen;
         e->last_access = ++s->clock;
         entry_touch(s, e);
     } else {
@@ -549,6 +573,7 @@ int store_incr(Store *s, const char *key, long long delta, long long *out) {
             entry_free(e);
             return -3;
         }
+        e->value_len = strlen(vbuf);
         e->type = ENTRY_STRING;
         e->expire_at = -1;
         e->last_access = ++s->clock;
@@ -567,13 +592,16 @@ long long store_append(Store *s, const char *key, const char *value) {
     if (e) {
         if (e->type != ENTRY_STRING) return -1;
         /* Grow the stored string in place; the expiry is untouched,
-           so APPEND preserves the TTL, as in Redis. */
-        size_t old = strlen(e->value);
+           so APPEND preserves the TTL, as in Redis. The old length
+           is value_len, not strlen: a value SETRANGE padded with
+           zero bytes appends after the padding, not inside it. */
+        size_t old = e->value_len;
         size_t add = strlen(value);
         char *nv = realloc(e->value, old + add + 1);
         if (!nv) return -2;
         e->value = nv;
         memcpy(e->value + old, value, add + 1);
+        e->value_len = old + add;
         e->last_access = ++s->clock;
         entry_touch(s, e);
         return (long long)(old + add);
@@ -588,6 +616,7 @@ long long store_append(Store *s, const char *key, const char *value) {
         entry_free(e);
         return -2;
     }
+    e->value_len = strlen(value);
     e->type = ENTRY_STRING;
     e->expire_at = -1;
     e->last_access = ++s->clock;
@@ -597,6 +626,96 @@ long long store_append(Store *s, const char *key, const char *value) {
     s->buckets[idx] = e;
     s->count++;
     return (long long)strlen(value);
+}
+
+int store_getrange(Store *s, const char *key, long long start, long long stop,
+                   char **out, size_t *n_out) {
+    Entry *e = store_find(s, key, NULL);
+    *out = NULL;
+    *n_out = 0;
+    if (!e) return 0; /* missing key: empty string, as in Redis */
+    if (e->type != ENTRY_STRING) return -1;
+    e->last_access = ++s->clock;
+    long long len = (long long)e->value_len;
+    if (start < 0) start += len;
+    if (stop < 0) stop += len;
+    if (start < 0) start = 0;
+    if (stop >= len) stop = len - 1;
+    if (start > stop || start >= len) {
+        /* Empty range: still a valid (empty) reply. */
+        char *empty = malloc(1);
+        if (!empty) return -2;
+        empty[0] = '\0';
+        *out = empty;
+        *n_out = 0;
+        return 0;
+    }
+    size_t n = (size_t)(stop - start + 1);
+    char *buf = malloc(n + 1);
+    if (!buf) return -2;
+    memcpy(buf, e->value + start, n);
+    buf[n] = '\0';
+    *out = buf;
+    *n_out = n;
+    return 0;
+}
+
+long long store_setrange(Store *s, const char *key, long long offset,
+                         const char *value, size_t vlen) {
+    if (offset < 0) return -3;
+    if (vlen == 0) {
+        /* An empty write changes nothing and creates nothing, as in
+           Redis: just report the current length. */
+        Entry *e = store_find(s, key, NULL);
+        if (!e) return 0;
+        if (e->type != ENTRY_STRING) return -1;
+        return (long long)e->value_len;
+    }
+    Entry *e = store_find(s, key, NULL);
+    if (e) {
+        if (e->type != ENTRY_STRING) return -1;
+        /* Grow to cover the write, zero-filling the gap; the expiry
+           is untouched, so SETRANGE preserves the TTL, as in Redis. */
+        size_t off = (size_t)offset;
+        size_t newlen = off + vlen > e->value_len ? off + vlen : e->value_len;
+        char *nv = realloc(e->value, newlen + 1);
+        if (!nv) return -2;
+        e->value = nv;
+        if (off > e->value_len)
+            memset(e->value + e->value_len, 0, off - e->value_len);
+        memcpy(e->value + off, value, vlen);
+        e->value[newlen] = '\0';
+        e->value_len = newlen;
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+        return (long long)newlen;
+    }
+    if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+        store_resize(s);
+    e = calloc(1, sizeof(Entry));
+    if (!e) return -2;
+    e->key = strdup(key);
+    size_t off = (size_t)offset;
+    size_t newlen = off + vlen;
+    e->value = malloc(newlen + 1);
+    if (!e->key || !e->value) {
+        entry_free(e);
+        return -2;
+    }
+    /* A missing key is created zero-padded up to the offset. */
+    if (off > 0) memset(e->value, 0, off);
+    memcpy(e->value + off, value, vlen);
+    e->value[newlen] = '\0';
+    e->value_len = newlen;
+    e->type = ENTRY_STRING;
+    e->expire_at = -1;
+    e->last_access = ++s->clock;
+    e->version = ++s->mod_seq;
+    size_t idx = hash_key(key) % s->cap;
+    e->next = s->buckets[idx];
+    s->buckets[idx] = e;
+    s->count++;
+    return (long long)newlen;
 }
 
 int store_del(Store *s, const char *key) {

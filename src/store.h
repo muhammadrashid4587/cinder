@@ -53,6 +53,12 @@ typedef struct Entry {
     char *key;
     int type; /* ENTRY_STRING, ENTRY_LIST, ENTRY_SET or ENTRY_HASH */
     char *value; /* string values (type == ENTRY_STRING) */
+    size_t value_len; /* true byte length of a string value, NUL bytes
+                         included: string values are length-tracked,
+                         so SETRANGE zero-padding survives GET, RDB
+                         snapshots and replication. e->value[value_len]
+                         is always '\0'; value_len == strlen(value)
+                         whenever the value holds no NUL byte */
     List *list; /* list values (type == ENTRY_LIST) */
     Set *set; /* set values (type == ENTRY_SET) */
     Hash *hash; /* hash values (type == ENTRY_HASH) */
@@ -85,8 +91,32 @@ void store_free(Store *s);
 /* Insert or overwrite a key. Value is copied. expire_at is ms epoch, -1 = none.
    Overwriting a list key replaces it with the string. */
 int store_set(Store *s, const char *key, const char *value, long long expire_at);
+/* Length-aware store_set: value is vlen bytes, NUL bytes included.
+   store_set is this with vlen = strlen(value). */
+int store_set_len(Store *s, const char *key, const char *value, size_t vlen,
+                  long long expire_at);
 /* Returns a malloc'd copy of the value, or NULL if missing/expired/wrong type. */
 char *store_get(Store *s, const char *key);
+/* Length-aware store_get: the copy holds the full value_len bytes
+   (NUL bytes included) plus a terminator at [value_len]; *len_out is
+   the true length. Returns NULL when missing/expired/wrong type. */
+char *store_get_len(Store *s, const char *key, size_t *len_out);
+/* Substring of a string value, Redis GETRANGE semantics: negative
+   indexes count from the end, out-of-range ends are clamped, and an
+   empty range (or a missing key) returns an empty string, not nil.
+   Returns 0 on success (*out is a malloc'd buffer of *n_out bytes,
+   NUL-terminated at [*n_out]; the caller frees it), -1 = wrong type,
+   -2 = out of memory. */
+int store_getrange(Store *s, const char *key, long long start, long long stop,
+                   char **out, size_t *n_out);
+/* Overwrite a string value starting at offset, Redis SETRANGE
+   semantics: creates the key when missing, zero-padding up to the
+   offset, and extends the value with zero bytes when the write runs
+   past the end. Preserves the key's TTL, as in Redis. An empty value
+   changes nothing and creates nothing. Returns the new length,
+   -1 = wrong type, -2 = out of memory, -3 = negative offset. */
+long long store_setrange(Store *s, const char *key, long long offset,
+                         const char *value, size_t vlen);
 /* Increment a string key's integer value by delta, in one hash lookup.
    Creates the key when missing (or expired). The TTL is untouched, so
    INCR preserves it, as in Redis. Returns 0 on success (*out is the
