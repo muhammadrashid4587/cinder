@@ -69,13 +69,120 @@ static void hash_free(Hash *h) {
     free(h);
 }
 
+static void zset_free(ZSet *z) {
+    if (!z) return;
+    for (size_t i = 0; i < z->len; i++)
+        free(z->members[i]);
+    free(z->members);
+    free(z->scores);
+    free(z);
+}
+
 static void entry_free(Entry *e) {
     free(e->key);
     if (e->type == ENTRY_LIST) list_free(e->list);
     else if (e->type == ENTRY_SET) set_free(e->set);
     else if (e->type == ENTRY_HASH) hash_free(e->hash);
+    else if (e->type == ENTRY_ZSET) zset_free(e->zset);
     else free(e->value);
     free(e);
+}
+
+static ZSet *zset_new(void) {
+    ZSet *z = calloc(1, sizeof(ZSet));
+    if (!z) return NULL;
+    z->cap = 8;
+    z->members = calloc(z->cap, sizeof(char *));
+    z->scores = calloc(z->cap, sizeof(double));
+    if (!z->members || !z->scores) {
+        zset_free(z);
+        return NULL;
+    }
+    return z;
+}
+
+/* Index of member, or -1 when absent. Linear scan, like the set type. */
+static long long zset_find(ZSet *z, const char *member) {
+    for (size_t i = 0; i < z->len; i++)
+        if (strcmp(z->members[i], member) == 0) return (long long)i;
+    return -1;
+}
+
+/* Ordering: score ascending, then member lexicographically. */
+static int zset_cmp(double s1, const char *m1, double s2, const char *m2) {
+    if (s1 < s2) return -1;
+    if (s1 > s2) return 1;
+    return strcmp(m1, m2);
+}
+
+/* Grow the arrays when full. Returns 0 on OOM. Each realloc result
+   is stored as soon as it succeeds: if the second realloc fails,
+   the first array is already grown (its capacity is larger than
+   cap records, which is harmless — the next grow just happens no
+   sooner than it would have) and no pointer is left dangling. */
+static int zset_grow(ZSet *z) {
+    size_t ncap = z->cap * 2;
+    double *ns = realloc(z->scores, ncap * sizeof(double));
+    if (!ns) return 0;
+    z->scores = ns;
+    char **nm = realloc(z->members, ncap * sizeof(char *));
+    if (!nm) return 0;
+    z->members = nm;
+    z->cap = ncap;
+    return 1;
+}
+
+/* Insert member with score at its sorted position (the member must
+   not already be present). Returns 1 added, -1 = OOM. */
+static int zset_insert(ZSet *z, const char *member, double score) {
+    char *m = strdup(member);
+    if (!m) return -1;
+    if (z->len == z->cap && !zset_grow(z)) {
+        free(m);
+        return -1;
+    }
+    size_t pos = 0;
+    while (pos < z->len &&
+           zset_cmp(z->scores[pos], z->members[pos], score, member) < 0)
+        pos++;
+    memmove(&z->members[pos + 1], &z->members[pos],
+            (z->len - pos) * sizeof(char *));
+    memmove(&z->scores[pos + 1], &z->scores[pos],
+            (z->len - pos) * sizeof(double));
+    z->members[pos] = m;
+    z->scores[pos] = score;
+    z->len++;
+    return 1;
+}
+
+/* Set member to score. Returns 1 new, 0 updated (score changed),
+   2 no-op (member already had exactly that score), -1 = OOM. */
+static int zset_put(ZSet *z, const char *member, double score) {
+    long long idx = zset_find(z, member);
+    if (idx < 0) return zset_insert(z, member, score);
+    if (z->scores[idx] == score) return 2;
+    /* A changed score can move the member: pull it out and reinsert
+       at its new sorted position. No grow is needed — the slot just
+       freed leaves room. */
+    char *m = z->members[idx];
+    memmove(&z->members[idx], &z->members[idx + 1],
+            (z->len - (size_t)idx - 1) * sizeof(char *));
+    memmove(&z->scores[idx], &z->scores[idx + 1],
+            (z->len - (size_t)idx - 1) * sizeof(double));
+    z->len--;
+    z->members[z->len] = NULL;
+    size_t pos = 0;
+    while (pos < z->len &&
+           zset_cmp(z->scores[pos], z->members[pos], score, m) < 0)
+        pos++;
+    memmove(&z->members[pos + 1], &z->members[pos],
+            (z->len - pos) * sizeof(char *));
+    memmove(&z->scores[pos + 1], &z->scores[pos],
+            (z->len - pos) * sizeof(double));
+    z->members[pos] = m;
+    z->scores[pos] = score;
+    z->len++;
+    return 0;
 }
 
 static Hash *hash_new(void) {
@@ -342,6 +449,10 @@ int store_set(Store *s, const char *key, const char *value, long long expire_at)
         } else if (e->type == ENTRY_HASH) {
             hash_free(e->hash);
             e->hash = NULL;
+            e->type = ENTRY_STRING;
+        } else if (e->type == ENTRY_ZSET) {
+            zset_free(e->zset);
+            e->zset = NULL;
             e->type = ENTRY_STRING;
         }
         free(e->value);
@@ -626,6 +737,7 @@ int store_type(Store *s, const char *key) {
     if (e->type == ENTRY_LIST) return 2;
     if (e->type == ENTRY_SET) return 3;
     if (e->type == ENTRY_HASH) return 4;
+    if (e->type == ENTRY_ZSET) return 5;
     return 1;
 }
 
@@ -955,4 +1067,67 @@ int store_hgetall(Store *s, const char *key, char ***out, size_t *n_out) {
     *out = res;
     *n_out = h->len * 2;
     return 0;
+}
+
+/* ---------- sorted sets ---------- */
+
+long long store_zadd(Store *s, const char *key, const char *member,
+                     double score) {
+    Entry *e = store_find(s, key, NULL);
+    if (e) {
+        if (e->type != ENTRY_ZSET) return -1;
+        int rc = zset_put(e->zset, member, score);
+        if (rc < 0) return -2;
+        if (rc != 2) {
+            /* A new member or a changed score is a real change; an
+               identical score re-add touches nothing, so a WATCH on
+               the key is not invalidated by it. */
+            e->last_access = ++s->clock;
+            entry_touch(s, e);
+        }
+        return rc;
+    }
+    if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+        store_resize(s);
+    e = calloc(1, sizeof(Entry));
+    if (!e) return -2;
+    e->key = strdup(key);
+    e->zset = zset_new();
+    if (!e->key || !e->zset) {
+        entry_free(e);
+        return -2;
+    }
+    e->type = ENTRY_ZSET;
+    e->expire_at = -1;
+    e->last_access = ++s->clock;
+    e->version = ++s->mod_seq;
+    if (zset_put(e->zset, member, score) < 0) {
+        entry_free(e);
+        return -2;
+    }
+    size_t idx = hash_key(key) % s->cap;
+    e->next = s->buckets[idx];
+    s->buckets[idx] = e;
+    s->count++;
+    return 1;
+}
+
+int store_zscore(Store *s, const char *key, const char *member,
+                 double *out) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    e->last_access = ++s->clock;
+    long long idx = zset_find(e->zset, member);
+    if (idx < 0) return 0;
+    *out = e->zset->scores[idx];
+    return 1;
+}
+
+long long store_zcard(Store *s, const char *key) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    e->last_access = ++s->clock;
+    return (long long)e->zset->len;
 }

@@ -2,7 +2,7 @@
 
 A Redis-compatible in-memory key-value store, written in C from scratch.
 Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, lists,
-sets and hashes with TTLs, approximate LRU eviction, and an append-only file for
+sets, hashes and sorted sets with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
 flush thread that does the once-a-second AOF sync under `everysec`,
@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.20.0.
+Version 0.21.0.
 
 ## Why
 
@@ -78,6 +78,9 @@ OK
 | `HEXISTS key field` | `1` if the field exists, `0` if not |
 | `HLEN key` | Number of fields (`0` when missing) |
 | `HGETALL key` | Flat `[field, value, ...]` array in insertion order |
+| `ZADD key score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing) |
+| `ZSCORE key member` | Member's score (`nil` when missing) |
+| `ZCARD key` | Number of members (`0` when missing) |
 | `KEYS pattern` | Glob match (`*` and `?`) |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
 | `COMMAND`, `SAVE` | `COMMAND` lists supported commands; `SAVE` writes a snapshot of the dataset to `dump.rdb` and forces the AOF to disk |
@@ -94,8 +97,10 @@ src/
   server.c   TCP listener, epoll event loop, command dispatch
   store.c    hash table (djb2, chaining, resize at 0.75 load), TTLs,
              strings, lists (circular-buffer lists, O(1) push/pop),
-             sets (unordered member arrays, dedup on insert) and
+             sets (unordered member arrays, dedup on insert),
              hashes (parallel field/value arrays, insertion order)
+             and sorted sets (parallel member/score arrays kept
+             sorted by score then member, linear scan)
   resp.c     RESP parser (array + inline commands) and encoders
   aof.c      append-only log: every mutation is a RESP array, replayed on start;
              fsync policy `always` or `everysec`; under `everysec` a
@@ -140,7 +145,7 @@ src/
   second, and always syncs on a clean shutdown or `SAVE`. On startup the file is replayed through the
   same dispatcher live clients use, so the log is the dataset. `SAVE`
   additionally writes a snapshot of the whole dataset to `dump.rdb`
-  (strings, lists, sets and hashes, with TTLs stored as absolute
+  (strings, lists, sets, hashes and sorted sets, with TTLs stored as absolute
   expiries; keys whose TTL already passed are left out), atomically via
   `dump.rdb.tmp`, `fsync`, and rename, so a crash mid-save never leaves
   a torn snapshot. On startup the snapshot is loaded first and the AOF
@@ -279,17 +284,23 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # TTL expiry, emptying a set deletes the key), hash checks
             # (multi-field set, update, get, delete, exists, length,
             # getall in insertion order, wrong-type errors, hash TTL
-            # expiry, emptying a hash deletes the key), an AOF
-            # restart test (data, a list, a set and a hash survive a
+            # expiry, emptying a hash deletes the key), sorted-set
+            # checks (multi-member add, score update, re-add with the
+            # same score is a no-op, duplicate member in one call
+            # takes the last score, bad-score error applies nothing,
+            # wrong-type errors, sorted-set TTL expiry, AOF restart
+            # and RDB snapshot and replication full-sync checks for
+            # scores), an AOF
+            # restart test (data, a list, a set, a hash and a sorted set survive a
             # SHUTDOWN and reload), and everysec-policy checks (INFO
             # reports the policy, the AOF holds the record before any
             # sync, data survives a SIGKILL + restart, unknown policy
             # is a startup error), and RDB snapshot checks (SAVE writes
-            # dump.rdb with all four types, a key whose TTL passed
+            # dump.rdb with all five types, a key whose TTL passed
             # before the save is left out, and a restart with the AOF
             # deleted restores every key from the snapshot alone, with
             # a surviving TTL preserved), and replication checks
-            # (REPLICAOF streams a full sync of all four types with a
+            # (REPLICAOF streams a full sync of all five types with a
             # surviving TTL, skips a key whose TTL passed first, then
             # streams live SET/INCR/DEL/LPUSH writes; REPLICAOF NO ONE
             # detaches and later writes stop flowing; a replica restart
@@ -316,7 +327,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # check (64 clients SET/GET at once, exercising the epoll
             # loop with dozens of ready fds in one epoll_wait batch), and
             # background-save checks (`BGSAVE` with `--threads 2` writes
-            # `dump.rdb` with all four types, skips a key whose TTL passed,
+            # `dump.rdb` with all five types, skips a key whose TTL passed,
             # reports `threads:2` and `last_bgsave_status:ok` in `INFO`, a
             # second `BGSAVE` completes after the first, and a restart
             # with the AOF deleted restores every key from the background
@@ -438,3 +449,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       is read-only. Limitation: on an out-of-memory failure midway
       through an `MSET`, the pairs set before the failure stay set
       (same partial-apply behaviour as `HSET` in this codebase)
+- [x] Sorted sets, basics (0.21.0): `ZADD` / `ZSCORE` / `ZCARD`,
+      members kept in a sorted array ordered by (score, member),
+      AOF-logged, RDB-persisted (scores as `%.17g` strings, which
+      round-trip exactly) and replicated via full sync; `ZADD` parses
+      every score before applying any pair, so a bad score changes
+      nothing, and re-adding a member with its current score is a
+      no-op that neither logs nor invalidates a `WATCH`. Limitations:
+      no range commands yet (`ZRANGE`/`ZREVRANGE`/`ZRANGEBYSCORE`),
+      no `ZREM`/`ZRANK`/`ZINCRBY`, no `NX`/`XX`/`GT`/`LT`/`CH`/`INCR`
+      options on `ZADD`, and member lookup is a linear scan, so large
+      sorted sets are slower than a skip list would be
+
+## Next
+
+- [ ] Sorted-set ranges and removal: `ZRANGE`, `ZREVRANGE`,
+      `ZRANGEBYSCORE`, `ZREM`, `ZRANK`, `ZINCRBY`

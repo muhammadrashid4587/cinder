@@ -316,6 +316,39 @@ def main():
         check("HDEL empties hash", c.cmd("HDEL", "myhash", "f1"), 1)
         check("EXISTS after hash emptied", c.cmd("EXISTS", "myhash"), 0)
         check("HSET persist hash", c.cmd("HSET", "phash", "a", "1", "b", "2"), 2)
+        # Sorted sets: add/update, scores, wrong type, TTL, AOF
+        # persistence. Members are ordered by (score, member); range
+        # commands are not implemented yet.
+        check("ZADD", c.cmd("ZADD", "myzset", "1.5", "a", "2", "b", "0.5", "c"), 3)
+        check("ZADD update score", c.cmd("ZADD", "myzset", "3", "a"), 0)
+        check("ZADD same score", c.cmd("ZADD", "myzset", "3", "a"), 0)
+        check("ZADD dup member one call", c.cmd("ZADD", "myzset", "4", "b", "5", "b"), 0)
+        check("ZCARD", c.cmd("ZCARD", "myzset"), 3)
+        check("ZCARD missing", c.cmd("ZCARD", "ghostzset"), 0)
+        check("ZSCORE updated", c.cmd("ZSCORE", "myzset", "a"), "3")
+        check("ZSCORE float", c.cmd("ZSCORE", "myzset", "b"), "5")
+        check("ZSCORE low", c.cmd("ZSCORE", "myzset", "c"), "0.5")
+        check("ZSCORE missing member", c.cmd("ZSCORE", "myzset", "ghost"), None)
+        check("ZSCORE missing key", c.cmd("ZSCORE", "ghostzset", "a"), None)
+        check("ZADD bad score", c.cmd("ZADD", "myzset", "nan", "x"),
+              ("error", "ERR value is not a valid float"))
+        check("ZADD bad score second pair", c.cmd("ZADD", "myzset", "1", "ok", "xx", "x"),
+              ("error", "ERR value is not a valid float"))
+        check("ZSCORE unchanged after bad ZADD", c.cmd("ZSCORE", "myzset", "ok"), None)
+        check("ZADD wrong args", c.cmd("ZADD", "myzset", "1"),
+              ("error", "ERR wrong number of arguments for 'zadd' command"))
+        check("ZADD wrongtype", c.cmd("ZADD", "after", "1", "x"), wrongtype)
+        check("ZSCORE wrongtype", c.cmd("ZSCORE", "after", "x"), wrongtype)
+        check("ZCARD wrongtype", c.cmd("ZCARD", "after"), wrongtype)
+        check("GET zset wrongtype", c.cmd("GET", "myzset"), wrongtype)
+        check("SADD zset wrongtype", c.cmd("SADD", "myzset", "x"), wrongtype)
+        check("HSET zset wrongtype", c.cmd("HSET", "myzset", "f", "v"), wrongtype)
+        check("ZADD ttl zset", c.cmd("ZADD", "blinkzset", "1", "a"), 1)
+        check("PEXPIRE zset", c.cmd("PEXPIRE", "blinkzset", "50"), 1)
+        time.sleep(0.1)
+        check("ZCARD expired zset", c.cmd("ZCARD", "blinkzset"), 0)
+        check("ZSCORE expired zset", c.cmd("ZSCORE", "blinkzset", "a"), None)
+        check("ZADD persist zset", c.cmd("ZADD", "pzset", "1.5", "x", "2.25", "y", "10", "z"), 3)
         # Transactions: MULTI queues, EXEC runs the queue in order and
         # returns one reply per command, DISCARD drops the queue, and
         # the error cases. A second client proves the queued writes
@@ -461,10 +494,14 @@ def main():
         check("rebuild plist", c.cmd("RPUSH", "plist", "x", "y", "z"), 3)
         check("rebuild pset", c.cmd("SADD", "pset", "x", "y", "z"), 3)
         check("rebuild phash", c.cmd("HSET", "phash", "a", "1", "b", "2"), 2)
+        check("rebuild pzset", c.cmd("ZADD", "pzset", "1.5", "x", "2.25", "y", "10", "z"), 3)
         check("COMMAND lists WATCH", "WATCH" in c.cmd("COMMAND"), True)
         check("COMMAND lists UNWATCH", "UNWATCH" in c.cmd("COMMAND"), True)
+        check("COMMAND lists ZADD", "ZADD" in c.cmd("COMMAND"), True)
+        check("COMMAND lists ZSCORE", "ZSCORE" in c.cmd("COMMAND"), True)
+        check("COMMAND lists ZCARD", "ZCARD" in c.cmd("COMMAND"), True)
         # Clean up the transaction keys: the AOF restart below counts
-        # exact keys (4: after, plist, pset, phash).
+        # exact keys (5: after, plist, pset, phash, pzset).
         check("tx cleanup", c.cmd("DEL", "txkey", "txctr", "txkey2", "txlist"), 4)
         c2.close()
         c.cmd("SHUTDOWN")
@@ -491,6 +528,9 @@ def main():
         check("AOF replay set card", c.cmd("SCARD", "pset"), 3)
         check("AOF replay hash", c.cmd("HGETALL", "phash"), ["a", "1", "b", "2"])
         check("AOF replay hash len", c.cmd("HLEN", "phash"), 2)
+        check("AOF replay zset card", c.cmd("ZCARD", "pzset"), 3)
+        check("AOF replay zset score", c.cmd("ZSCORE", "pzset", "y"), "2.25")
+        check("AOF replay zset score int", c.cmd("ZSCORE", "pzset", "z"), "10")
         # The replayed PEXPIRE re-arms blinklist's 50 ms TTL from replay
         # time, so it is briefly alive again. The checks above run only
         # a few ms after the restart, so whether the TTL has passed by
@@ -500,13 +540,15 @@ def main():
         while time.time() < deadline:
             if (c.cmd("LLEN", "blinklist") == 0 and
                     c.cmd("SCARD", "blinkset") == 0 and
-                    c.cmd("HLEN", "blinkhash") == 0):
+                    c.cmd("HLEN", "blinkhash") == 0 and
+                    c.cmd("ZCARD", "blinkzset") == 0):
                 break
             time.sleep(0.01)
         check("AOF replay expired list gone", c.cmd("LLEN", "blinklist"), 0)
         check("AOF replay expired set gone", c.cmd("SCARD", "blinkset"), 0)
         check("AOF replay expired hash gone", c.cmd("HLEN", "blinkhash"), 0)
-        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 4)
+        check("AOF replay expired zset gone", c.cmd("ZCARD", "blinkzset"), 0)
+        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 5)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -649,6 +691,7 @@ def main():
         check("rdb RPUSH", c.cmd("RPUSH", "snaplist", "x", "y", "z"), 3)
         check("rdb SADD", c.cmd("SADD", "snapset", "a", "b"), 2)
         check("rdb HSET", c.cmd("HSET", "snaphash", "f1", "v1", "f2", "v2"), 2)
+        check("rdb ZADD", c.cmd("ZADD", "snapzset", "1.5", "a", "2", "b"), 2)
         check("rdb SET ttl", c.cmd("SET", "snapttl", "v", "EX", "100"), "OK")
         check("rdb SET expiring", c.cmd("SET", "snapgone", "v", "PX", "50"), "OK")
         time.sleep(0.1)
@@ -656,7 +699,7 @@ def main():
         with open(os.path.join(rdb_dir, "dump.rdb"), "rb") as f:
             snap = f.read()
         check("rdb file magic", snap[:6], b"CINDER")
-        check("rdb file has keys", b"snapstr" in snap and b"snaphash" in snap, True)
+        check("rdb file has keys", b"snapstr" in snap and b"snaphash" in snap and b"snapzset" in snap, True)
         check("rdb file skips expired key", b"snapgone" not in snap, True)
         c.cmd("SHUTDOWN")
         c.close()
@@ -674,9 +717,11 @@ def main():
         check("rdb reload list", c.cmd("LRANGE", "snaplist", "0", "-1"), ["x", "y", "z"])
         check("rdb reload set", sorted(c.cmd("SMEMBERS", "snapset")), ["a", "b"])
         check("rdb reload hash", c.cmd("HGETALL", "snaphash"), ["f1", "v1", "f2", "v2"])
+        check("rdb reload zset card", c.cmd("ZCARD", "snapzset"), 2)
+        check("rdb reload zset score", c.cmd("ZSCORE", "snapzset", "a"), "1.5")
         check("rdb reload TTL survives", 90000 <= c.cmd("PTTL", "snapttl") <= 100000, True)
         check("rdb reload expired gone", c.cmd("GET", "snapgone"), None)
-        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 5)
+        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 6)
         check("rdb reload SET still works", c.cmd("SET", "afterload", "1"), "OK")
         check("rdb SAVE again", c.cmd("SAVE"), "OK")
         c.cmd("SHUTDOWN")
@@ -791,7 +836,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.19.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.21.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -812,6 +857,7 @@ def main():
         check("repl RPUSH", p.cmd("RPUSH", "replist", "x", "y", "z"), 3)
         check("repl SADD", p.cmd("SADD", "repset", "a", "b"), 2)
         check("repl HSET", p.cmd("HSET", "rephash", "f1", "v1", "f2", "v2"), 2)
+        check("repl ZADD", p.cmd("ZADD", "repzset", "1.5", "a", "2", "b"), 2)
         check("repl SET ttl", p.cmd("SET", "repttl", "v", "EX", "100"), "OK")
         check("repl SET gone soon", p.cmd("SET", "repgone", "v", "PX", "50"), "OK")
         time.sleep(0.1)  # repgone expires before the sync: it must not appear
@@ -836,6 +882,8 @@ def main():
         check("repl full sync arrived", synced, True)
         check("repl sync set", sorted(r.cmd("SMEMBERS", "repset")), ["a", "b"])
         check("repl sync hash", r.cmd("HGETALL", "rephash"), ["f1", "v1", "f2", "v2"])
+        check("repl sync zset", r.cmd("ZCARD", "repzset"), 2)
+        check("repl sync zset score", r.cmd("ZSCORE", "repzset", "a"), "1.5")
         check("repl sync TTL survives", 90000 <= r.cmd("PTTL", "repttl") <= 100000, True)
         check("repl sync skips expired key", r.cmd("GET", "repgone"), None)
         check("repl INFO replica role", "role:replica" in r.cmd("INFO"), True)

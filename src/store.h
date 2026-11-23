@@ -7,6 +7,7 @@
 #define ENTRY_LIST 1
 #define ENTRY_SET 2
 #define ENTRY_HASH 3
+#define ENTRY_ZSET 4
 
 /* A list value: circular buffer of malloc'd strings, so push/pop at
    either end is O(1) amortised. */
@@ -35,6 +36,19 @@ typedef struct Hash {
     size_t len;
 } Hash;
 
+/* A sorted-set value: parallel arrays of malloc'd members and their
+   scores, kept sorted by (score, member) — score ascending, then
+   member lexicographically, as in Redis. Lookup and insertion are
+   linear scans, like the set and hash types; a skip list would be
+   the next step if sorted sets grow large. Range commands
+   (ZRANGE and friends) are not implemented yet. */
+typedef struct ZSet {
+    char **members;
+    double *scores;
+    size_t cap;
+    size_t len;
+} ZSet;
+
 typedef struct Entry {
     char *key;
     int type; /* ENTRY_STRING, ENTRY_LIST, ENTRY_SET or ENTRY_HASH */
@@ -42,6 +56,7 @@ typedef struct Entry {
     List *list; /* list values (type == ENTRY_LIST) */
     Set *set; /* set values (type == ENTRY_SET) */
     Hash *hash; /* hash values (type == ENTRY_HASH) */
+    ZSet *zset; /* sorted-set values (type == ENTRY_ZSET) */
     long long expire_at; /* ms since epoch, -1 = no expiry */
     unsigned long long last_access; /* logical clock, for approximate LRU */
     unsigned long long version; /* bumped on every real change to this
@@ -108,7 +123,7 @@ size_t store_keys_matching(Store *s, const char *pattern, char ***keys_out);
 typedef int (*store_foreach_fn)(const Entry *e, void *arg);
 int store_foreach(Store *s, store_foreach_fn fn, void *arg);
 
-/* 0 = no such key, 1 = string, 2 = list, 3 = set, 4 = hash. */
+/* 0 = no such key, 1 = string, 2 = list, 3 = set, 4 = hash, 5 = zset. */
 int store_type(Store *s, const char *key);
 
 /* Push one element. Returns the new length, -1 = key holds a string,
@@ -169,5 +184,19 @@ long long store_hlen(Store *s, const char *key);
    -1 = wrong type, -2 = out of memory. *out is a malloc'd array of
    malloc'd strings; the caller frees both. */
 int store_hgetall(Store *s, const char *key, char ***out, size_t *n_out);
+
+/* Add or update one member's score. Returns 1 when the member is
+   new, 0 when it overwrote an existing member's score, 2 when the
+   member already had exactly that score (no change), -1 = key holds
+   a string, list, set or hash, -2 = out of memory. Creates the
+   sorted set when the key is missing. */
+long long store_zadd(Store *s, const char *key, const char *member,
+                     double score);
+/* Score of a member: 1 = found (*out is the score), 0 = key or member
+   missing, -1 = wrong type. */
+int store_zscore(Store *s, const char *key, const char *member,
+                 double *out);
+/* Number of members: 0 when missing, -1 = wrong type. */
+long long store_zcard(Store *s, const char *key);
 
 #endif

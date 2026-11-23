@@ -102,6 +102,21 @@ static int save_entry(const Entry *e, void *arg) {
                 return 1;
             }
         }
+    } else if (e->type == ENTRY_ZSET) {
+        /* Scores are stored as %.17g strings, which round-trip a
+           double exactly, so the snapshot needs no binary float
+           format and stays portable. */
+        ZSet *z = e->zset;
+        if (w_u32(f, (uint32_t)z->len) < 0) { ctx->err = 1; return 1; }
+        for (size_t i = 0; i < z->len; i++) {
+            char scorebuf[32];
+            snprintf(scorebuf, sizeof(scorebuf), "%.17g", z->scores[i]);
+            if (w_str(f, z->members[i]) < 0 ||
+                w_str(f, scorebuf) < 0) {
+                ctx->err = 1;
+                return 1;
+            }
+        }
     }
     return 0;
 }
@@ -297,7 +312,7 @@ long long rdb_load(Store *s, const char *path) {
         unsigned char type;
         if (r_u8(&r, &type) < 0) goto malformed;
         if (type == RDB_END) break;
-        if (type > ENTRY_HASH) goto malformed;
+        if (type > ENTRY_ZSET) goto malformed;
         int64_t expire_at;
         char *key = NULL;
         if (r_i64(&r, &expire_at) < 0) goto malformed;
@@ -323,7 +338,7 @@ long long rdb_load(Store *s, const char *path) {
                 free(el);
             }
             if (!expired && expire_at != -1) store_expire(s, key, expire_at);
-        } else { /* ENTRY_HASH */
+        } else { /* ENTRY_HASH or ENTRY_ZSET */
             uint32_t n;
             if (r_u32(&r, &n) < 0) { free(key); goto malformed; }
             for (uint32_t i = 0; i < n; i++) {
@@ -334,7 +349,15 @@ long long rdb_load(Store *s, const char *path) {
                     free(key);
                     goto malformed;
                 }
-                if (!expired) store_hset(s, key, field, val);
+                if (!expired) {
+                    if (type == ENTRY_HASH) {
+                        store_hset(s, key, field, val);
+                    } else {
+                        /* The score string is %.17g from the writer,
+                           so it parses back to the exact double. */
+                        store_zadd(s, key, field, strtod(val, NULL));
+                    }
+                }
                 free(field);
                 free(val);
             }

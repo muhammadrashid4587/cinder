@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -38,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.19.0"
+#define CINDER_VERSION "0.21.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -194,6 +195,26 @@ static int parse_ll(const char *s, long long *out) {
     if (errno != 0 || end == s || *end != '\0') return 0;
     *out = v;
     return 1;
+}
+
+/* Strict double parse: the whole string must be one number, and NaN
+   is rejected (Redis refuses NaN scores too). Infinities are
+   accepted, as in Redis ("inf" / "-inf"). */
+static int parse_double(const char *s, double *out) {
+    if (!s || !*s) return 0;
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno != 0 || end == s || *end != '\0' || isnan(v)) return 0;
+    *out = v;
+    return 1;
+}
+
+/* Format a score the way Redis does: %.17g round-trips a double
+   exactly, and prints integral scores without a decimal point
+   ("2", not "2.0"). */
+static void format_score(char *buf, size_t cap, double score) {
+    snprintf(buf, cap, "%.17g", score);
 }
 
 /* ---------- command dispatch ----------
@@ -627,6 +648,70 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(pairs);
         return 0;
     }
+    if (strcasecmp(cmd, "ZADD") == 0) {
+        if (argc < 4 || (argc % 2) != 0)
+            return dbuf_error(reply, "wrong number of arguments for 'zadd' command"), 0;
+        /* Parse every score before applying any pair, so a bad score
+           errors without a partial apply. Only the plain form is
+           supported for now: no NX/XX/GT/LT/CH/INCR options (those
+           are a syntax error, as an unknown option would be). */
+        size_t npairs = (size_t)(argc - 2) / 2;
+        double *scores = malloc(npairs * sizeof(double));
+        if (!scores)
+            return dbuf_error(reply, "out of memory"), 0;
+        for (size_t i = 0; i < npairs; i++) {
+            if (!parse_double(argv[2 + 2 * i], &scores[i])) {
+                free(scores);
+                return dbuf_error(reply, "value is not a valid float"), 0;
+            }
+        }
+        long long added = 0;
+        int changed = 0;
+        for (size_t i = 0; i < npairs; i++) {
+            long long rc = store_zadd(g_store, argv[1], argv[3 + 2 * i],
+                                      scores[i]);
+            if (rc == -1) {
+                free(scores);
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            }
+            if (rc == -2) {
+                free(scores);
+                return dbuf_error(reply, "out of memory"), 0;
+            }
+            if (rc == 1) added++;
+            if (rc != 2) changed = 1;
+        }
+        free(scores);
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_int(reply, added);
+        /* Log only when something actually changed: re-adding a
+           member with its current score is a no-op, like SADD of a
+           member already present. */
+        return changed ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "ZSCORE") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'zscore' command"), 0;
+        int t = store_type(g_store, argv[1]);
+        if (t != 0 && t != 5)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        double score;
+        int rc = store_zscore(g_store, argv[1], argv[2], &score);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == 0) return dbuf_null(reply), 0;
+        char buf[32];
+        format_score(buf, sizeof(buf), score);
+        dbuf_bulk(reply, buf, strlen(buf));
+        return 0;
+    }
+    if (strcasecmp(cmd, "ZCARD") == 0) {
+        if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'zcard' command"), 0;
+        long long n = store_zcard(g_store, argv[1]);
+        if (n == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_int(reply, n);
+        return 0;
+    }
     if (strcasecmp(cmd, "FLUSHALL") == 0) {
         store_flush(g_store);
         dbuf_simple(reply, "OK");
@@ -699,6 +784,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
+            "ZADD", "ZSCORE", "ZCARD",
             "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
             "SYNC", "PSYNC", "REPLICAOF"};
@@ -1406,6 +1492,30 @@ static int sync_emit_entry(const Entry *e, void *arg) {
         }
         emit_resp_cmd(out, av, 2 + (int)(2 * h->len));
         free(av);
+    } else if (e->type == ENTRY_ZSET) {
+        ZSet *z = e->zset;
+        if (z->len == 0) return 0;
+        /* One ZADD carrying every member; scores are %.17g strings,
+           which parse back to the exact same doubles. The array is
+           already sorted by (score, member), but order does not
+           matter for the rebuild — ZADD re-sorts on the replica. */
+        char **av = malloc((2 + 2 * z->len) * sizeof(char *));
+        char (*scores)[32] = malloc(z->len * sizeof(*scores));
+        if (!av || !scores) {
+            free(av);
+            free(scores);
+            return 0;
+        }
+        av[0] = "ZADD";
+        av[1] = (char *)e->key;
+        for (size_t i = 0; i < z->len; i++) {
+            format_score(scores[i], sizeof(scores[i]), z->scores[i]);
+            av[2 + 2 * i] = scores[i];
+            av[3 + 2 * i] = z->members[i];
+        }
+        emit_resp_cmd(out, av, 2 + (int)(2 * z->len));
+        free(av);
+        free(scores);
     }
     if (ttl > 0) {
         snprintf(ttlbuf, sizeof(ttlbuf), "%lld", ttl);
