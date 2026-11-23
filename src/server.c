@@ -38,7 +38,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.16.0"
+#define CINDER_VERSION "0.17.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -604,6 +604,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "KEYS", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
+            "MULTI", "EXEC", "DISCARD",
             "SYNC", "PSYNC", "REPLICAOF"};
         dbuf_array_header(reply, (long long)(sizeof(names) / sizeof(names[0])));
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
@@ -667,6 +668,13 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
 
 /* ---------- clients ---------- */
 
+/* One queued command inside a MULTI/EXEC transaction: a deep copy of
+   the argv the client sent, owned by the queue. */
+typedef struct {
+    char **argv;
+    int argc;
+} QueuedCmd;
+
 typedef struct Client {
     int fd;
     unsigned long long gen; /* generation: distinguishes this client
@@ -677,6 +685,11 @@ typedef struct Client {
     size_t inlen;
     Dbuf out;
     int dead;
+    int in_multi;       /* inside a MULTI/EXEC transaction: commands
+                           queue instead of executing */
+    QueuedCmd *queue;   /* queued commands, in the order received */
+    size_t queue_len;
+    size_t queue_cap;
     unsigned long long deferred_last_target; /* append seq of this
         client's most recent deferred reply (0 = none pending) */
     size_t deferred_count; /* replies of this client still queued */
@@ -732,6 +745,47 @@ static void client_add(int fd) {
     }
 }
 
+/* Drop a client's whole MULTI/EXEC queue, freeing the deep-copied
+   argv strings. A no-op on a client that never queued anything. */
+static void multi_clear(Client *c) {
+    for (size_t i = 0; i < c->queue_len; i++) {
+        for (int j = 0; j < c->queue[i].argc; j++)
+            free(c->queue[i].argv[j]);
+        free(c->queue[i].argv);
+    }
+    free(c->queue);
+    c->queue = NULL;
+    c->queue_len = 0;
+    c->queue_cap = 0;
+}
+
+/* Queue one command for a client inside MULTI: deep-copy argv, so
+   the queue survives the event loop reusing the input buffer.
+   Returns 0 on success, -1 on allocation failure. */
+static int multi_queue(Client *c, char **argv, int argc) {
+    if (c->queue_len == c->queue_cap) {
+        size_t ncap = c->queue_cap ? c->queue_cap * 2 : 8;
+        QueuedCmd *nq = realloc(c->queue, ncap * sizeof(QueuedCmd));
+        if (!nq) return -1;
+        c->queue = nq;
+        c->queue_cap = ncap;
+    }
+    QueuedCmd *q = &c->queue[c->queue_len];
+    q->argv = malloc((argc > 0 ? argc : 1) * sizeof(char *));
+    if (!q->argv) return -1;
+    q->argc = argc;
+    for (int i = 0; i < argc; i++) {
+        q->argv[i] = strdup(argv[i]);
+        if (!q->argv[i]) {
+            for (int j = 0; j < i; j++) free(q->argv[j]);
+            free(q->argv);
+            return -1;
+        }
+    }
+    c->queue_len++;
+    return 0;
+}
+
 /* Recompute a client's epoll interest from its current state and
    update the registration only when it changed. Called once per loop
    iteration for every client, before epoll_wait: the poll() loop this
@@ -759,6 +813,9 @@ static void client_remove(size_t idx) {
         epoll_ctl(g_epollfd, EPOLL_CTL_DEL, g_clients[idx].fd, NULL);
     close(g_clients[idx].fd);
     free(g_clients[idx].out.data);
+    /* A client that disconnects mid-transaction drops its queue with
+       it: nothing queued ever executes. */
+    multi_clear(&g_clients[idx]);
     g_clients[idx] = g_clients[--g_nclients];
 }
 
@@ -1363,6 +1420,53 @@ static void gen_replid(char out[41]) {
     out[40] = '\0';
 }
 
+/* Execute a queued MULTI/EXEC transaction: run every queued command
+   in order through the normal dispatcher, collecting each reply into
+   one array. A mutating command is AOF-logged and forwarded to
+   replicas exactly as if the client had sent it outside a
+   transaction, so the AOF and the replication stream hold the
+   individual commands, never MULTI/EXEC themselves. An error inside
+   the transaction does not abort it: the error reply takes its place
+   in the array and the rest still run, like real Redis. The whole
+   array waits for the sync covering the last append it made, like
+   any mutating reply. A QUIT queued in the transaction closes the
+   client once the array is sent; a queued SHUTDOWN stops the server
+   (via *shutdown_out). WATCH is not implemented: it is an unknown
+   command, so queueing it answers +QUEUED and EXEC reports the
+   error in the array. */
+static void handle_exec(Client *c, int *shutdown_out) {
+    Dbuf reply = {0};
+    dbuf_array_header(&reply, (long long)c->queue_len);
+    unsigned long long last_seq = 0;
+    int quit = 0;
+    for (size_t i = 0; i < c->queue_len; i++) {
+        QueuedCmd *q = &c->queue[i];
+        Dbuf sub = {0};
+        int drc = dispatch(q->argv, q->argc, &sub);
+        if (drc == 1 && !g_replaying) {
+            last_seq = aof_append(q->argv, q->argc);
+            Dbuf raw = {0};
+            emit_resp_cmd(&raw, q->argv, q->argc);
+            forward_to_replicas(raw.data, raw.len);
+            free(raw.data);
+        }
+        dbuf_put(&reply, sub.data, sub.len);
+        free(sub.data);
+        if (drc == 2) quit = 1;
+        if (drc == 3) *shutdown_out = 1;
+    }
+    multi_clear(c);
+    c->in_multi = 0;
+    client_reply(c, &reply, last_seq);
+    free(reply.data);
+    if (quit) {
+        /* QUIT behind parked replies: wait for the syncs and flush
+           the socket, or the client never sees the +OKs. */
+        deferred_flush_client(c);
+        c->dead = 1;
+    }
+}
+
 /* ---------- main ---------- */
 
 static void usage(const char *prog) {
@@ -1743,6 +1847,21 @@ int main(int argc, char **argv) {
                             aof_append(cargv, cargc);
                             forward_to_replicas(raw, rawlen);
                         }
+                    } else if (c->in_multi &&
+                               strcasecmp(cargv[0], "MULTI") != 0 &&
+                               strcasecmp(cargv[0], "EXEC") != 0 &&
+                               strcasecmp(cargv[0], "DISCARD") != 0) {
+                        /* Inside MULTI, every other command queues
+                           instead of executing: the client gets
+                           +QUEUED and the command runs at EXEC, in
+                           order, atomically with the rest. */
+                        Dbuf reply = {0};
+                        if (multi_queue(c, cargv, cargc) < 0)
+                            dbuf_error(&reply, "ERR out of memory");
+                        else
+                            dbuf_simple(&reply, "QUEUED");
+                        client_reply(c, &reply, 0);
+                        free(reply.data);
                     } else if (strcasecmp(cargv[0], "SYNC") == 0 && cargc == 1) {
                         /* A replica asking for a full sync. */
                         c->is_replica = 1;
@@ -1788,27 +1907,73 @@ int main(int argc, char **argv) {
                             free(reply.data);
                         }
                     } else {
-                        Dbuf reply = {0};
-                        int drc = dispatch(cargv, cargc, &reply);
-                        unsigned long long aof_seq = 0;
-                        if (drc == 1 && !g_replaying) {
-                            aof_seq = aof_append(cargv, cargc);
-                            forward_to_replicas(raw, rawlen);
+                        /* MULTI/EXEC/DISCARD are transaction control,
+                           handled here rather than in dispatch: they
+                           are per-client state, not store operations,
+                           and they are never AOF-logged or replicated
+                           — only the commands EXEC runs are. */
+                        if (strcasecmp(cargv[0], "MULTI") == 0) {
+                            Dbuf reply = {0};
+                            if (cargc != 1)
+                                dbuf_error(&reply, "wrong number of arguments for 'multi' command");
+                            else if (c->in_multi)
+                                dbuf_error(&reply, "MULTI calls can not be nested");
+                            else {
+                                c->in_multi = 1;
+                                dbuf_simple(&reply, "OK");
+                            }
+                            client_reply(c, &reply, 0);
+                            free(reply.data);
+                        } else if (strcasecmp(cargv[0], "EXEC") == 0) {
+                            if (cargc != 1) {
+                                Dbuf reply = {0};
+                                dbuf_error(&reply, "wrong number of arguments for 'exec' command");
+                                client_reply(c, &reply, 0);
+                                free(reply.data);
+                            } else if (!c->in_multi) {
+                                Dbuf reply = {0};
+                                dbuf_error(&reply, "EXEC without MULTI");
+                                client_reply(c, &reply, 0);
+                                free(reply.data);
+                            } else {
+                                handle_exec(c, &shutdown);
+                            }
+                        } else if (strcasecmp(cargv[0], "DISCARD") == 0) {
+                            Dbuf reply = {0};
+                            if (cargc != 1)
+                                dbuf_error(&reply, "wrong number of arguments for 'discard' command");
+                            else if (!c->in_multi)
+                                dbuf_error(&reply, "DISCARD without MULTI");
+                            else {
+                                multi_clear(c);
+                                c->in_multi = 0;
+                                dbuf_simple(&reply, "OK");
+                            }
+                            client_reply(c, &reply, 0);
+                            free(reply.data);
+                        } else {
+                            Dbuf reply = {0};
+                            int drc = dispatch(cargv, cargc, &reply);
+                            unsigned long long aof_seq = 0;
+                            if (drc == 1 && !g_replaying) {
+                                aof_seq = aof_append(cargv, cargc);
+                                forward_to_replicas(raw, rawlen);
+                            }
+                            /* Under `always` a mutating reply parks until
+                               the flush thread's sync covers its append;
+                               client_reply also parks later replies behind
+                               it, so per-client order never breaks. */
+                            client_reply(c, &reply, aof_seq);
+                            free(reply.data);
+                            if (drc == 2) {
+                                /* QUIT behind parked replies: wait for the
+                                   syncs and flush the socket, or the
+                                   client never sees the +OKs. */
+                                deferred_flush_client(c);
+                                c->dead = 1;
+                            }
+                            if (drc == 3) shutdown = 1;
                         }
-                        /* Under `always` a mutating reply parks until
-                           the flush thread's sync covers its append;
-                           client_reply also parks later replies behind
-                           it, so per-client order never breaks. */
-                        client_reply(c, &reply, aof_seq);
-                        free(reply.data);
-                        if (drc == 2) {
-                            /* QUIT behind parked replies: wait for the
-                               syncs and flush the socket, or the
-                               client never sees the +OKs. */
-                            deferred_flush_client(c);
-                            c->dead = 1;
-                        }
-                        if (drc == 3) shutdown = 1;
                     }
                     for (int k = 0; k < cargc; k++) free(cargv[k]);
                     free(cargv);

@@ -273,6 +273,50 @@ def main():
         check("HDEL empties hash", c.cmd("HDEL", "myhash", "f1"), 1)
         check("EXISTS after hash emptied", c.cmd("EXISTS", "myhash"), 0)
         check("HSET persist hash", c.cmd("HSET", "phash", "a", "1", "b", "2"), 2)
+        # Transactions: MULTI queues, EXEC runs the queue in order and
+        # returns one reply per command, DISCARD drops the queue, and
+        # the error cases. A second client proves the queued writes
+        # are invisible until EXEC runs.
+        c2 = Client(PORT)
+        check("EXEC without MULTI", c.cmd("EXEC"), ("error", "ERR EXEC without MULTI"))
+        check("DISCARD without MULTI", c.cmd("DISCARD"), ("error", "ERR DISCARD without MULTI"))
+        check("MULTI", c.cmd("MULTI"), "OK")
+        check("MULTI nested", c.cmd("MULTI"), ("error", "ERR MULTI calls can not be nested"))
+        check("MULTI SET queued", c.cmd("SET", "txkey", "txval"), "QUEUED")
+        check("MULTI INCR queued", c.cmd("INCR", "txctr"), "QUEUED")
+        check("MULTI GET queued", c.cmd("GET", "txkey"), "QUEUED")
+        check("txkey invisible before EXEC", c2.cmd("GET", "txkey"), None)
+        check("EXEC", c.cmd("EXEC"), ["OK", 1, "txval"])
+        check("txkey visible after EXEC", c2.cmd("GET", "txkey"), "txval")
+        check("txctr after EXEC", c2.cmd("GET", "txctr"), "1")
+        # An error inside a transaction does not abort it: the error
+        # reply takes its place in the array and the rest still run.
+        check("MULTI 2", c.cmd("MULTI"), "OK")
+        check("MULTI bad INCR queued", c.cmd("INCR", "txkey"), "QUEUED")
+        check("MULTI good SET queued", c.cmd("SET", "txkey2", "v2"), "QUEUED")
+        check("EXEC with error", c.cmd("EXEC"),
+              [("error", "ERR value is not an integer or out of range"), "OK"])
+        check("txkey2 set despite error", c2.cmd("GET", "txkey2"), "v2")
+        # DISCARD drops the queue: nothing queued ever executes.
+        check("MULTI 3", c.cmd("MULTI"), "OK")
+        check("MULTI discard SET queued", c.cmd("SET", "txgone", "x"), "QUEUED")
+        check("DISCARD", c.cmd("DISCARD"), "OK")
+        check("discarded key absent", c2.cmd("GET", "txgone"), None)
+        # An empty transaction EXECs to an empty array, and a nested
+        # array reply (LRANGE) comes back nested inside the EXEC array.
+        check("MULTI empty", c.cmd("MULTI"), "OK")
+        check("EXEC empty queue", c.cmd("EXEC"), [])
+        check("MULTI 4", c.cmd("MULTI"), "OK")
+        check("MULTI RPUSH queued", c.cmd("RPUSH", "txlist", "a", "b"), "QUEUED")
+        check("MULTI LRANGE queued", c.cmd("LRANGE", "txlist", "0", "-1"), "QUEUED")
+        check("EXEC nested array", c.cmd("EXEC"), [2, ["a", "b"]])
+        check("COMMAND lists MULTI", "MULTI" in c.cmd("COMMAND"), True)
+        check("COMMAND lists EXEC", "EXEC" in c.cmd("COMMAND"), True)
+        check("COMMAND lists DISCARD", "DISCARD" in c.cmd("COMMAND"), True)
+        # Clean up the transaction keys: the AOF restart below counts
+        # exact keys (4: after, plist, pset, phash).
+        check("tx cleanup", c.cmd("DEL", "txkey", "txctr", "txkey2", "txlist"), 4)
+        c2.close()
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -597,7 +641,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.16.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.17.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

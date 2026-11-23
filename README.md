@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.16.0.
+Version 0.17.0.
 
 ## Why
 
@@ -67,6 +67,7 @@ OK
 | `SISMEMBER key member` | `1` if member, `0` if not |
 | `SCARD key` | Set size (`0` when missing) |
 | `HSET key field value [field value ...]` | Set fields; returns number of new fields (updates return `0` for that field) |
+| `MULTI`, `EXEC`, `DISCARD` | Transactions: `MULTI` queues commands (`+QUEUED` per command, nested `MULTI` is an error), `EXEC` runs the queue in order and returns one reply per command (an error inside the transaction takes its place in the array and the rest still run), `DISCARD` drops the queue; `EXEC`/`DISCARD` without `MULTI` are errors. Queued writes are invisible to other clients until `EXEC` runs, and the commands `EXEC` runs are AOF-logged and replicated individually, never `MULTI`/`EXEC` themselves. `WATCH` is not supported yet (future work) |
 | `HGET key field` | Field value (`nil` when missing) |
 | `HDEL key field [field ...]` | Delete fields; returns number removed; emptying the hash deletes the key |
 | `HEXISTS key field` | `1` if the field exists, `0` if not |
@@ -318,14 +319,22 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # is a startup error), and a benchmark-tool check
             # (`tools/bench.py` runs against a live server, exits 0, and
             # prints one table row per operation, and `INFO` reports
-            # version 0.16.0), and `always`-policy checks (a pipeline
+            # version 0.17.0), and `always`-policy checks (a pipeline
             # mixing writes and reads returns its replies in command
             # order, two clients writing at once each get their own
             # +OK, a QUIT sent in the same packet as a SET still
             # returns both +OKs, `INFO` reports
             # `aof_deferred_replies` and `aof_pending_appends`, and a
             # write acknowledged before a SIGKILL is on disk after the
-            # restart)
+            # restart), and transaction checks (`EXEC`/`DISCARD`
+            # without `MULTI` are errors, nested `MULTI` is an error,
+            # queued writes are invisible to a second client until
+            # `EXEC` runs, `EXEC` returns one reply per command with
+            # an error taking its place in the array and the rest
+            # still running, `DISCARD` drops the queue, an empty
+            # `EXEC` returns an empty array, a nested array reply
+            # comes back nested inside the `EXEC` array, and `COMMAND`
+            # lists `MULTI`, `EXEC` and `DISCARD`)
 ```
 
 ## Roadmap
@@ -380,3 +389,14 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       `aof_pending_appends`. Sequential writes under `always` now cost
       a thread round trip (~12–16k ops/sec on this VM, down from
       ~33–36k with the inline sync); pipelined writes hold at ~131k
+- [x] `MULTI`/`EXEC` transactions (0.17.0): `MULTI` queues commands
+      (`+QUEUED` each), `EXEC` runs the queue in order and returns
+      one reply per command, `DISCARD` drops the queue; nested
+      `MULTI` and `EXEC`/`DISCARD` without `MULTI` are errors, an
+      error inside a transaction takes its place in the array and the
+      rest still run, queued writes are invisible to other clients
+      until `EXEC`, and the commands `EXEC` runs are AOF-logged and
+      replicated individually. `WATCH` is not supported yet — it is
+      an unknown command, so queueing it answers `+QUEUED` and
+      `EXEC` reports the error in the array; optimistic locking
+      (`WATCH`/`UNWATCH`) is the follow-up slice
