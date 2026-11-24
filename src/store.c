@@ -2229,6 +2229,46 @@ int store_hgetall(Store *s, const char *key, char ***out, size_t *n_out) {
     return 0;
 }
 
+int store_hincrby(Store *s, const char *key, const char *field,
+                  long long delta, long long *out) {
+    Entry *e = store_find(s, key, NULL);
+    if (e && e->type != ENTRY_HASH) return -1;
+    long long v = 0;
+    int have_field = 0;
+    if (e) {
+        long long idx = hash_find(e->hash, field);
+        if (idx >= 0) {
+            have_field = 1;
+            if (!parse_ll(e->hash->values[idx], &v)) return -2;
+            if (delta == 0) {
+                /* A zero increment on an existing field changes
+                   nothing, so it does not touch the version. */
+                *out = v;
+                return 2;
+            }
+            long long nv;
+            if (__builtin_add_overflow(v, delta, &nv)) return -3;
+            v = nv;
+        } else {
+            v = delta;
+        }
+    } else {
+        v = delta;
+    }
+    char vbuf[32];
+    snprintf(vbuf, sizeof(vbuf), "%lld", v);
+    if (!e) {
+        if (store_hset(s, key, field, vbuf) < 0) return -4;
+        *out = v;
+        return 1;
+    }
+    if (hash_put(e->hash, field, vbuf) < 0) return -4;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    *out = v;
+    return have_field ? 0 : 1;
+}
+
 /* ---------- sorted sets ---------- */
 
 long long store_zadd(Store *s, const char *key, const char *member,

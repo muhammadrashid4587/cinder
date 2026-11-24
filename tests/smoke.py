@@ -815,6 +815,45 @@ def main():
         check("HDEL empties hash", c.cmd("HDEL", "myhash", "f1"), 1)
         check("EXISTS after hash emptied", c.cmd("EXISTS", "myhash"), 0)
         check("HSET persist hash", c.cmd("HSET", "phash", "a", "1", "b", "2"), 2)
+        # HMGET / HSETNX / HINCRBY: multi-field read, conditional set,
+        # integer fields, wrong type, TTL, and WATCH behaviour (the
+        # WATCH checks live in the transaction section below).
+        check("HSET hmhash", c.cmd("HSET", "hmhash", "a", "1", "b", "2", "s", "txt"), 3)
+        check("HMGET", c.cmd("HMGET", "hmhash", "a", "b", "ghost"), ["1", "2", None])
+        check("HMGET missing key", c.cmd("HMGET", "ghosthash", "a"), [None])
+        check("HMGET wrongtype", c.cmd("HMGET", "after", "a"), wrongtype)
+        check("HMGET wrong args", c.cmd("HMGET", "hmhash"),
+              ("error", "ERR wrong number of arguments for 'hmget' command"))
+        check("HSETNX new", c.cmd("HSETNX", "hmhash", "c", "3"), 1)
+        check("HSETNX existing", c.cmd("HSETNX", "hmhash", "a", "9"), 0)
+        check("HGET after HSETNX noop", c.cmd("HGET", "hmhash", "a"), "1")
+        check("HSETNX missing key", c.cmd("HSETNX", "nxhash", "f", "v"), 1)
+        check("HSETNX wrongtype", c.cmd("HSETNX", "after", "f", "v"), wrongtype)
+        check("HSETNX wrong args", c.cmd("HSETNX", "hmhash", "a"),
+              ("error", "ERR wrong number of arguments for 'hsetnx' command"))
+        check("HINCRBY", c.cmd("HINCRBY", "hmhash", "a", "4"), 5)
+        check("HINCRBY new field", c.cmd("HINCRBY", "hmhash", "ctr", "10"), 10)
+        check("HINCRBY negative", c.cmd("HINCRBY", "hmhash", "ctr", "-3"), 7)
+        check("HINCRBY zero noop", c.cmd("HINCRBY", "hmhash", "a", "0"), 5)
+        check("HINCRBY missing key", c.cmd("HINCRBY", "incrhash", "n", "2"), 2)
+        check("HINCRBY non-integer field", c.cmd("HINCRBY", "hmhash", "s", "1"),
+              ("error", "ERR hash value is not an integer"))
+        check("HINCRBY bad increment", c.cmd("HINCRBY", "hmhash", "a", "xx"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("HINCRBY wrongtype", c.cmd("HINCRBY", "after", "f", "1"), wrongtype)
+        check("HINCRBY wrong args", c.cmd("HINCRBY", "hmhash", "a"),
+              ("error", "ERR wrong number of arguments for 'hincrby' command"))
+        check("HSET hmhash big", c.cmd("HSET", "hmhash", "big", "9223372036854775807"), 1)
+        check("HINCRBY overflow", c.cmd("HINCRBY", "hmhash", "big", "1"),
+              ("error", "ERR increment or decrement would overflow"))
+        check("HGET big unchanged after overflow", c.cmd("HGET", "hmhash", "big"), "9223372036854775807")
+        check("HSET ttl hincrby", c.cmd("HSET", "blinkhincr", "n", "1"), 1)
+        check("PEXPIRE hincrby", c.cmd("PEXPIRE", "blinkhincr", "100000"), 1)
+        check("HINCRBY preserves TTL", c.cmd("HINCRBY", "blinkhincr", "n", "1"), 2)
+        check("TTL after HINCRBY ~", 99 <= c.cmd("TTL", "blinkhincr") <= 100, True)
+        check("COMMAND lists HMGET", "HMGET" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HSETNX", "HSETNX" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HINCRBY", "HINCRBY" in c.cmd("COMMAND"), True)
         # Sorted sets: add/update, scores, wrong type, TTL, AOF
         # persistence. Members are ordered by (score, member); range
         # commands are not implemented yet.
@@ -1276,7 +1315,22 @@ def main():
         check("MULTI noop watch", c.cmd("MULTI"), "OK")
         check("MULTI noop SET queued", c.cmd("SET", "wkey", "v15"), "QUEUED")
         check("EXEC noop watch runs", c.cmd("EXEC"), ["OK"])
-        check("watch keys cleanup", c.cmd("DEL", "wkey", "wmissing", "wset"), 3)
+        # A real HINCRBY invalidates a watch; a no-op one (delta 0 on
+        # an existing field) does not.
+        check("HSET whash", c.cmd("HSET", "whash", "n", "1"), 1)
+        check("WATCH whash", c.cmd("WATCH", "whash"), "OK")
+        check("other client HINCRBY whash", c2.cmd("HINCRBY", "whash", "n", "1"), 2)
+        check("MULTI hincrby watch", c.cmd("MULTI"), "OK")
+        check("MULTI hincrby SET queued", c.cmd("SET", "wkey", "v16"), "QUEUED")
+        check("EXEC hincrby watch aborts", c.cmd("EXEC"), None)
+        check("wkey unchanged after hincrby abort", c.cmd("GET", "wkey"), "v15")
+        check("WATCH whash 2", c.cmd("WATCH", "whash"), "OK")
+        check("other client HINCRBY noop", c2.cmd("HINCRBY", "whash", "n", "0"), 2)
+        check("MULTI hincrby noop watch", c.cmd("MULTI"), "OK")
+        check("MULTI hincrby noop SET queued", c.cmd("SET", "wkey", "v17"), "QUEUED")
+        check("EXEC hincrby noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("wkey after hincrby noop EXEC", c.cmd("GET", "wkey"), "v17")
+        check("watch keys cleanup", c.cmd("DEL", "wkey", "wmissing", "wset", "whash"), 4)
         # FLUSHALL invalidates even a watch on a key that never
         # existed; it wipes the dataset, so rebuild the four keys the
         # AOF restart section below expects (after, plist, pset, phash).
@@ -1311,6 +1365,7 @@ def main():
         # replay section below can prove they were logged.
         check("AOF pre-restart ZINCRBY", c.cmd("ZINCRBY", "pzset", "1", "x"), "2.5")
         check("AOF pre-restart ZREM", c.cmd("ZREM", "pzset", "z"), 1)
+        check("AOF pre-restart HINCRBY", c.cmd("HINCRBY", "phash", "a", "5"), 6)
         check("AOF pre-restart BITFIELD", c.cmd("BITFIELD", "pfield", "SET", "u8", "0", "65", "SET", "u8", "8", "66"), [0, 0])
         check("tx cleanup", c.cmd("DEL", "txkey", "txctr", "txkey2", "txlist"), 4)
         c2.close()
@@ -1336,7 +1391,7 @@ def main():
         check("AOF replay list len", c.cmd("LLEN", "plist"), 3)
         check("AOF replay set", sorted(c.cmd("SMEMBERS", "pset")), ["x", "y", "z"])
         check("AOF replay set card", c.cmd("SCARD", "pset"), 3)
-        check("AOF replay hash", c.cmd("HGETALL", "phash"), ["a", "1", "b", "2"])
+        check("AOF replay hash", c.cmd("HGETALL", "phash"), ["a", "6", "b", "2"])
         check("AOF replay hash len", c.cmd("HLEN", "phash"), 2)
         check("AOF replay zset card", c.cmd("ZCARD", "pzset"), 2)
         check("AOF replay zset score", c.cmd("ZSCORE", "pzset", "y"), "2.25")
@@ -1655,7 +1710,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.35.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.36.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

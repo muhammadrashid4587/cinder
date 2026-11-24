@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.35.0.
+Version 0.36.0.
 
 ## Why
 
@@ -96,6 +96,9 @@ OK
 | `HEXISTS key field` | `1` if the field exists, `0` if not |
 | `HLEN key` | Number of fields (`0` when missing) |
 | `HGETALL key` | Flat `[field, value, ...]` array in insertion order |
+| `HMGET key field [field ...]` | Field values in order (`nil` for a missing field or key) |
+| `HSETNX key field value` | Set only when the field does not exist; returns `1` when set, `0` when the field already exists |
+| `HINCRBY key field increment` | Add to a field's integer value, creating the field and the key when missing; returns the new value; preserves the TTL; a zero increment on an existing field changes nothing and is not logged |
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZCARD key` | Number of members (`0` when missing) |
@@ -313,7 +316,16 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # TTL expiry, emptying a set deletes the key), hash checks
             # (multi-field set, update, get, delete, exists, length,
             # getall in insertion order, wrong-type errors, hash TTL
-            # expiry, emptying a hash deletes the key), sorted-set
+            # expiry, emptying a hash deletes the key), hash-misc
+            # checks (`HMGET` in order with `nil` for missing fields,
+            # `HSETNX` setting only a new field, `HINCRBY` on an
+            # existing, a new, and a missing key's field, negative
+            # and zero increments, a non-integer field and a bad
+            # increment, overflow, wrong-type and wrong-argument
+            # errors, the TTL surviving an `HINCRBY`, `COMMAND`
+            # listing all three, a real `HINCRBY` invalidating a
+            # `WATCH` while a zero increment does not, and an
+            # `HINCRBY` surviving an AOF restart), sorted-set
             # checks (multi-member add, score update, re-add with the
             # same score is a no-op, duplicate member in one call
             # takes the last score, bad-score error applies nothing,
@@ -782,3 +794,21 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       `store_zadd`. This retires the "slower than a skip list"
       limitation on every sorted-set entry above. Limitation:
       sets and hashes still use linear scans
+
+- [x] Hash misc commands: `HMGET` / `HSETNX` / `HINCRBY`
+      (0.36.0): the remaining core hash family. `HMGET` returns
+      the field values in order, `nil` for a missing field or
+      key; `HSETNX` sets only when the field does not exist and
+      returns `1` when it sets, `0` when the field was already
+      there (a no-op set logs nothing and does not invalidate a
+      `WATCH`); `HINCRBY` adds to a field's integer value,
+      creating the field and the key when missing, and returns
+      the new value — a non-integer field is an error, an
+      increment that would overflow is an error and changes
+      nothing, a zero increment on an existing field is a no-op
+      (no log, no `WATCH` invalidation), and the TTL survives,
+      as in Redis. The mutating two are AOF-logged and
+      replicated as raw commands when they change state, so the
+      snapshot and full sync needed no change. Limitation:
+      hashes still use a linear scan, and `HKEYS` / `HVALS` /
+      `HINCRBYFLOAT` / `HSCAN` are not implemented yet

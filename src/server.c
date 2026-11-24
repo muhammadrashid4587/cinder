@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.35.0"
+#define CINDER_VERSION "0.36.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1181,6 +1181,61 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(pairs);
         return 0;
     }
+    if (strcasecmp(cmd, "HMGET") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'hmget' command"), 0;
+        int t = store_type(g_store, argv[1]);
+        if (t != 0 && t != 4)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_array_header(reply, (long long)(argc - 2));
+        for (int i = 2; i < argc; i++) {
+            char *v = store_hget(g_store, argv[1], argv[i]);
+            if (!v) dbuf_null(reply);
+            else {
+                dbuf_bulk(reply, v, strlen(v));
+                free(v);
+            }
+        }
+        return 0;
+    }
+    if (strcasecmp(cmd, "HSETNX") == 0) {
+        if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'hsetnx' command"), 0;
+        int ex = store_hexists(g_store, argv[1], argv[2]);
+        if (ex == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (ex == 1) {
+            /* The field is already there: nothing changes, so the
+               command is not logged and does not invalidate a WATCH. */
+            dbuf_int(reply, 0);
+            return 0;
+        }
+        long long rc = store_hset(g_store, argv[1], argv[2], argv[3]);
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_int(reply, 1);
+        return 1;
+    }
+    if (strcasecmp(cmd, "HINCRBY") == 0) {
+        if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'hincrby' command"), 0;
+        long long delta;
+        if (!parse_ll(argv[3], &delta))
+            return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        long long v;
+        int rc = store_hincrby(g_store, argv[1], argv[2], delta, &v);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "hash value is not an integer"), 0;
+        if (rc == -3)
+            return dbuf_error(reply, "increment or decrement would overflow"), 0;
+        if (rc == -4)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == 1 && g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_int(reply, v);
+        /* A zero increment on an existing field changed nothing, so
+           there is nothing to log or replicate. */
+        return rc == 2 ? 0 : 1;
+    }
     if (strcasecmp(cmd, "ZADD") == 0) {
         if (argc < 4)
             return dbuf_error(reply, "wrong number of arguments for 'zadd' command"), 0;
@@ -1625,6 +1680,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "LMOVE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
+            "HMGET", "HSETNX", "HINCRBY",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZREM",
             "ZRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER",

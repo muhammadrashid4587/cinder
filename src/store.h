@@ -365,6 +365,15 @@ long long store_hlen(Store *s, const char *key);
    -1 = wrong type, -2 = out of memory. *out is a malloc'd array of
    malloc'd strings; the caller frees both. */
 int store_hgetall(Store *s, const char *key, char ***out, size_t *n_out);
+/* Add delta to a hash field's integer value, creating the field (with
+   value delta) and the hash when missing. Returns 1 when the field
+   is new, 0 when an existing field changed, 2 when nothing changed
+   (increment 0 on a field already there), -1 = wrong type,
+   -2 = field value is not an integer, -3 = increment would overflow,
+   -4 = out of memory. Preserves the key's TTL, as in Redis.
+   *out is the field's new value. */
+int store_hincrby(Store *s, const char *key, const char *field,
+                  long long delta, long long *out);
 
 /* Add or update one member's score. Returns 1 when the member is
    new, 0 when it overwrote an existing member's score, 2 when the
