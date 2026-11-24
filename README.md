@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.43.0.
+Version 0.44.0.
 
 ## Why
 
@@ -112,6 +112,7 @@ OK
 | `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]` | Members whose scores fall in `[min, max]`; bounds may be `-inf`/`+inf` or exclusive with a leading `(` (e.g. `(5`); `LIMIT` skips `offset` matches and returns at most `count` (negative `count` means all); `WITHSCORES` interleaves each score after its member |
 | `ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]` | Same range, highest score first; bounds are `max` first, as in Redis, with the same exclusive/inf/`WITHSCORES`/`LIMIT` handling |
 | `ZRANGEBYLEX key min max [LIMIT offset count] [REV]` | Members whose names fall in `[min, max]` lexicographically, regardless of score; bounds are `-` (-inf) / `+` (+inf) or inclusive `[x` / exclusive `(x`; `REV` returns them in reverse member order with the bounds given max-first, as in Redis; `LIMIT` skips `offset` matches and returns at most `count` (negative `count` means all) |
+| `ZLEXCOUNT key min max` | Number of members whose names fall in `[min, max]` lexicographically, with the same bounds as `ZRANGEBYLEX` but no `REV` — the count does not depend on order; `0` when missing or the range is empty, including a finite min above the max |
 | `ZREM key member [member ...]` | Remove members; returns number removed (the key is deleted when the last member is removed) |
 | `ZRANK key member` | 0-based rank of a member, lowest score first (`nil` when missing) |
 | `ZREVRANK key member` | 0-based rank of a member, highest score first (`nil` when missing) |
@@ -931,5 +932,17 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       min above the max answers an empty array, like
       `ZRANGEBYSCORE`'s reversed bounds. A missing key answers
       `[]`, a non-sorted-set key is a `WRONGTYPE` error, listed by
+      `COMMAND`. Read-only, so AOF logging, `WATCH` invalidation
+      and replication needed no change.
+
+- [x] `ZLEXCOUNT` (0.44.0): count of the members in a lexicographic
+      range, `ZLEXCOUNT key min max`, with the same bounds as
+      `ZRANGEBYLEX` (`-` / `+` or `[x` / `(x`) but no `REV` — the
+      count does not depend on order. The store gains
+      `store_zlexcount`, which counts with a level-0 scan and never
+      allocates, so it is O(n) time and O(1) memory where
+      `ZRANGEBYLEX` collects and sorts. A missing key answers `0`,
+      as does an empty range including a finite min above the max,
+      and a non-sorted-set key is a `WRONGTYPE` error, listed by
       `COMMAND`. Read-only, so AOF logging, `WATCH` invalidation
       and replication needed no change.

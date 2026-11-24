@@ -1715,6 +1715,29 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(members);
         return 0;
     }
+    if (strcasecmp(cmd, "ZLEXCOUNT") == 0) {
+        if (argc != 4)
+            return dbuf_error(reply, "wrong number of arguments for 'zlexcount' command"), 0;
+        /* Same bounds as ZRANGEBYLEX, but no REV: the count does
+           not depend on order, so the bounds are always min first.
+           "-" is -inf (min only), "+" is +inf (max only), "[x" is
+           inclusive and "(x" exclusive; a bare member or the wrong
+           infinity is a syntax error. */
+        const char *lo_bound = NULL, *hi_bound = NULL;
+        int min_excl = 0, max_excl = 0;
+        int lo_kind = parse_lex_bound(argv[2], &lo_bound, &min_excl);
+        int hi_kind = parse_lex_bound(argv[3], &hi_bound, &max_excl);
+        if (lo_kind == 0 || hi_kind == 0 || lo_kind == 2 || hi_kind == 1)
+            return dbuf_error(reply, "syntax error"), 0;
+        const char *min = lo_kind == 3 ? lo_bound : NULL;
+        const char *max = hi_kind == 3 ? hi_bound : NULL;
+        long long n = store_zlexcount(g_store, argv[1], min, min_excl,
+                                      max, max_excl);
+        if (n == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_int(reply, n);
+        return 0;
+    }
     if (strcasecmp(cmd, "ZREM") == 0) {
         if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'zrem' command"), 0;
         long long removed = 0;
@@ -2005,7 +2028,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
-            "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZREM",
+            "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZRANK", "ZREVRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",
             "KEYS", "SCAN", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",

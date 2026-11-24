@@ -1282,6 +1282,34 @@ def main():
               ("error", "ERR syntax error"))
         check("ZRANGEBYLEX wrongtype", c.cmd("ZRANGEBYLEX", "after", "-", "+"),
               wrongtype)
+        # Lexicographic counts. Same myzset (a, b, c, d), same
+        # bounds as ZRANGEBYLEX, but a count instead of the members.
+        check("ZLEXCOUNT all", c.cmd("ZLEXCOUNT", "myzset", "-", "+"), 4)
+        check("ZLEXCOUNT slice", c.cmd("ZLEXCOUNT", "myzset", "[a", "[c"), 3)
+        check("ZLEXCOUNT excl min", c.cmd("ZLEXCOUNT", "myzset", "(a", "[c"), 2)
+        check("ZLEXCOUNT excl max", c.cmd("ZLEXCOUNT", "myzset", "[a", "(c"), 2)
+        check("ZLEXCOUNT excl both", c.cmd("ZLEXCOUNT", "myzset", "(a", "(d"), 2)
+        check("ZLEXCOUNT from start", c.cmd("ZLEXCOUNT", "myzset", "-", "[b"), 2)
+        check("ZLEXCOUNT to end", c.cmd("ZLEXCOUNT", "myzset", "[c", "+"), 2)
+        check("ZLEXCOUNT min above max",
+              c.cmd("ZLEXCOUNT", "myzset", "[d", "[a"), 0)
+        check("ZLEXCOUNT empty slice",
+              c.cmd("ZLEXCOUNT", "myzset", "[x", "[z"), 0)
+        check("ZLEXCOUNT missing",
+              c.cmd("ZLEXCOUNT", "ghostzset", "-", "+"), 0)
+        check("ZLEXCOUNT wrong args", c.cmd("ZLEXCOUNT", "myzset", "[a"),
+              ("error", "ERR wrong number of arguments for 'zlexcount' command"))
+        check("ZLEXCOUNT bare bound", c.cmd("ZLEXCOUNT", "myzset", "a", "[z"),
+              ("error", "ERR syntax error"))
+        check("ZLEXCOUNT plus as min", c.cmd("ZLEXCOUNT", "myzset", "+", "[z"),
+              ("error", "ERR syntax error"))
+        check("ZLEXCOUNT minus as max", c.cmd("ZLEXCOUNT", "myzset", "[a", "-"),
+              ("error", "ERR syntax error"))
+        check("ZLEXCOUNT empty bracket", c.cmd("ZLEXCOUNT", "myzset", "[", "+"),
+              ("error", "ERR syntax error"))
+        check("ZLEXCOUNT wrongtype", c.cmd("ZLEXCOUNT", "after", "-", "+"),
+              wrongtype)
+        check("COMMAND lists ZLEXCOUNT", "ZLEXCOUNT" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZRANGEBYLEX", "ZRANGEBYLEX" in c.cmd("COMMAND"), True)
         check("ZREM one", c.cmd("ZREM", "myzset", "b"), 1)
         check("ZCARD after ZREM", c.cmd("ZCARD", "myzset"), 3)

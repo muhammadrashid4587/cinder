@@ -3113,6 +3113,37 @@ int store_zrangebylex(Store *s, const char *key, const char *min, int min_excl,
     return 0;
 }
 
+/* Count the members whose names fall in [min, max]
+   lexicographically, with the same bound conventions as
+   store_zrangebylex. Like that function, the skip list is ordered
+   by (score, member), so the count is a level-0 scan; unlike it,
+   no members are collected or sorted, so the work is O(n) time
+   and O(1) memory. */
+long long store_zlexcount(Store *s, const char *key, const char *min,
+                          int min_excl, const char *max, int max_excl) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    e->last_access = ++s->clock;
+    ZSet *z = e->zset;
+    if (min && max && strcmp(min, max) > 0) return 0;
+    long long n = 0;
+    for (zslNode *node = z->sl->header->level[0].forward; node;
+         node = node->level[0].forward) {
+        const char *m = node->member;
+        if (min) {
+            int c = strcmp(m, min);
+            if (c < 0 || (c == 0 && min_excl)) continue;
+        }
+        if (max) {
+            int c = strcmp(m, max);
+            if (c > 0 || (c == 0 && max_excl)) continue;
+        }
+        n++;
+    }
+    return n;
+}
+
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing

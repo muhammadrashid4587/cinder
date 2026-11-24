@@ -488,6 +488,15 @@ int store_zrangebylex(Store *s, const char *key, const char *min, int min_excl,
                       const char *max, int max_excl, long long offset,
                       long long count, int reverse,
                       char ***members_out, size_t *n_out);
+/* Count the members whose names fall in [min, max]
+   lexicographically, with the same bound conventions as
+   store_zrangebylex (NULL min = -inf, NULL max = +inf, an endpoint
+   excluded when its flag is set). Returns the count (0 for a missing
+   key or an empty range, including min > max), -1 = wrong type.
+   Counts with a level-0 scan and never allocates, so it cannot run
+   out of memory. */
+long long store_zlexcount(Store *s, const char *key, const char *min,
+                          int min_excl, const char *max, int max_excl);
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing
