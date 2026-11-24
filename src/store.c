@@ -2,6 +2,7 @@
 #include "store.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -825,6 +826,20 @@ static int parse_ll(const char *s, long long *out) {
     errno = 0;
     long long v = strtoll(s, &end, 10);
     if (errno != 0 || end == s || *end != '\0') return 0;
+    *out = v;
+    return 1;
+}
+
+/* Strict double parse: the whole string must be one number, and NaN
+   is rejected (Redis refuses NaN field values too). Infinities are
+   accepted here; the caller decides whether an infinite result is
+   an overflow. */
+static int parse_double(const char *s, double *out) {
+    if (!s || !*s) return 0;
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno != 0 || end == s || *end != '\0' || isnan(v)) return 0;
     *out = v;
     return 1;
 }
@@ -2267,6 +2282,102 @@ int store_hincrby(Store *s, const char *key, const char *field,
     entry_touch(s, e);
     *out = v;
     return have_field ? 0 : 1;
+}
+
+int store_hincrbyfloat(Store *s, const char *key, const char *field,
+                       double delta, double *out) {
+    Entry *e = store_find(s, key, NULL);
+    if (e && e->type != ENTRY_HASH) return -1;
+    double v = 0;
+    int have_field = 0;
+    if (e) {
+        long long idx = hash_find(e->hash, field);
+        if (idx >= 0) {
+            have_field = 1;
+            if (!parse_double(e->hash->values[idx], &v)) return -2;
+            if (delta == 0) {
+                /* A zero increment on an existing field changes
+                   nothing, so it does not touch the version. */
+                *out = v;
+                return 2;
+            }
+            v += delta;
+            if (isnan(v) || isinf(v)) return -3;
+            /* -0.0 prints as "-0" with %.17g; Redis answers "0". */
+            if (v == 0) v = 0;
+        } else {
+            v = delta;
+            if (isnan(v) || isinf(v)) return -3;
+            if (v == 0) v = 0;
+        }
+    } else {
+        v = delta;
+        if (isnan(v) || isinf(v)) return -3;
+        if (v == 0) v = 0;
+    }
+    char vbuf[32];
+    snprintf(vbuf, sizeof(vbuf), "%.17g", v);
+    if (!e) {
+        if (store_hset(s, key, field, vbuf) < 0) return -4;
+        *out = v;
+        return 1;
+    }
+    if (hash_put(e->hash, field, vbuf) < 0) return -4;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    *out = v;
+    return have_field ? 0 : 1;
+}
+
+int store_hscan(Store *s, const char *key, unsigned long long cursor,
+                const char *pattern, size_t count, char ***out,
+                size_t *n_out, unsigned long long *next_out) {
+    *out = NULL;
+    *n_out = 0;
+    *next_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_HASH) return -1;
+    e->last_access = ++s->clock;
+    Hash *h = e->hash;
+    if (count == 0 || cursor >= h->len) return 0;
+    char **res = NULL;
+    size_t n = 0, cap = 0;
+    size_t i = (size_t)cursor;
+    while (i < h->len) {
+        if (glob_match(pattern, h->fields[i])) {
+            if (n + 2 > cap) {
+                size_t ncap = cap ? cap * 2 : 16;
+                char **nres = realloc(res, ncap * sizeof(char *));
+                if (!nres) {
+                    for (size_t j = 0; j < n; j++) free(res[j]);
+                    free(res);
+                    return -2;
+                }
+                res = nres;
+                cap = ncap;
+            }
+            res[n] = strdup(h->fields[i]);
+            res[n + 1] = strdup(h->values[i]);
+            if (!res[n] || !res[n + 1]) {
+                free(res[n]);
+                free(res[n + 1]);
+                for (size_t j = 0; j < n; j++) free(res[j]);
+                free(res);
+                return -2;
+            }
+            n += 2;
+            if (n / 2 >= count) {
+                i++;
+                break;
+            }
+        }
+        i++;
+    }
+    *out = res;
+    *n_out = n;
+    *next_out = (i >= h->len) ? 0 : (unsigned long long)i;
+    return 0;
 }
 
 /* ---------- sorted sets ---------- */

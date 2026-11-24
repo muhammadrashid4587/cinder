@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.36.0.
+Version 0.37.0.
 
 ## Why
 
@@ -99,6 +99,10 @@ OK
 | `HMGET key field [field ...]` | Field values in order (`nil` for a missing field or key) |
 | `HSETNX key field value` | Set only when the field does not exist; returns `1` when set, `0` when the field already exists |
 | `HINCRBY key field increment` | Add to a field's integer value, creating the field and the key when missing; returns the new value; preserves the TTL; a zero increment on an existing field changes nothing and is not logged |
+| `HKEYS key` | All field names (insertion order; empty array when missing) |
+| `HVALS key` | All field values (insertion order; empty array when missing) |
+| `HINCRBYFLOAT key field increment` | Add to a field's float value, creating the field and the key when missing; returns the new value; preserves the TTL; a non-float field is an error, an increment that would produce a non-finite result is an error, and a zero increment on an existing field changes nothing and is not logged |
+| `HSCAN key cursor [MATCH pattern] [COUNT n]` | Cursor-based iteration over a hash's fields: start at cursor `0`, repeat with the returned cursor until it comes back `0`; each call returns the next cursor and a flat `[field, value, ...]` array of matching pairs; `MATCH` filters field names with the same glob as `KEYS`, `COUNT` (default 10) is a hint for how many matching pairs to return per call |
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZCARD key` | Number of members (`0` when missing) |
@@ -809,6 +813,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       (no log, no `WATCH` invalidation), and the TTL survives,
       as in Redis. The mutating two are AOF-logged and
       replicated as raw commands when they change state, so the
-      snapshot and full sync needed no change. Limitation:
-      hashes still use a linear scan, and `HKEYS` / `HVALS` /
-      `HINCRBYFLOAT` / `HSCAN` are not implemented yet
+      snapshot and full sync needed no change.
+
+- [x] Hash misc commands, continued: `HKEYS` / `HVALS` /
+      `HINCRBYFLOAT` / `HSCAN` (0.37.0): `HKEYS` and `HVALS`
+      return the field names or values in insertion order from
+      the same flat array `HGETALL` builds; `HINCRBYFLOAT` adds
+      to a field's float value like `HINCRBY` does for integers
+      — a non-float field is an error, a result that would not
+      be finite is an error and changes nothing, a zero
+      increment on an existing field is a no-op (no log, no
+      `WATCH` invalidation), and the TTL survives; `HSCAN`
+      iterates a hash's fields with a cursor that is an index
+      into the insertion-ordered fields, with `MATCH` glob
+      filtering on field names and `COUNT` as a per-call hint.
+      The hash family is now complete for the core commands.
+      Limitation: hashes still use a linear scan

@@ -851,9 +851,74 @@ def main():
         check("PEXPIRE hincrby", c.cmd("PEXPIRE", "blinkhincr", "100000"), 1)
         check("HINCRBY preserves TTL", c.cmd("HINCRBY", "blinkhincr", "n", "1"), 2)
         check("TTL after HINCRBY ~", 99 <= c.cmd("TTL", "blinkhincr") <= 100, True)
+        # HKEYS / HVALS: insertion order, missing key, wrong type.
+        check("HKEYS", c.cmd("HKEYS", "hmhash"),
+              ["a", "b", "s", "c", "ctr", "big"])
+        check("HVALS", c.cmd("HVALS", "hmhash"),
+              ["5", "2", "txt", "3", "7", "9223372036854775807"])
+        check("HKEYS missing key", c.cmd("HKEYS", "ghosthash"), [])
+        check("HVALS missing key", c.cmd("HVALS", "ghosthash"), [])
+        check("HKEYS wrongtype", c.cmd("HKEYS", "after"), wrongtype)
+        check("HVALS wrongtype", c.cmd("HVALS", "after"), wrongtype)
+        check("HKEYS wrong args", c.cmd("HKEYS", "hmhash", "x"),
+              ("error", "ERR wrong number of arguments for 'hkeys' command"))
+        check("HVALS wrong args", c.cmd("HVALS"),
+              ("error", "ERR wrong number of arguments for 'hvals' command"))
+        # HINCRBYFLOAT: float fields, new fields and keys, errors,
+        # overflow, zero no-op, TTL.
+        check("HSET floathash", c.cmd("HSET", "floathash", "x", "1.5", "s", "txt"), 2)
+        check("HINCRBYFLOAT", c.cmd("HINCRBYFLOAT", "floathash", "x", "0.25"), "1.75")
+        check("HINCRBYFLOAT new field", c.cmd("HINCRBYFLOAT", "floathash", "y", "2"), "2")
+        check("HINCRBYFLOAT negative", c.cmd("HINCRBYFLOAT", "floathash", "y", "-0.5"), "1.5")
+        check("HINCRBYFLOAT zero noop", c.cmd("HINCRBYFLOAT", "floathash", "x", "0"), "1.75")
+        check("HINCRBYFLOAT missing key", c.cmd("HINCRBYFLOAT", "floatnew", "n", "3"), "3")
+        check("HINCRBYFLOAT non-float field", c.cmd("HINCRBYFLOAT", "floathash", "s", "1"),
+              ("error", "ERR hash value is not a float"))
+        check("HINCRBYFLOAT bad increment", c.cmd("HINCRBYFLOAT", "floathash", "x", "xx"),
+              ("error", "ERR value is not a valid float"))
+        check("HINCRBYFLOAT inf increment", c.cmd("HINCRBYFLOAT", "floathash", "x", "inf"),
+              ("error", "ERR increment or decrement would overflow"))
+        check("HGET unchanged after inf increment", c.cmd("HGET", "floathash", "x"), "1.75")
+        check("HSET floathash big", c.cmd("HSET", "floathash", "big", "1.7976931348623157e308"), 1)
+        check("HINCRBYFLOAT overflow", c.cmd("HINCRBYFLOAT", "floathash", "big", "1.7976931348623157e308"),
+              ("error", "ERR increment or decrement would overflow"))
+        check("HGET big unchanged after float overflow", c.cmd("HGET", "floathash", "big"), "1.7976931348623157e308")
+        check("HINCRBYFLOAT wrongtype", c.cmd("HINCRBYFLOAT", "after", "f", "1"), wrongtype)
+        check("HINCRBYFLOAT wrong args", c.cmd("HINCRBYFLOAT", "floathash", "x"),
+              ("error", "ERR wrong number of arguments for 'hincrbyfloat' command"))
+        check("HSET ttl hincrbyfloat", c.cmd("HSET", "blinkfloat", "n", "1.5"), 1)
+        check("PEXPIRE hincrbyfloat", c.cmd("PEXPIRE", "blinkfloat", "100000"), 1)
+        check("HINCRBYFLOAT preserves TTL", c.cmd("HINCRBYFLOAT", "blinkfloat", "n", "0.5"), "2")
+        check("TTL after HINCRBYFLOAT ~", 99 <= c.cmd("TTL", "blinkfloat") <= 100, True)
+        # HSCAN: full iteration, MATCH, COUNT pagination, errors.
+        check("HSET scanhash", c.cmd("HSET", "scanhash", "f1", "v1", "f2", "v2", "f3", "v3", "f4", "v4", "f5", "v5"), 5)
+        check("HSCAN all", c.cmd("HSCAN", "scanhash", "0"),
+              ["0", ["f1", "v1", "f2", "v2", "f3", "v3", "f4", "v4", "f5", "v5"]])
+        check("HSCAN MATCH f1*", c.cmd("HSCAN", "scanhash", "0", "MATCH", "f1*"),
+              ["0", ["f1", "v1"]])
+        check("HSCAN MATCH none", c.cmd("HSCAN", "scanhash", "0", "MATCH", "zzz*"),
+              ["0", []])
+        check("HSCAN COUNT 2 page 1", c.cmd("HSCAN", "scanhash", "0", "COUNT", "2"),
+              ["2", ["f1", "v1", "f2", "v2"]])
+        check("HSCAN COUNT 2 page 2", c.cmd("HSCAN", "scanhash", "2", "COUNT", "2"),
+              ["4", ["f3", "v3", "f4", "v4"]])
+        check("HSCAN COUNT 2 page 3", c.cmd("HSCAN", "scanhash", "4", "COUNT", "2"),
+              ["0", ["f5", "v5"]])
+        check("HSCAN missing key", c.cmd("HSCAN", "ghosthash", "0"), ["0", []])
+        check("HSCAN wrongtype", c.cmd("HSCAN", "after", "0"), wrongtype)
+        check("HSCAN bad cursor", c.cmd("HSCAN", "scanhash", "abc"),
+              ("error", "ERR invalid cursor"))
+        check("HSCAN wrong args", c.cmd("HSCAN", "scanhash"),
+              ("error", "ERR wrong number of arguments for 'hscan' command"))
+        check("HSCAN bad option", c.cmd("HSCAN", "scanhash", "0", "NOPE"),
+              ("error", "ERR syntax error"))
         check("COMMAND lists HMGET", "HMGET" in c.cmd("COMMAND"), True)
         check("COMMAND lists HSETNX", "HSETNX" in c.cmd("COMMAND"), True)
         check("COMMAND lists HINCRBY", "HINCRBY" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HKEYS", "HKEYS" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HVALS", "HVALS" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HINCRBYFLOAT", "HINCRBYFLOAT" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HSCAN", "HSCAN" in c.cmd("COMMAND"), True)
         # Sorted sets: add/update, scores, wrong type, TTL, AOF
         # persistence. Members are ordered by (score, member); range
         # commands are not implemented yet.
@@ -1330,6 +1395,20 @@ def main():
         check("MULTI hincrby noop SET queued", c.cmd("SET", "wkey", "v17"), "QUEUED")
         check("EXEC hincrby noop watch runs", c.cmd("EXEC"), ["OK"])
         check("wkey after hincrby noop EXEC", c.cmd("GET", "wkey"), "v17")
+        # A real HINCRBYFLOAT invalidates a watch; a no-op one
+        # (delta 0 on an existing field) does not.
+        check("WATCH whash 3", c.cmd("WATCH", "whash"), "OK")
+        check("other client HINCRBYFLOAT whash", c2.cmd("HINCRBYFLOAT", "whash", "n", "0.5"), "2.5")
+        check("MULTI hincrbyfloat watch", c.cmd("MULTI"), "OK")
+        check("MULTI hincrbyfloat SET queued", c.cmd("SET", "wkey", "v18"), "QUEUED")
+        check("EXEC hincrbyfloat watch aborts", c.cmd("EXEC"), None)
+        check("wkey unchanged after hincrbyfloat abort", c.cmd("GET", "wkey"), "v17")
+        check("WATCH whash 4", c.cmd("WATCH", "whash"), "OK")
+        check("other client HINCRBYFLOAT noop", c2.cmd("HINCRBYFLOAT", "whash", "n", "0"), "2.5")
+        check("MULTI hincrbyfloat noop watch", c.cmd("MULTI"), "OK")
+        check("MULTI hincrbyfloat noop SET queued", c.cmd("SET", "wkey", "v19"), "QUEUED")
+        check("EXEC hincrbyfloat noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("wkey after hincrbyfloat noop EXEC", c.cmd("GET", "wkey"), "v19")
         check("watch keys cleanup", c.cmd("DEL", "wkey", "wmissing", "wset", "whash"), 4)
         # FLUSHALL invalidates even a watch on a key that never
         # existed; it wipes the dataset, so rebuild the four keys the
@@ -1710,7 +1789,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.36.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.37.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

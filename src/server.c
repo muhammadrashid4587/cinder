@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.36.0"
+#define CINDER_VERSION "0.37.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1181,6 +1181,31 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(pairs);
         return 0;
     }
+    if (strcasecmp(cmd, "HKEYS") == 0 || strcasecmp(cmd, "HVALS") == 0) {
+        int want_keys = strcasecmp(cmd, "HKEYS") == 0;
+        if (argc != 2)
+            return dbuf_error(reply, want_keys
+                ? "wrong number of arguments for 'hkeys' command"
+                : "wrong number of arguments for 'hvals' command"), 0;
+        char **pairs = NULL;
+        size_t n = 0;
+        int rc = store_hgetall(g_store, argv[1], &pairs, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        /* store_hgetall returns a flat [field, value, ...] array in
+           insertion order; HKEYS takes the even slots, HVALS the
+           odd ones. */
+        dbuf_array_header(reply, (long long)(n / 2));
+        for (size_t i = want_keys ? 0 : 1; i < n; i += 2) {
+            dbuf_bulk(reply, pairs[i], strlen(pairs[i]));
+            free(pairs[i]);
+        }
+        for (size_t i = want_keys ? 1 : 0; i < n; i += 2) free(pairs[i]);
+        free(pairs);
+        return 0;
+    }
     if (strcasecmp(cmd, "HMGET") == 0) {
         if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'hmget' command"), 0;
         int t = store_type(g_store, argv[1]);
@@ -1235,6 +1260,86 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         /* A zero increment on an existing field changed nothing, so
            there is nothing to log or replicate. */
         return rc == 2 ? 0 : 1;
+    }
+    if (strcasecmp(cmd, "HINCRBYFLOAT") == 0) {
+        if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'hincrbyfloat' command"), 0;
+        double delta;
+        if (!parse_double(argv[3], &delta))
+            return dbuf_error(reply, "value is not a valid float"), 0;
+        double v;
+        int rc = store_hincrbyfloat(g_store, argv[1], argv[2], delta, &v);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "hash value is not a float"), 0;
+        if (rc == -3)
+            return dbuf_error(reply, "increment or decrement would overflow"), 0;
+        if (rc == -4)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == 1 && g_max_entries) store_evict_lru(g_store, g_max_entries);
+        char buf[32];
+        format_score(buf, sizeof(buf), v);
+        dbuf_bulk(reply, buf, strlen(buf));
+        /* A zero increment on an existing field changed nothing, so
+           there is nothing to log or replicate. */
+        return rc == 2 ? 0 : 1;
+    }
+    if (strcasecmp(cmd, "HSCAN") == 0) {
+        if (argc < 3)
+            return dbuf_error(reply, "wrong number of arguments for 'hscan' command"), 0;
+        /* The cursor is an unsigned decimal integer, as in SCAN;
+           anything else is the same "invalid cursor" error. */
+        unsigned long long cursor = 0;
+        if (!*argv[2])
+            return dbuf_error(reply, "invalid cursor"), 0;
+        for (const char *p = argv[2]; *p; p++) {
+            if (*p < '0' || *p > '9')
+                return dbuf_error(reply, "invalid cursor"), 0;
+            cursor = cursor * 10 + (unsigned long long)(*p - '0');
+        }
+        const char *pattern = "*";
+        long long count = 10; /* Redis's default COUNT */
+        int seen_match = 0, seen_count = 0;
+        for (int i = 3; i < argc; i++) {
+            if (strcasecmp(argv[i], "MATCH") == 0) {
+                if (seen_match || i + 1 >= argc)
+                    return dbuf_error(reply, "syntax error"), 0;
+                seen_match = 1;
+                pattern = argv[++i];
+            } else if (strcasecmp(argv[i], "COUNT") == 0) {
+                if (seen_count || i + 1 >= argc)
+                    return dbuf_error(reply, "syntax error"), 0;
+                seen_count = 1;
+                long long n;
+                if (!parse_ll(argv[++i], &n))
+                    return dbuf_error(reply, "value is not an integer or out of range"), 0;
+                if (n < 0)
+                    return dbuf_error(reply, "syntax error"), 0;
+                count = n;
+            } else {
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        }
+        char **pairs = NULL;
+        size_t n = 0;
+        unsigned long long next = 0;
+        int rc = store_hscan(g_store, argv[1], cursor, pattern,
+                             (size_t)count, &pairs, &n, &next);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_array_header(reply, 2);
+        char curbuf[32];
+        snprintf(curbuf, sizeof(curbuf), "%llu", next);
+        dbuf_bulk(reply, curbuf, strlen(curbuf));
+        dbuf_array_header(reply, (long long)n);
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, pairs[i], strlen(pairs[i]));
+            free(pairs[i]);
+        }
+        free(pairs);
+        return 0;
     }
     if (strcasecmp(cmd, "ZADD") == 0) {
         if (argc < 4)
@@ -1680,7 +1785,8 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "LMOVE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
-            "HMGET", "HSETNX", "HINCRBY",
+            "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
+            "HINCRBYFLOAT", "HSCAN",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZREM",
             "ZRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER",

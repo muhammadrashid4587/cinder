@@ -374,6 +374,31 @@ int store_hgetall(Store *s, const char *key, char ***out, size_t *n_out);
    *out is the field's new value. */
 int store_hincrby(Store *s, const char *key, const char *field,
                   long long delta, long long *out);
+/* Add delta to a hash field's float value, creating the field (with
+   value delta) and the hash when missing. Returns 1 when the field
+   is new, 0 when an existing field changed, 2 when nothing changed
+   (increment 0 on a field already there), -1 = wrong type,
+   -2 = field value is not a float, -3 = increment would overflow
+   (the result is not a finite number), -4 = out of memory.
+   Preserves the key's TTL, as in Redis. *out is the field's new
+   value, stored formatted with %.17g. */
+int store_hincrbyfloat(Store *s, const char *key, const char *field,
+                       double delta, double *out);
+/* Cursor-based iteration over a hash's fields, Redis HSCAN
+   semantics: start with cursor 0, repeat with the returned cursor
+   until it comes back 0. The cursor is an index into the hash's
+   insertion-ordered fields, so a field added or removed between
+   calls may be skipped or returned twice, as with SCAN. `pattern`
+   is the same glob as KEYS/SCAN, matched against field names;
+   `count` is a hint for how many matching pairs to return per call
+   (0 returns none and cursor 0). Returns 0 on success (*n_out is
+   the flat [field, value, ...] count, 0 for a missing key, and
+   *next_out is the next cursor), -1 = wrong type, -2 = out of
+   memory. *out is a malloc'd array of malloc'd strings; the caller
+   frees both. */
+int store_hscan(Store *s, const char *key, unsigned long long cursor,
+                const char *pattern, size_t count, char ***out,
+                size_t *n_out, unsigned long long *next_out);
 
 /* Add or update one member's score. Returns 1 when the member is
    new, 0 when it overwrote an existing member's score, 2 when the
