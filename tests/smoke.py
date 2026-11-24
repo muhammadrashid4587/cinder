@@ -1523,6 +1523,107 @@ def main():
               ("error", "ERR syntax error"))
         check("COMMAND lists ZINTER", "ZINTER" in c.cmd("COMMAND"), True)
         check("ZINTER cleanup", c.cmd("DEL", "izset1", "izset2"), 2)
+        # ZUNIONSTORE. stzset1 holds a=1, b=2, c=3; stzset2 holds
+        # b=10, d=4, so the union is a=1, b=12, c=3, d=4.
+        check("ZADD stzset1", c.cmd("ZADD", "stzset1", "1", "a", "2", "b", "3", "c"), 3)
+        check("ZADD stzset2", c.cmd("ZADD", "stzset2", "10", "b", "4", "d"), 2)
+        check("ZUNIONSTORE one", c.cmd("ZUNIONSTORE", "stdest", "1", "stzset1"), 3)
+        check("ZUNIONSTORE one range", c.cmd("ZRANGE", "stdest", "0", "-1", "WITHSCORES"),
+              ["a", "1", "b", "2", "c", "3"])
+        check("ZUNIONSTORE two", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2"), 4)
+        check("ZUNIONSTORE two range", c.cmd("ZRANGE", "stdest", "0", "-1", "WITHSCORES"),
+              ["a", "1", "c", "3", "d", "4", "b", "12"])
+        check("ZUNIONSTORE weights", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                           "WEIGHTS", "2", "3"), 4)
+        check("ZUNIONSTORE weights range", c.cmd("ZRANGE", "stdest", "0", "-1", "WITHSCORES"),
+              ["a", "2", "c", "6", "d", "12", "b", "34"])
+        check("ZUNIONSTORE aggregate min", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                                 "AGGREGATE", "MIN"), 4)
+        check("ZUNIONSTORE aggregate min range", c.cmd("ZRANGE", "stdest", "0", "-1", "WITHSCORES"),
+              ["a", "1", "b", "2", "c", "3", "d", "4"])
+        check("ZUNIONSTORE aggregate max", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                                 "AGGREGATE", "MAX"), 4)
+        check("ZUNIONSTORE aggregate max range", c.cmd("ZRANGE", "stdest", "0", "-1", "WITHSCORES"),
+              ["a", "1", "c", "3", "d", "4", "b", "10"])
+        check("ZUNIONSTORE weights min", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                               "WEIGHTS", "2", "1", "AGGREGATE", "MIN"), 4)
+        check("ZUNIONSTORE weights min range", c.cmd("ZRANGE", "stdest", "0", "-1", "WITHSCORES"),
+              ["a", "2", "b", "4", "d", "4", "c", "6"])
+        check("ZUNIONSTORE options any order", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                                     "AGGREGATE", "MAX", "WEIGHTS", "1", "1"), 4)
+        check("ZUNIONSTORE options any order range", c.cmd("ZRANGE", "stdest", "0", "-1", "WITHSCORES"),
+              ["a", "1", "c", "3", "d", "4", "b", "10"])
+        # Overwriting a string destination replaces it, and the
+        # destination's TTL is cleared by the overwrite.
+        check("ZUNIONSTORE string dest setup", c.cmd("SET", "strdest", "old"), "OK")
+        check("ZUNIONSTORE overwrites string", c.cmd("ZUNIONSTORE", "strdest", "1", "stzset1"), 3)
+        check("ZUNIONSTORE string dest is zset", c.cmd("ZSCORE", "strdest", "a"), "1")
+        check("ZUNIONSTORE string dest GET wrongtype", c.cmd("GET", "strdest"), wrongtype)
+        check("ZUNIONSTORE TTL setup", c.cmd("EXPIRE", "stdest", "100"), 1)
+        check("ZUNIONSTORE overwrites TTL", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2"), 4)
+        check("ZUNIONSTORE TTL cleared", c.cmd("TTL", "stdest"), -1)
+        # An empty result deletes the destination instead of leaving
+        # an empty set, and a missing destination stays missing.
+        check("ZUNIONSTORE empty deletes", c.cmd("ZUNIONSTORE", "stdest", "1", "ghostzset"), 0)
+        check("ZUNIONSTORE empty dest gone", c.cmd("EXISTS", "stdest"), 0)
+        check("ZUNIONSTORE empty missing dest", c.cmd("ZUNIONSTORE", "newdest", "1", "ghostzset"), 0)
+        check("ZUNIONSTORE empty missing dest gone", c.cmd("EXISTS", "newdest"), 0)
+        check("ZUNIONSTORE missing other", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "ghostzset"), 3)
+        check("ZUNIONSTORE missing other range", c.cmd("ZRANGE", "stdest", "0", "-1"),
+              ["a", "b", "c"])
+        check("ZUNIONSTORE wrongtype", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "after"), wrongtype)
+        check("ZUNIONSTORE wrong args", c.cmd("ZUNIONSTORE", "stdest"),
+              ("error", "ERR wrong number of arguments for 'zunionstore' command"))
+        check("ZUNIONSTORE too few keys", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1"),
+              ("error", "ERR wrong number of arguments for 'zunionstore' command"))
+        check("ZUNIONSTORE zero keys", c.cmd("ZUNIONSTORE", "stdest", "0", "stzset1"),
+              ("error", "ERR at least 1 input key is needed for 'zunionstore' command"))
+        check("ZUNIONSTORE bad weight", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                              "WEIGHTS", "x", "1"),
+              ("error", "ERR value is not a valid float"))
+        check("ZUNIONSTORE weights short", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                                 "WEIGHTS", "1"),
+              ("error", "ERR syntax error"))
+        check("ZUNIONSTORE bad aggregate", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                                 "AGGREGATE", "MEAN"),
+              ("error", "ERR syntax error"))
+        check("ZUNIONSTORE duplicate weights", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                                     "WEIGHTS", "1", "1",
+                                                     "WEIGHTS", "1", "1"),
+              ("error", "ERR syntax error"))
+        check("ZUNIONSTORE duplicate aggregate", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                                       "AGGREGATE", "SUM",
+                                                       "AGGREGATE", "MIN"),
+              ("error", "ERR syntax error"))
+        check("ZUNIONSTORE withscores rejected", c.cmd("ZUNIONSTORE", "stdest", "1", "stzset1",
+                                                       "WITHSCORES"),
+              ("error", "ERR syntax error"))
+        check("ZUNIONSTORE bad option", c.cmd("ZUNIONSTORE", "stdest", "1", "stzset1", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("COMMAND lists ZUNIONSTORE", "ZUNIONSTORE" in c.cmd("COMMAND"), True)
+        # A ZUNIONSTORE that reproduces the destination exactly is a
+        # no-op and does not invalidate a WATCH; one that changes it
+        # does. Restore the plain union into stdest first.
+        check("ZUNIONSTORE restore union", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2"), 4)
+        check("WATCH zunionstore noop", c.cmd("WATCH", "stdest"), "OK")
+        check("ZUNIONSTORE noop", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2"), 4)
+        check("MULTI zunionstore noop watch", c.cmd("MULTI"), "OK")
+        check("MULTI zunionstore noop SET queued", c.cmd("SET", "wtestkey", "v1"), "QUEUED")
+        check("EXEC zunionstore noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("wtestkey after zunionstore noop EXEC", c.cmd("GET", "wtestkey"), "v1")
+        check("WATCH zunionstore change", c.cmd("WATCH", "stdest"), "OK")
+        check("ZUNIONSTORE change", c.cmd("ZUNIONSTORE", "stdest", "2", "stzset1", "stzset2",
+                                          "WEIGHTS", "2", "1"), 4)
+        check("MULTI zunionstore change watch", c.cmd("MULTI"), "OK")
+        check("MULTI zunionstore change SET queued", c.cmd("SET", "wtestkey", "v2"), "QUEUED")
+        check("EXEC zunionstore change watch aborts", c.cmd("EXEC"), None)
+        check("wtestkey unchanged after zunionstore abort", c.cmd("GET", "wtestkey"), "v1")
+        # The destination may be one of the inputs: the union is
+        # computed before the destination is overwritten.
+        check("ZUNIONSTORE dest is input", c.cmd("ZUNIONSTORE", "stzset1", "2", "stzset1", "stzset2"), 4)
+        check("ZUNIONSTORE dest is input range", c.cmd("ZRANGE", "stzset1", "0", "-1", "WITHSCORES"),
+              ["a", "1", "c", "3", "d", "4", "b", "12"])
+        check("ZUNIONSTORE cleanup", c.cmd("DEL", "stzset1", "stzset2", "stdest", "strdest", "wtestkey"), 5)
         # Deleted again: the AOF restart below counts exactly 7 keys.
         check("ZMSCORE cleanup", c.cmd("DEL", "mszset"), 1)
         check("ZREMRANGEBYLEX wrongtype", c.cmd("ZREMRANGEBYLEX", "after", "-", "+"),
@@ -1882,7 +1983,7 @@ def main():
         check("COMMAND lists ZSCORE", "ZSCORE" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZCARD", "ZCARD" in c.cmd("COMMAND"), True)
         # Clean up the transaction keys: the AOF restart below counts
-        # exact keys (7: after, plist, pset, phash, pzset, prange, pfield).
+        # exact keys (8: after, plist, pset, phash, pzset, prange, pfield, punion).
         # ZINCRBY and ZREM on pzset before the restart, so the AOF
         # replay section below can prove they were logged; the
         # ZREMRANGEBYSCORE removes y (2.25) from pzset the same way.
@@ -1890,6 +1991,7 @@ def main():
         check("AOF pre-restart ZINCRBY", c.cmd("ZINCRBY", "pzset", "1", "x"), "2.5")
         check("AOF pre-restart ZREM", c.cmd("ZREM", "pzset", "z"), 1)
         check("AOF pre-restart HINCRBY", c.cmd("HINCRBY", "phash", "a", "5"), 6)
+        check("AOF pre-restart ZUNIONSTORE", c.cmd("ZUNIONSTORE", "punion", "1", "pzset"), 1)
         check("AOF pre-restart BITFIELD", c.cmd("BITFIELD", "pfield", "SET", "u8", "0", "65", "SET", "u8", "8", "66"), [0, 0])
         check("tx cleanup", c.cmd("DEL", "txkey", "txctr", "txkey2", "txlist"), 4)
         c2.close()
@@ -1922,6 +2024,9 @@ def main():
         check("AOF replay zset incr score", c.cmd("ZSCORE", "pzset", "x"), "2.5")
         check("AOF replay zset range", c.cmd("ZRANGE", "pzset", "0", "-1"), ["x"])
         check("AOF replay zset removed gone", c.cmd("ZSCORE", "pzset", "z"), None)
+        check("AOF replay zunionstore card", c.cmd("ZCARD", "punion"), 1)
+        check("AOF replay zunionstore score", c.cmd("ZSCORE", "punion", "x"), "2.5")
+        check("AOF replay zunionstore range", c.cmd("ZRANGE", "punion", "0", "-1"), ["x"])
         check("AOF replay padded GET", c.cmd("GET", "prange"), "\x00" * 5 + "pad")
         check("AOF replay padded STRLEN", c.cmd("STRLEN", "prange"), 8)
         check("AOF replay padded GETRANGE", c.cmd("GETRANGE", "prange", "0", "4"), "\x00" * 5)
@@ -1943,7 +2048,7 @@ def main():
         check("AOF replay expired set gone", c.cmd("SCARD", "blinkset"), 0)
         check("AOF replay expired hash gone", c.cmd("HLEN", "blinkhash"), 0)
         check("AOF replay expired zset gone", c.cmd("ZCARD", "blinkzset"), 0)
-        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 7)
+        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 8)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -2234,7 +2339,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.51.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.52.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -2301,6 +2406,8 @@ def main():
         check("repl live INCR", p.cmd("INCR", "repcounter"), 1)
         check("repl live DEL", p.cmd("DEL", "repstr"), 1)
         check("repl live LPUSH", p.cmd("LPUSH", "replist", "front"), 4)
+        check("repl live ZADD zset2", p.cmd("ZADD", "repz2", "10", "a", "1", "c"), 2)
+        check("repl live ZUNIONSTORE", p.cmd("ZUNIONSTORE", "repunion", "2", "repzset", "repz2"), 3)
         check("repl live ZREMRANGEBYSCORE", p.cmd("ZREMRANGEBYSCORE", "repzset", "1", "2"), 2)
         deadline = time.time() + 5
         streamed = False
@@ -2309,13 +2416,15 @@ def main():
                 if (r.cmd("GET", "newkey") == "live" and
                         r.cmd("GET", "repstr") is None and
                         r.cmd("GET", "repcounter") == "1" and
-                        r.cmd("ZCARD", "repzset") == 0):
+                        r.cmd("ZCARD", "repzset") == 0 and
+                        r.cmd("ZCARD", "repunion") == 3):
                     streamed = True
                     break
             except (EOFError, OSError):
                 pass
             time.sleep(0.1)
         check("repl streamed writes arrived", streamed, True)
+        check("repl streamed zunionstore", r.cmd("ZSCORE", "repunion", "a"), "11.5")
         check("repl streamed list", r.cmd("LRANGE", "replist", "0", "-1"),
               ["front", "x", "y", "z"])
         # Replication offsets: the primary counts forwarded stream bytes,
