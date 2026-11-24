@@ -1358,6 +1358,29 @@ def main():
         check("ZREMRANGEBYSCORE wrongtype", c.cmd("ZREMRANGEBYSCORE", "after", "0", "10"),
               wrongtype)
         check("COMMAND lists ZREMRANGEBYSCORE", "ZREMRANGEBYSCORE" in c.cmd("COMMAND"), True)
+        # ZREMRANGEBYRANK. rrzset holds a=1, b=2, c=3, d=4, e=5.
+        check("ZADD rrzset", c.cmd("ZADD", "rrzset", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e"), 5)
+        check("ZREMRANGEBYRANK mid", c.cmd("ZREMRANGEBYRANK", "rrzset", "1", "3"), 3)
+        check("ZRANGE after ZREMRANGEBYRANK", c.cmd("ZRANGE", "rrzset", "0", "-1"), ["a", "e"])
+        check("ZREMRANGEBYRANK negative", c.cmd("ZREMRANGEBYRANK", "rrzset", "-1", "-1"), 1)
+        check("ZRANGE after negative ZREMRANGEBYRANK", c.cmd("ZRANGE", "rrzset", "0", "-1"), ["a"])
+        check("ZREMRANGEBYRANK last one", c.cmd("ZREMRANGEBYRANK", "rrzset", "0", "0"), 1)
+        check("EXISTS emptied by ZREMRANGEBYRANK", c.cmd("EXISTS", "rrzset"), 0)
+        check("ZREMRANGEBYRANK missing", c.cmd("ZREMRANGEBYRANK", "ghostzset", "0", "-1"), 0)
+        check("ZREMRANGEBYRANK reversed", c.cmd("ZREMRANGEBYRANK", "rrzset2", "1", "0"), 0)
+        check("ZCARD after reversed rank range", c.cmd("ZCARD", "rrzset2"), 2)
+        check("ZREMRANGEBYRANK out of range", c.cmd("ZREMRANGEBYRANK", "rrzset2", "5", "9"), 0)
+        check("ZCARD after out-of-range rank range", c.cmd("ZCARD", "rrzset2"), 2)
+        check("ZREMRANGEBYRANK clamped stop", c.cmd("ZREMRANGEBYRANK", "rrzset2", "0", "99"), 2)
+        check("EXISTS emptied by clamped ZREMRANGEBYRANK", c.cmd("EXISTS", "rrzset2"), 0)
+        check("ZREMRANGEBYRANK bad int",
+              c.cmd("ZREMRANGEBYRANK", "myzset", "xx", "5"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("ZREMRANGEBYRANK wrong args", c.cmd("ZREMRANGEBYRANK", "myzset", "1"),
+              ("error", "ERR wrong number of arguments for 'zremrangebyrank' command"))
+        check("ZREMRANGEBYRANK wrongtype", c.cmd("ZREMRANGEBYRANK", "after", "0", "-1"),
+              wrongtype)
+        check("COMMAND lists ZREMRANGEBYRANK", "ZREMRANGEBYRANK" in c.cmd("COMMAND"), True)
         check("ZREM one", c.cmd("ZREM", "myzset", "b"), 1)
         check("ZCARD after ZREM", c.cmd("ZCARD", "myzset"), 3)
         check("ZRANK removed member", c.cmd("ZRANK", "myzset", "b"), None)
@@ -2064,7 +2087,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.45.2" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.46.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

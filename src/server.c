@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.45.2"
+#define CINDER_VERSION "0.46.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1758,6 +1758,23 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            no-op, so it is neither. */
         return removed > 0 ? 1 : 0;
     }
+    if (strcasecmp(cmd, "ZREMRANGEBYRANK") == 0) {
+        if (argc != 4)
+            return dbuf_error(reply, "wrong number of arguments for 'zremrangebyrank' command"), 0;
+        /* Ranks are 0-based and negative indices count from the
+           end, as in ZRANGE. */
+        long long start, stop;
+        if (!parse_ll(argv[2], &start) || !parse_ll(argv[3], &stop))
+            return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        long long removed = store_zremrangebyrank(g_store, argv[1], start, stop);
+        if (removed == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_int(reply, removed);
+        /* A removal is logged to the AOF and replicated, and it
+           invalidates WATCH on the key; removing nothing is a
+           no-op, so it is neither. */
+        return removed > 0 ? 1 : 0;
+    }
     if (strcasecmp(cmd, "ZREM") == 0) {
         if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'zrem' command"), 0;
         long long removed = 0;
@@ -2049,7 +2066,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HINCRBYFLOAT", "HSCAN",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
-            "ZREMRANGEBYSCORE",
+            "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK",
             "ZRANK", "ZREVRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",
             "KEYS", "SCAN", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",

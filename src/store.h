@@ -507,6 +507,17 @@ long long store_zlexcount(Store *s, const char *key, const char *min,
    matching slice is walked once at level 0. */
 long long store_zremrangebyscore(Store *s, const char *key, double min,
                                  int min_excl, double max, int max_excl);
+/* Remove the members ranked [start, stop] (inclusive, 0-based),
+   with negative indices counting from the end, as in
+   store_zrange, and out-of-range ends clamped. Returns the number
+   removed (0 for a missing key or an empty range, including start
+   above stop after normalisation), -1 = wrong type. The key is
+   deleted when the last member is removed, as with store_zrem; a
+   removal touches the key's version, a no-op does not. The node at
+   rank start + 1 is found in O(log n) and the slice is walked once
+   at level 0. */
+long long store_zremrangebyrank(Store *s, const char *key, long long start,
+                                long long stop);
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing

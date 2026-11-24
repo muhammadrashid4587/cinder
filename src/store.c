@@ -3180,6 +3180,46 @@ long long store_zremrangebyscore(Store *s, const char *key, double min,
     return removed;
 }
 
+/* Remove the members ranked [start, stop] (inclusive, 0-based),
+   with negative indices counting from the end, as in ZRANGE, and
+   out-of-range ends clamped. The node at rank start + 1 is found in
+   O(log n); the slice is walked once at level 0, each member
+   dropped through zset_remove, which keeps the dict and the skip
+   list in step. The next node is saved before the removal, since
+   removing frees the node being stood on. */
+long long store_zremrangebyrank(Store *s, const char *key, long long start,
+                                long long stop) {
+    Entry **pp = NULL;
+    Entry *e = store_find(s, key, &pp);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    ZSet *z = e->zset;
+    long long len = (long long)z->len;
+    if (start < 0) start += len;
+    if (stop < 0) stop += len;
+    if (start < 0) start = 0;
+    if (stop >= len) stop = len - 1;
+    if (start > stop || start >= len) return 0;
+    zslNode *node = zsl_get_by_rank(z->sl, (unsigned long)start + 1);
+    long long removed = 0;
+    while (node && removed <= stop - start) {
+        zslNode *next = node->level[0].forward;
+        if (zset_remove(z, node->member)) removed++;
+        node = next;
+    }
+    if (removed == 0) return 0;
+    if (z->len == 0) {
+        /* A sorted set emptied by removing is gone, as in Redis. */
+        *pp = e->next;
+        entry_free(e);
+        s->count--;
+    } else {
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+    }
+    return removed;
+}
+
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing
