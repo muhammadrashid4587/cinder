@@ -1469,6 +1469,60 @@ def main():
               ("error", "ERR syntax error"))
         check("COMMAND lists ZUNION", "ZUNION" in c.cmd("COMMAND"), True)
         check("ZUNION cleanup", c.cmd("DEL", "uzset1", "uzset2"), 2)
+        # ZINTER. izset1 holds a=1, b=2, c=3; izset2 holds b=10, c=30, d=4,
+        # so the intersection is b and c: SUM gives b=12, c=33.
+        check("ZADD izset1", c.cmd("ZADD", "izset1", "1", "a", "2", "b", "3", "c"), 3)
+        check("ZADD izset2", c.cmd("ZADD", "izset2", "10", "b", "30", "c", "4", "d"), 3)
+        check("ZINTER one", c.cmd("ZINTER", "1", "izset1"), ["a", "b", "c"])
+        check("ZINTER two", c.cmd("ZINTER", "2", "izset1", "izset2"), ["b", "c"])
+        check("ZINTER withscores", c.cmd("ZINTER", "2", "izset1", "izset2", "WITHSCORES"),
+              ["b", "12", "c", "33"])
+        check("ZINTER weights", c.cmd("ZINTER", "2", "izset1", "izset2",
+                                       "WEIGHTS", "2", "3", "WITHSCORES"),
+              ["b", "34", "c", "96"])
+        check("ZINTER aggregate min", c.cmd("ZINTER", "2", "izset1", "izset2",
+                                            "AGGREGATE", "MIN", "WITHSCORES"),
+              ["b", "2", "c", "3"])
+        check("ZINTER aggregate max", c.cmd("ZINTER", "2", "izset1", "izset2",
+                                            "AGGREGATE", "MAX", "WITHSCORES"),
+              ["b", "10", "c", "30"])
+        check("ZINTER weights min", c.cmd("ZINTER", "2", "izset1", "izset2",
+                                          "WEIGHTS", "2", "1", "AGGREGATE", "MIN",
+                                          "WITHSCORES"),
+              ["b", "4", "c", "6"])
+        check("ZINTER options any order", c.cmd("ZINTER", "2", "izset1", "izset2",
+                                                "WITHSCORES", "AGGREGATE", "MAX"),
+              ["b", "10", "c", "30"])
+        check("ZINTER missing other", c.cmd("ZINTER", "2", "izset1", "ghostzset"), [])
+        check("ZINTER missing first", c.cmd("ZINTER", "1", "ghostzset"), [])
+        check("ZINTER missing first two", c.cmd("ZINTER", "2", "ghostzset", "izset1"), [])
+        check("ZINTER wrongtype", c.cmd("ZINTER", "2", "izset1", "after"), wrongtype)
+        check("ZINTER wrong args", c.cmd("ZINTER", "izset1"),
+              ("error", "ERR wrong number of arguments for 'zinter' command"))
+        check("ZINTER too few keys", c.cmd("ZINTER", "2", "izset1"),
+              ("error", "ERR wrong number of arguments for 'zinter' command"))
+        check("ZINTER zero keys", c.cmd("ZINTER", "0", "izset1"),
+              ("error", "ERR at least 1 input key is needed for 'zinter' command"))
+        check("ZINTER bad weight", c.cmd("ZINTER", "2", "izset1", "izset2",
+                                         "WEIGHTS", "x", "1"),
+              ("error", "ERR value is not a valid float"))
+        check("ZINTER weights short", c.cmd("ZINTER", "2", "izset1", "izset2",
+                                            "WEIGHTS", "1"),
+              ("error", "ERR syntax error"))
+        check("ZINTER bad aggregate", c.cmd("ZINTER", "2", "izset1", "izset2",
+                                            "AGGREGATE", "MEAN"),
+              ("error", "ERR syntax error"))
+        check("ZINTER duplicate weights", c.cmd("ZINTER", "2", "izset1", "izset2",
+                                                "WEIGHTS", "1", "1",
+                                                "WEIGHTS", "1", "1"),
+              ("error", "ERR syntax error"))
+        check("ZINTER duplicate withscores", c.cmd("ZINTER", "2", "izset1", "izset2",
+                                                   "WITHSCORES", "WITHSCORES"),
+              ("error", "ERR syntax error"))
+        check("ZINTER bad option", c.cmd("ZINTER", "1", "izset1", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("COMMAND lists ZINTER", "ZINTER" in c.cmd("COMMAND"), True)
+        check("ZINTER cleanup", c.cmd("DEL", "izset1", "izset2"), 2)
         # Deleted again: the AOF restart below counts exactly 7 keys.
         check("ZMSCORE cleanup", c.cmd("DEL", "mszset"), 1)
         check("ZREMRANGEBYLEX wrongtype", c.cmd("ZREMRANGEBYLEX", "after", "-", "+"),
@@ -2180,7 +2234,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.50.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.51.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

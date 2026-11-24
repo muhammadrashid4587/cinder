@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.50.0.
+Version 0.51.0.
 
 ## Why
 
@@ -108,6 +108,7 @@ OK
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZMSCORE key member [member ...]` | Scores of several members at once, in order (`nil` for a missing member, an array of `nil`s when the key is missing) |
 | `ZDIFF numkeys key [key ...] [WITHSCORES]` | Members of the first sorted set that are in none of the other sets, lowest score first; `WITHSCORES` interleaves each score after its member; a missing key counts as an empty set |
+| `ZINTER numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]` | Members present in every input sorted set, lowest score first; each score is weighted per key and then aggregated (`SUM` by default, or `MIN`/`MAX`); `WITHSCORES` interleaves each score after its member; a missing key counts as an empty set |
 | `ZCARD key` | Number of members (`0` when missing) |
 | `ZRANGE key start stop [WITHSCORES]` | Members in index range, lowest score first; negative indices count from the end, `WITHSCORES` interleaves each score after its member |
 | `ZREVRANGE key start stop [WITHSCORES]` | Same range, highest score first |
@@ -1060,3 +1061,20 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       It is a read, so it is not logged to the AOF, not
       replicated, and does not invalidate `WATCH`, and it is
       listed by `COMMAND`.
+
+- [x] `ZINTER` (0.51.0): return the intersection of several sorted
+      sets, `ZINTER numkeys key [key ...] [WEIGHTS w ...]
+      [AGGREGATE SUM|MIN|MAX] [WITHSCORES]`, lowest score first,
+      with only the members present in every input set and each
+      score weighted per key and then aggregated (`SUM` by
+      default), as in real Redis. The options may appear in any
+      order; a bad weight is a float error, a bad or repeated
+      option is a syntax error. A missing key counts as an empty
+      set and a non-sorted-set key is a `WRONGTYPE` error; the
+      handler checks the type of every input key before reading
+      any set. It reuses `store_zrange` for the first set and
+      `store_zscore` for membership in the others, and sorts the
+      result by score, member name breaking ties, so it needs no
+      new store code. It is a read, so it is not logged to the
+      AOF, not replicated, and does not invalidate `WATCH`, and
+      it is listed by `COMMAND`.
