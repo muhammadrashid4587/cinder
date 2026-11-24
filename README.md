@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.45.0.
+Version 0.45.1.
 
 ## Why
 
@@ -963,3 +963,9 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       is logged to the AOF and replicated and invalidates `WATCH`
       on the key; removing nothing is a no-op, so it is none of
       those.
+
+- [x] Version fix (0.45.1): `CINDER_VERSION` still said 0.42.0
+      while the README was at 0.45.0, so `INFO` reported the stale
+      version and the smoke test pinned it. The define and the
+      smoke-test expectation now both say 0.45.0; no behaviour
+      change.
