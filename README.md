@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.48.0.
+Version 0.49.0.
 
 ## Why
 
@@ -107,6 +107,7 @@ OK
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZMSCORE key member [member ...]` | Scores of several members at once, in order (`nil` for a missing member, an array of `nil`s when the key is missing) |
+| `ZDIFF numkeys key [key ...] [WITHSCORES]` | Members of the first sorted set that are in none of the other sets, lowest score first; `WITHSCORES` interleaves each score after its member; a missing key counts as an empty set |
 | `ZCARD key` | Number of members (`0` when missing) |
 | `ZRANGE key start stop [WITHSCORES]` | Members in index range, lowest score first; negative indices count from the end, `WITHSCORES` interleaves each score after its member |
 | `ZREVRANGE key start stop [WITHSCORES]` | Same range, highest score first |
@@ -1033,3 +1034,16 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       is what real Redis returns. It is a read, so it is not
       logged to the AOF, not replicated, and does not invalidate
       `WATCH`, and it is listed by `COMMAND`.
+
+- [x] `ZDIFF` (0.49.0): return the members of the first sorted
+      set that are in none of the other sets, `ZDIFF numkeys key
+      [key ...] [WITHSCORES]`, lowest score first, with the scores
+      from the first set when `WITHSCORES` is given, as in real
+      Redis. A missing key counts as an empty set and a
+      non-sorted-set key is a `WRONGTYPE` error; the handler checks
+      the type of every input key before reading any set. It
+      reuses `store_zrange` for the first set and `store_zscore`
+      for membership in the others, so it needs no new store code.
+      It is a read, so it is not logged to the AOF, not
+      replicated, and does not invalidate `WATCH`, and it is
+      listed by `COMMAND`.

@@ -1422,6 +1422,28 @@ def main():
         check("ZMSCORE wrong args", c.cmd("ZMSCORE", "mszset"),
               ("error", "ERR wrong number of arguments for 'zmscore' command"))
         check("COMMAND lists ZMSCORE", "ZMSCORE" in c.cmd("COMMAND"), True)
+        # ZDIFF. dzset1 holds a=1, b=2, c=3; dzset2 holds b=2, d=4.
+        check("ZADD dzset1", c.cmd("ZADD", "dzset1", "1", "a", "2", "b", "3", "c"), 3)
+        check("ZADD dzset2", c.cmd("ZADD", "dzset2", "2", "b", "4", "d"), 2)
+        check("ZDIFF one", c.cmd("ZDIFF", "1", "dzset1"), ["a", "b", "c"])
+        check("ZDIFF two", c.cmd("ZDIFF", "2", "dzset1", "dzset2"), ["a", "c"])
+        check("ZDIFF withscores", c.cmd("ZDIFF", "2", "dzset1", "dzset2", "WITHSCORES"),
+              ["a", "1", "c", "3"])
+        check("ZDIFF missing other", c.cmd("ZDIFF", "2", "dzset1", "ghostzset"),
+              ["a", "b", "c"])
+        check("ZDIFF missing first", c.cmd("ZDIFF", "1", "ghostzset"), [])
+        check("ZDIFF missing first two", c.cmd("ZDIFF", "2", "ghostzset", "dzset1"), [])
+        check("ZDIFF wrongtype", c.cmd("ZDIFF", "2", "dzset1", "after"), wrongtype)
+        check("ZDIFF wrong args", c.cmd("ZDIFF", "dzset1"),
+              ("error", "ERR wrong number of arguments for 'zdiff' command"))
+        check("ZDIFF too few keys", c.cmd("ZDIFF", "2", "dzset1"),
+              ("error", "ERR wrong number of arguments for 'zdiff' command"))
+        check("ZDIFF zero keys", c.cmd("ZDIFF", "0", "dzset1"),
+              ("error", "ERR at least 1 input key is needed for 'zdiff' command"))
+        check("ZDIFF bad option", c.cmd("ZDIFF", "1", "dzset1", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("COMMAND lists ZDIFF", "ZDIFF" in c.cmd("COMMAND"), True)
+        check("ZDIFF cleanup", c.cmd("DEL", "dzset1", "dzset2"), 2)
         # Deleted again: the AOF restart below counts exactly 7 keys.
         check("ZMSCORE cleanup", c.cmd("DEL", "mszset"), 1)
         check("ZREMRANGEBYLEX wrongtype", c.cmd("ZREMRANGEBYLEX", "after", "-", "+"),
@@ -2133,7 +2155,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.48.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.49.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

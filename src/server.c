@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.48.0"
+#define CINDER_VERSION "0.49.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1571,6 +1571,85 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         }
         return 0;
     }
+    if (strcasecmp(cmd, "ZDIFF") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'zdiff' command"), 0;
+        long long numkeys;
+        if (!parse_ll(argv[1], &numkeys) || numkeys < 1)
+            return dbuf_error(reply, "at least 1 input key is needed for 'zdiff' command"), 0;
+        if (argc < 2 + numkeys)
+            return dbuf_error(reply, "wrong number of arguments for 'zdiff' command"), 0;
+        int withscores = 0;
+        if (argc == 3 + numkeys) {
+            if (strcasecmp(argv[2 + numkeys], "WITHSCORES") != 0)
+                return dbuf_error(reply, "syntax error"), 0;
+            withscores = 1;
+        } else if (argc > 3 + numkeys) {
+            return dbuf_error(reply, "syntax error"), 0;
+        }
+        /* The type of every input key is checked before any set
+           is read: a non-sorted-set key is a WRONGTYPE error, and
+           a missing key counts as an empty set, as in Redis. */
+        for (long long k = 0; k < numkeys; k++) {
+            int t = store_type(g_store, argv[2 + k]);
+            if (t != 0 && t != 5)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        }
+        /* Fetch the first set whole, in score order, then keep
+           the members no other input set holds. A member is
+           tested with store_zscore, which answers 0 for a missing
+           key, so the missing-key case needs no special casing. */
+        char **members = NULL;
+        double *scores = NULL;
+        size_t n = 0;
+        int rc = store_zrange(g_store, argv[2], 0, -1, 0,
+                              &members, &scores, &n);
+        if (rc == -1)
+            /* Unreachable: the type check above already rejected
+               non-sorted-set keys, and the loop is single-threaded. */
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        char *keep = calloc(n ? n : 1, 1);
+        if (!keep) {
+            for (size_t i = 0; i < n; i++) free(members[i]);
+            free(members);
+            free(scores);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        long long kept = 0;
+        for (size_t i = 0; i < n; i++) {
+            int in_other = 0;
+            for (long long k = 1; k < numkeys && !in_other; k++) {
+                double s;
+                if (store_zscore(g_store, argv[2 + k], members[i], &s) == 1)
+                    in_other = 1;
+            }
+            if (!in_other) {
+                keep[i] = 1;
+                kept++;
+            }
+        }
+        dbuf_array_header(reply, withscores ? kept * 2 : kept);
+        for (size_t i = 0; i < n; i++) {
+            if (!keep[i]) {
+                free(members[i]);
+                continue;
+            }
+            dbuf_bulk(reply, members[i], strlen(members[i]));
+            if (withscores) {
+                char buf[32];
+                format_score(buf, sizeof(buf), scores[i]);
+                dbuf_bulk(reply, buf, strlen(buf));
+            }
+            free(members[i]);
+        }
+        free(keep);
+        free(members);
+        free(scores);
+        /* A read, so it is not logged to the AOF, not replicated,
+           and does not invalidate WATCH. */
+        return 0;
+    }
     if (strcasecmp(cmd, "ZCARD") == 0) {
         if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'zcard' command"), 0;
         long long n = store_zcard(g_store, argv[1]);
@@ -2110,7 +2189,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",
-            "ZADD", "ZSCORE", "ZMSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
+            "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",
             "ZRANK", "ZREVRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",
