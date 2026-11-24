@@ -1212,6 +1212,77 @@ def main():
         check("ZREVRANGEBYSCORE wrongtype",
               c.cmd("ZREVRANGEBYSCORE", "after", "10", "0"), wrongtype)
         check("COMMAND lists ZREVRANGEBYSCORE", "ZREVRANGEBYSCORE" in c.cmd("COMMAND"), True)
+        # Lexicographic ranges. myzset holds c=0.5, d=1.5, a=5, b=5
+        # here, so score order (c, d, a, b) and member order (a, b,
+        # c, d) differ — a lex range must follow member order.
+        check("ZRANGEBYLEX all", c.cmd("ZRANGEBYLEX", "myzset", "-", "+"),
+              ["a", "b", "c", "d"])
+        check("ZRANGEBYLEX slice", c.cmd("ZRANGEBYLEX", "myzset", "[a", "[c"),
+              ["a", "b", "c"])
+        check("ZRANGEBYLEX excl min", c.cmd("ZRANGEBYLEX", "myzset", "(a", "[c"),
+              ["b", "c"])
+        check("ZRANGEBYLEX excl max", c.cmd("ZRANGEBYLEX", "myzset", "[a", "(c"),
+              ["a", "b"])
+        check("ZRANGEBYLEX excl both", c.cmd("ZRANGEBYLEX", "myzset", "(a", "(d"),
+              ["b", "c"])
+        check("ZRANGEBYLEX from start", c.cmd("ZRANGEBYLEX", "myzset", "-", "[b"),
+              ["a", "b"])
+        check("ZRANGEBYLEX to end", c.cmd("ZRANGEBYLEX", "myzset", "[c", "+"),
+              ["c", "d"])
+        check("ZRANGEBYLEX rev all", c.cmd("ZRANGEBYLEX", "myzset", "+", "-",
+                                           "REV"), ["d", "c", "b", "a"])
+        check("ZRANGEBYLEX rev slice", c.cmd("ZRANGEBYLEX", "myzset", "[c", "[a",
+                                             "REV"), ["c", "b", "a"])
+        check("ZRANGEBYLEX rev excl", c.cmd("ZRANGEBYLEX", "myzset", "+", "(b",
+                                            "REV"), ["d", "c"])
+        check("ZRANGEBYLEX limit", c.cmd("ZRANGEBYLEX", "myzset", "-", "+",
+                                         "LIMIT", "1", "2"), ["b", "c"])
+        check("ZRANGEBYLEX limit all", c.cmd("ZRANGEBYLEX", "myzset", "-", "+",
+                                             "LIMIT", "0", "-1"),
+              ["a", "b", "c", "d"])
+        check("ZRANGEBYLEX limit past end", c.cmd("ZRANGEBYLEX", "myzset", "-",
+                                                  "+", "LIMIT", "10", "5"), [])
+        check("ZRANGEBYLEX limit rev", c.cmd("ZRANGEBYLEX", "myzset", "+", "-",
+                                             "LIMIT", "1", "2", "REV"),
+              ["c", "b"])
+        check("ZRANGEBYLEX rev before limit",
+              c.cmd("ZRANGEBYLEX", "myzset", "+", "-", "REV", "LIMIT", "1", "2"),
+              ["c", "b"])
+        check("ZRANGEBYLEX min above max",
+              c.cmd("ZRANGEBYLEX", "myzset", "[d", "[a"), [])
+        check("ZRANGEBYLEX empty slice",
+              c.cmd("ZRANGEBYLEX", "myzset", "[x", "[z"), [])
+        check("ZRANGEBYLEX missing",
+              c.cmd("ZRANGEBYLEX", "ghostzset", "-", "+"), [])
+        check("ZRANGEBYLEX wrong args", c.cmd("ZRANGEBYLEX", "myzset", "[a"),
+              ("error", "ERR wrong number of arguments for 'zrangebylex' command"))
+        check("ZRANGEBYLEX bare bound", c.cmd("ZRANGEBYLEX", "myzset", "a", "[z"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYLEX plus as min", c.cmd("ZRANGEBYLEX", "myzset", "+", "[z"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYLEX minus as max", c.cmd("ZRANGEBYLEX", "myzset", "[a", "-"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYLEX empty bracket", c.cmd("ZRANGEBYLEX", "myzset", "[", "+"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYLEX bad option", c.cmd("ZRANGEBYLEX", "myzset", "-", "+",
+                                              "WITHSCORES"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYLEX limit missing count",
+              c.cmd("ZRANGEBYLEX", "myzset", "-", "+", "LIMIT", "1"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYLEX limit negative offset",
+              c.cmd("ZRANGEBYLEX", "myzset", "-", "+", "LIMIT", "-1", "5"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYLEX duplicate limit",
+              c.cmd("ZRANGEBYLEX", "myzset", "-", "+", "LIMIT", "0", "1",
+                    "LIMIT", "0", "1"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYLEX duplicate rev",
+              c.cmd("ZRANGEBYLEX", "myzset", "-", "+", "REV", "REV"),
+              ("error", "ERR syntax error"))
+        check("ZRANGEBYLEX wrongtype", c.cmd("ZRANGEBYLEX", "after", "-", "+"),
+              wrongtype)
+        check("COMMAND lists ZRANGEBYLEX", "ZRANGEBYLEX" in c.cmd("COMMAND"), True)
         check("ZREM one", c.cmd("ZREM", "myzset", "b"), 1)
         check("ZCARD after ZREM", c.cmd("ZCARD", "myzset"), 3)
         check("ZRANK removed member", c.cmd("ZRANK", "myzset", "b"), None)

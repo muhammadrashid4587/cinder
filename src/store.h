@@ -472,6 +472,22 @@ int store_zrangebyscore(Store *s, const char *key, double min, int min_excl,
                         long long count, int reverse,
                         char ***members_out, double **scores_out,
                         size_t *n_out);
+/* Members whose names fall in [min, max] lexicographically, in
+   member order, or reverse member order when reverse is set. A NULL
+   min means -inf, a NULL max means +inf; an endpoint is excluded
+   when its flag is set. `offset` matches are skipped and at most
+   `count` are returned (`count < 0` means all). The skip list is
+   ordered by (score, member), so a lex range cannot walk it in
+   order: the matching members are collected with a level-0 scan
+   and sorted by member, which is fine at the scale this store
+   targets. Returns 0 on success (*n_out is 0 for a missing key or
+   an empty range, including min > max), -1 = wrong type,
+   -2 = out of memory. *members_out is a malloc'd array of
+   malloc'd strings; the caller frees both. */
+int store_zrangebylex(Store *s, const char *key, const char *min, int min_excl,
+                      const char *max, int max_excl, long long offset,
+                      long long count, int reverse,
+                      char ***members_out, size_t *n_out);
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing

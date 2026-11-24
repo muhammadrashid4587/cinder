@@ -3018,6 +3018,101 @@ int store_zrangebyscore(Store *s, const char *key, double min, int min_excl,
     return 0;
 }
 
+/* qsort comparator for member-name strings. */
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* Members whose names fall in [min, max] lexicographically, in
+   member order, or reverse member order when reverse is set. A NULL
+   min means -inf, a NULL max means +inf; an endpoint is excluded
+   when its flag is set. Skips `offset` matches and returns at most
+   `count` (`count < 0` means all). The skip list is ordered by
+   (score, member), so a lex range cannot walk it in member order:
+   the matches are collected with a level-0 scan and sorted by
+   member, which is fine at the scale this store targets; a finite
+   min above a finite max matches nothing, as with ZRANGEBYSCORE's
+   reversed bounds. */
+int store_zrangebylex(Store *s, const char *key, const char *min, int min_excl,
+                      const char *max, int max_excl, long long offset,
+                      long long count, int reverse,
+                      char ***members_out, size_t *n_out) {
+    *members_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    e->last_access = ++s->clock;
+    ZSet *z = e->zset;
+    if (min && max && strcmp(min, max) > 0) return 0;
+    char **members = NULL;
+    size_t n = 0, cap = 0;
+    for (zslNode *node = z->sl->header->level[0].forward; node;
+         node = node->level[0].forward) {
+        const char *m = node->member;
+        if (min) {
+            int c = strcmp(m, min);
+            if (c < 0 || (c == 0 && min_excl)) continue;
+        }
+        if (max) {
+            int c = strcmp(m, max);
+            if (c > 0 || (c == 0 && max_excl)) continue;
+        }
+        if (n + 1 > cap) {
+            size_t ncap = cap ? cap * 2 : 16;
+            char **nm = realloc(members, ncap * sizeof(char *));
+            if (!nm) {
+                for (size_t j = 0; j < n; j++) free(members[j]);
+                free(members);
+                return -2;
+            }
+            members = nm;
+            cap = ncap;
+        }
+        members[n] = strdup(m);
+        if (!members[n]) {
+            for (size_t j = 0; j < n; j++) free(members[j]);
+            free(members);
+            return -2;
+        }
+        n++;
+    }
+    if (n == 0) {
+        free(members);
+        return 0;
+    }
+    qsort(members, n, sizeof(char *), cmp_str);
+    if (reverse) {
+        /* Reverse the whole sorted slice first, so LIMIT applies
+           to the reversed order, as in Redis. */
+        for (size_t i = 0, j = n - 1; i < j; i++, j--) {
+            char *tmp = members[i];
+            members[i] = members[j];
+            members[j] = tmp;
+        }
+    }
+    if ((long long)n <= offset) {
+        for (size_t j = 0; j < n; j++) free(members[j]);
+        free(members);
+        return 0;
+    }
+    size_t avail = n - (size_t)offset;
+    size_t out_n = count < 0 || (long long)avail <= count ? avail
+                                                          : (size_t)count;
+    if (out_n == 0) {
+        for (size_t j = 0; j < n; j++) free(members[j]);
+        free(members);
+        return 0;
+    }
+    /* Drop everything outside [offset, offset + out_n). */
+    for (size_t j = 0; j < (size_t)offset; j++) free(members[j]);
+    for (size_t j = (size_t)offset + out_n; j < n; j++) free(members[j]);
+    memmove(members, members + offset, out_n * sizeof(char *));
+    *members_out = members;
+    *n_out = out_n;
+    return 0;
+}
+
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing

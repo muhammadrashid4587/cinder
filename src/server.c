@@ -273,6 +273,26 @@ static int parse_score_bound(const char *s, double *out, int *excl) {
     return parse_double(s, out);
 }
 
+/* Parse a lex bound for ZRANGEBYLEX: "-" is -inf, "+" is +inf,
+   otherwise a leading '[' (inclusive) or '(' (exclusive) followed
+   by a non-empty member name. Returns 0 = bad syntax, 1 = "-",
+   2 = "+", 3 = finite bound, in which case *bound is the member
+   name (past the bracket) and *excl whether it is exclusive. */
+static int parse_lex_bound(const char *s, const char **bound, int *excl) {
+    *bound = NULL;
+    *excl = 0;
+    if (!s || !*s) return 0;
+    if (strcmp(s, "-") == 0) return 1;
+    if (strcmp(s, "+") == 0) return 2;
+    if (s[0] == '[' || s[0] == '(') {
+        if (!s[1]) return 0;
+        *excl = s[0] == '(';
+        *bound = s + 1;
+        return 3;
+    }
+    return 0;
+}
+
 /* Format a score the way Redis does: %.17g round-trips a double
    exactly, and prints integral scores without a decimal point
    ("2", not "2.0"). */
@@ -1636,6 +1656,65 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(scores);
         return 0;
     }
+    if (strcasecmp(cmd, "ZRANGEBYLEX") == 0) {
+        if (argc < 4)
+            return dbuf_error(reply, "wrong number of arguments for 'zrangebylex' command"), 0;
+        /* Bounds are min first, or max first with REV, as in Redis:
+           "-" is -inf (min only), "+" is +inf (max only), "[x" is
+           inclusive and "(x" exclusive. A bare member or the wrong
+           infinity is a syntax error. REV may come before or after
+           LIMIT, so scan for it first — a LIMIT argument that
+           happens to read "REV" still fails LIMIT parsing below,
+           so the reply stays a syntax error either way. */
+        int rev = 0;
+        for (int i = 4; i < argc; i++)
+            if (strcasecmp(argv[i], "REV") == 0) rev = 1;
+        const char *lo = rev ? argv[3] : argv[2];
+        const char *hi = rev ? argv[2] : argv[3];
+        const char *lo_bound = NULL, *hi_bound = NULL;
+        int min_excl = 0, max_excl = 0;
+        int lo_kind = parse_lex_bound(lo, &lo_bound, &min_excl);
+        int hi_kind = parse_lex_bound(hi, &hi_bound, &max_excl);
+        if (lo_kind == 0 || hi_kind == 0 || lo_kind == 2 || hi_kind == 1)
+            return dbuf_error(reply, "syntax error"), 0;
+        const char *min = lo_kind == 3 ? lo_bound : NULL;
+        const char *max = hi_kind == 3 ? hi_bound : NULL;
+        int have_limit = 0, seen_rev = 0;
+        long long offset = 0, count = -1;
+        for (int i = 4; i < argc; i++) {
+            if (strcasecmp(argv[i], "REV") == 0) {
+                if (seen_rev)
+                    return dbuf_error(reply, "syntax error"), 0;
+                seen_rev = 1;
+            } else if (strcasecmp(argv[i], "LIMIT") == 0) {
+                if (i + 2 >= argc || have_limit)
+                    return dbuf_error(reply, "syntax error"), 0;
+                if (!parse_ll(argv[i + 1], &offset) ||
+                    !parse_ll(argv[i + 2], &count) || offset < 0)
+                    return dbuf_error(reply, "syntax error"), 0;
+                have_limit = 1;
+                i += 2;
+            } else {
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        }
+        char **members = NULL;
+        size_t n = 0;
+        int rc = store_zrangebylex(g_store, argv[1], min, min_excl,
+                                   max, max_excl, offset, count, rev,
+                                   &members, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_array_header(reply, (long long)n);
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, members[i], strlen(members[i]));
+            free(members[i]);
+        }
+        free(members);
+        return 0;
+    }
     if (strcasecmp(cmd, "ZREM") == 0) {
         if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'zrem' command"), 0;
         long long removed = 0;
@@ -1926,7 +2005,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
-            "ZREVRANGEBYSCORE", "ZREM",
+            "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZREM",
             "ZRANK", "ZREVRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",
             "KEYS", "SCAN", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
