@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.34.0"
+#define CINDER_VERSION "0.35.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2285,6 +2285,25 @@ static void emit_resp_cmd(Dbuf *out, char **argv, int argc) {
 /* One entry of the full sync: the commands that rebuild this key on
    the replica. Strings carry their remaining TTL as PX; other types
    get a PEXPIRE after the rebuild. */
+
+/* One member of a sorted set being emitted as a ZADD pair: the
+   score string and the member are borrowed into the argv array,
+   which the caller keeps alive for the emit. */
+struct zadd_emit_ctx {
+    char **av;
+    char (*scores)[32];
+    size_t i;
+};
+
+static int emit_zadd_member(const char *member, double score, void *arg) {
+    struct zadd_emit_ctx *ctx = arg;
+    format_score(ctx->scores[ctx->i], sizeof(ctx->scores[ctx->i]), score);
+    ctx->av[2 + 2 * ctx->i] = ctx->scores[ctx->i];
+    ctx->av[3 + 2 * ctx->i] = (char *)member;
+    ctx->i++;
+    return 0;
+}
+
 static int sync_emit_entry(const Entry *e, void *arg) {
     Dbuf *out = arg;
     long long ttl = e->expire_at > 0 ? e->expire_at - now_ms() : -1;
@@ -2381,9 +2400,10 @@ static int sync_emit_entry(const Entry *e, void *arg) {
         ZSet *z = e->zset;
         if (z->len == 0) return 0;
         /* One ZADD carrying every member; scores are %.17g strings,
-           which parse back to the exact same doubles. The array is
-           already sorted by (score, member), but order does not
-           matter for the rebuild — ZADD re-sorts on the replica. */
+           which parse back to the exact same doubles. The skip
+           list hands members over in (score, member) order, but
+           order does not matter for the rebuild — ZADD re-sorts
+           on the replica. */
         char **av = malloc((2 + 2 * z->len) * sizeof(char *));
         char (*scores)[32] = malloc(z->len * sizeof(*scores));
         if (!av || !scores) {
@@ -2393,11 +2413,8 @@ static int sync_emit_entry(const Entry *e, void *arg) {
         }
         av[0] = "ZADD";
         av[1] = (char *)e->key;
-        for (size_t i = 0; i < z->len; i++) {
-            format_score(scores[i], sizeof(scores[i]), z->scores[i]);
-            av[2 + 2 * i] = scores[i];
-            av[3 + 2 * i] = z->members[i];
-        }
+        struct zadd_emit_ctx emit_ctx = {av, scores, 0};
+        zset_foreach(z, emit_zadd_member, &emit_ctx);
         emit_resp_cmd(out, av, 2 + (int)(2 * z->len));
         free(av);
         free(scores);

@@ -70,12 +70,339 @@ static void hash_free(Hash *h) {
     free(h);
 }
 
+/* ---------- sorted sets: skip list + member dict ---------- */
+
+/* A skip list orders the set by (score, member) — score ascending,
+   then member lexicographically, as in Redis — so insert, delete,
+   rank and range-by-index are O(log n). A hash table maps each
+   member to its skip-list node, so member lookup is O(1). The old
+   sorted array did all of these with linear scans and memmoves. */
+
+#define ZSL_MAXLEVEL 32
+#define ZSL_P 0.25
+
+typedef struct zslLevel {
+    struct zslNode *forward;
+    unsigned long span;
+} zslLevel;
+
+typedef struct zslNode {
+    char *member; /* owned by the node */
+    double score;
+    struct zslNode *backward;
+    zslLevel level[]; /* sized to the node's level */
+} zslNode;
+
+typedef struct zsl {
+    zslNode *header;
+    zslNode *tail;
+    unsigned long length;
+    int level;
+} zsl;
+
+typedef struct zdictEntry {
+    zslNode *node; /* the key is node->member */
+    struct zdictEntry *next;
+} zdictEntry;
+
+typedef struct zdict {
+    zdictEntry **buckets;
+    size_t cap;
+    size_t count;
+} zdict;
+
+/* Ordering: score ascending, then member lexicographically. */
+static int zset_cmp(double s1, const char *m1, double s2, const char *m2) {
+    if (s1 < s2) return -1;
+    if (s1 > s2) return 1;
+    return strcmp(m1, m2);
+}
+
+static int zsl_random_level(void) {
+    int level = 1;
+    while ((double)rand() / (double)RAND_MAX < ZSL_P &&
+           level < ZSL_MAXLEVEL)
+        level++;
+    return level;
+}
+
+static zslNode *zsl_create_node(int level, double score,
+                                const char *member) {
+    zslNode *n = malloc(sizeof(*n) + (size_t)level * sizeof(zslLevel));
+    if (!n) return NULL;
+    n->member = strdup(member);
+    if (!n->member) {
+        free(n);
+        return NULL;
+    }
+    n->score = score;
+    n->backward = NULL;
+    return n;
+}
+
+static zsl *zsl_create(void) {
+    zsl *sl = malloc(sizeof(*sl));
+    if (!sl) return NULL;
+    sl->level = 1;
+    sl->length = 0;
+    sl->header = zsl_create_node(ZSL_MAXLEVEL, 0, "");
+    if (!sl->header) {
+        free(sl);
+        return NULL;
+    }
+    for (int i = 0; i < ZSL_MAXLEVEL; i++) {
+        sl->header->level[i].forward = NULL;
+        sl->header->level[i].span = 0;
+    }
+    sl->header->backward = NULL;
+    sl->tail = NULL;
+    return sl;
+}
+
+static void zsl_free(zsl *sl) {
+    if (!sl) return;
+    zslNode *n = sl->header->level[0].forward;
+    free(sl->header->member);
+    free(sl->header);
+    while (n) {
+        zslNode *next = n->level[0].forward;
+        free(n->member);
+        free(n);
+        n = next;
+    }
+    free(sl);
+}
+
+/* Insert a new node. The (score, member) pair must not already be
+   in the list. Returns the node, or NULL on OOM. */
+static zslNode *zsl_insert(zsl *sl, double score, const char *member) {
+    zslNode *update[ZSL_MAXLEVEL];
+    unsigned long rank[ZSL_MAXLEVEL];
+    zslNode *x = sl->header;
+    for (int i = sl->level - 1; i >= 0; i--) {
+        rank[i] = i == sl->level - 1 ? 0 : rank[i + 1];
+        while (x->level[i].forward &&
+               zset_cmp(x->level[i].forward->score,
+                        x->level[i].forward->member, score, member) < 0) {
+            rank[i] += x->level[i].span;
+            x = x->level[i].forward;
+        }
+        update[i] = x;
+    }
+    int level = zsl_random_level();
+    if (level > sl->level) {
+        for (int i = sl->level; i < level; i++) {
+            rank[i] = 0;
+            update[i] = sl->header;
+            sl->header->level[i].span = sl->length;
+        }
+        sl->level = level;
+    }
+    zslNode *n = zsl_create_node(level, score, member);
+    if (!n) return NULL;
+    for (int i = 0; i < level; i++) {
+        n->level[i].forward = update[i]->level[i].forward;
+        update[i]->level[i].forward = n;
+        n->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]);
+        update[i]->level[i].span = (rank[0] - rank[i]) + 1;
+    }
+    for (int i = level; i < sl->level; i++)
+        update[i]->level[i].span++;
+    n->backward = update[0] == sl->header ? NULL : update[0];
+    if (n->level[0].forward)
+        n->level[0].forward->backward = n;
+    else
+        sl->tail = n;
+    sl->length++;
+    return n;
+}
+
+/* Unlink the node for (score, member) and return it detached — the
+   caller frees the node and its member string — or NULL when the
+   pair is not in the list. */
+static zslNode *zsl_delete(zsl *sl, double score, const char *member) {
+    zslNode *update[ZSL_MAXLEVEL];
+    zslNode *x = sl->header;
+    for (int i = sl->level - 1; i >= 0; i--) {
+        while (x->level[i].forward &&
+               zset_cmp(x->level[i].forward->score,
+                        x->level[i].forward->member, score, member) < 0)
+            x = x->level[i].forward;
+        update[i] = x;
+    }
+    x = x->level[0].forward;
+    if (!x || x->score != score || strcmp(x->member, member) != 0)
+        return NULL;
+    for (int i = 0; i < sl->level; i++) {
+        if (update[i]->level[i].forward == x) {
+            update[i]->level[i].span += x->level[i].span - 1;
+            update[i]->level[i].forward = x->level[i].forward;
+        } else {
+            update[i]->level[i].span -= 1;
+        }
+    }
+    if (x->level[0].forward)
+        x->level[0].forward->backward = x->backward;
+    else
+        sl->tail = x->backward;
+    while (sl->level > 1 &&
+           sl->header->level[sl->level - 1].forward == NULL)
+        sl->level--;
+    sl->length--;
+    return x;
+}
+
+/* 1-based rank of (score, member), or 0 when it is not in the list. */
+static unsigned long zsl_get_rank(zsl *sl, double score,
+                                  const char *member) {
+    unsigned long rank = 0;
+    zslNode *x = sl->header;
+    for (int i = sl->level - 1; i >= 0; i--) {
+        while (x->level[i].forward &&
+               zset_cmp(x->level[i].forward->score,
+                        x->level[i].forward->member, score, member) <= 0) {
+            rank += x->level[i].span;
+            x = x->level[i].forward;
+        }
+        /* The header's member is "" with score 0, so it must not
+           match a real member of the same name and score. */
+        if (x != sl->header && x->score == score &&
+            strcmp(x->member, member) == 0)
+            return rank;
+    }
+    return 0;
+}
+
+/* The node at 1-based rank, or NULL when rank is out of range. */
+static zslNode *zsl_get_by_rank(zsl *sl, unsigned long rank) {
+    if (rank == 0 || rank > sl->length) return NULL;
+    unsigned long traversed = 0;
+    zslNode *x = sl->header;
+    for (int i = sl->level - 1; i >= 0; i--) {
+        while (x->level[i].forward &&
+               traversed + x->level[i].span <= rank) {
+            traversed += x->level[i].span;
+            x = x->level[i].forward;
+        }
+        if (traversed == rank) return x;
+    }
+    return NULL;
+}
+
+/* First node whose score lies in the range: score >= min (or
+   > min when min_excl), and score <= max (or < max when max_excl).
+   Returns NULL when no node matches. The caller must have checked
+   min <= max. */
+static zslNode *zsl_first_in_range(zsl *sl, double min, int min_excl,
+                                   double max, int max_excl) {
+    zslNode *x = sl->header;
+    for (int i = sl->level - 1; i >= 0; i--) {
+        while (x->level[i].forward &&
+               (min_excl ? x->level[i].forward->score <= min
+                         : x->level[i].forward->score < min))
+            x = x->level[i].forward;
+    }
+    x = x->level[0].forward;
+    if (!x) return NULL;
+    if (max_excl ? x->score >= max : x->score > max) return NULL;
+    return x;
+}
+
+#define ZDICT_INIT_CAP 16
+
+static zdict *zdict_new(void) {
+    zdict *d = calloc(1, sizeof(zdict));
+    if (!d) return NULL;
+    d->cap = ZDICT_INIT_CAP;
+    d->buckets = calloc(d->cap, sizeof(zdictEntry *));
+    if (!d->buckets) {
+        free(d);
+        return NULL;
+    }
+    return d;
+}
+
+static void zdict_free(zdict *d) {
+    if (!d) return;
+    for (size_t i = 0; i < d->cap; i++) {
+        zdictEntry *en = d->buckets[i];
+        while (en) {
+            zdictEntry *next = en->next;
+            free(en);
+            en = next;
+        }
+    }
+    free(d->buckets);
+    free(d);
+}
+
+static zslNode *zdict_find(zdict *d, const char *member) {
+    size_t idx = hash_key(member) % d->cap;
+    for (zdictEntry *en = d->buckets[idx]; en; en = en->next)
+        if (strcmp(en->node->member, member) == 0) return en->node;
+    return NULL;
+}
+
+static int zdict_grow(zdict *d) {
+    size_t ncap = d->cap * 2;
+    zdictEntry **nb = calloc(ncap, sizeof(zdictEntry *));
+    if (!nb) return 0;
+    for (size_t i = 0; i < d->cap; i++) {
+        zdictEntry *en = d->buckets[i];
+        while (en) {
+            zdictEntry *next = en->next;
+            size_t idx = hash_key(en->node->member) % ncap;
+            en->next = nb[idx];
+            nb[idx] = en;
+            en = next;
+        }
+    }
+    free(d->buckets);
+    d->buckets = nb;
+    d->cap = ncap;
+    return 1;
+}
+
+/* Point the member's dict entry at node, adding the entry when the
+   member is new. Returns 0 on OOM; replacing an existing entry
+   cannot fail. */
+static int zdict_set(zdict *d, zslNode *node) {
+    size_t idx = hash_key(node->member) % d->cap;
+    for (zdictEntry *en = d->buckets[idx]; en; en = en->next)
+        if (strcmp(en->node->member, node->member) == 0) {
+            en->node = node;
+            return 1;
+        }
+    if (d->count + 1 > d->cap * 3 / 4 && !zdict_grow(d)) return 0;
+    idx = hash_key(node->member) % d->cap;
+    zdictEntry *en = malloc(sizeof(zdictEntry));
+    if (!en) return 0;
+    en->node = node;
+    en->next = d->buckets[idx];
+    d->buckets[idx] = en;
+    d->count++;
+    return 1;
+}
+
+static void zdict_remove(zdict *d, const char *member) {
+    size_t idx = hash_key(member) % d->cap;
+    zdictEntry **pp = &d->buckets[idx];
+    while (*pp) {
+        if (strcmp((*pp)->node->member, member) == 0) {
+            zdictEntry *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            d->count--;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
 static void zset_free(ZSet *z) {
     if (!z) return;
-    for (size_t i = 0; i < z->len; i++)
-        free(z->members[i]);
-    free(z->members);
-    free(z->scores);
+    zdict_free(z->dict);
+    zsl_free(z->sl);
     free(z);
 }
 
@@ -92,112 +419,77 @@ static void entry_free(Entry *e) {
 static ZSet *zset_new(void) {
     ZSet *z = calloc(1, sizeof(ZSet));
     if (!z) return NULL;
-    z->cap = 8;
-    z->members = calloc(z->cap, sizeof(char *));
-    z->scores = calloc(z->cap, sizeof(double));
-    if (!z->members || !z->scores) {
+    z->sl = zsl_create();
+    z->dict = zdict_new();
+    if (!z->sl || !z->dict) {
         zset_free(z);
         return NULL;
     }
     return z;
 }
 
-/* Index of member, or -1 when absent. Linear scan, like the set type. */
-static long long zset_find(ZSet *z, const char *member) {
-    for (size_t i = 0; i < z->len; i++)
-        if (strcmp(z->members[i], member) == 0) return (long long)i;
-    return -1;
-}
-
-/* Ordering: score ascending, then member lexicographically. */
-static int zset_cmp(double s1, const char *m1, double s2, const char *m2) {
-    if (s1 < s2) return -1;
-    if (s1 > s2) return 1;
-    return strcmp(m1, m2);
-}
-
-/* Grow the arrays when full. Returns 0 on OOM. Each realloc result
-   is stored as soon as it succeeds: if the second realloc fails,
-   the first array is already grown (its capacity is larger than
-   cap records, which is harmless — the next grow just happens no
-   sooner than it would have) and no pointer is left dangling. */
-static int zset_grow(ZSet *z) {
-    size_t ncap = z->cap * 2;
-    double *ns = realloc(z->scores, ncap * sizeof(double));
-    if (!ns) return 0;
-    z->scores = ns;
-    char **nm = realloc(z->members, ncap * sizeof(char *));
-    if (!nm) return 0;
-    z->members = nm;
-    z->cap = ncap;
-    return 1;
-}
-
-/* Insert member with score at its sorted position (the member must
-   not already be present). Returns 1 added, -1 = OOM. */
-static int zset_insert(ZSet *z, const char *member, double score) {
-    char *m = strdup(member);
-    if (!m) return -1;
-    if (z->len == z->cap && !zset_grow(z)) {
-        free(m);
-        return -1;
-    }
-    size_t pos = 0;
-    while (pos < z->len &&
-           zset_cmp(z->scores[pos], z->members[pos], score, member) < 0)
-        pos++;
-    memmove(&z->members[pos + 1], &z->members[pos],
-            (z->len - pos) * sizeof(char *));
-    memmove(&z->scores[pos + 1], &z->scores[pos],
-            (z->len - pos) * sizeof(double));
-    z->members[pos] = m;
-    z->scores[pos] = score;
-    z->len++;
-    return 1;
+/* The node for member, or NULL when absent. O(1) via the dict. */
+static zslNode *zset_find(ZSet *z, const char *member) {
+    return zdict_find(z->dict, member);
 }
 
 /* Set member to score. Returns 1 new, 0 updated (score changed),
    2 no-op (member already had exactly that score), -1 = OOM. */
 static int zset_put(ZSet *z, const char *member, double score) {
-    long long idx = zset_find(z, member);
-    if (idx < 0) return zset_insert(z, member, score);
-    if (z->scores[idx] == score) return 2;
-    /* A changed score can move the member: pull it out and reinsert
-       at its new sorted position. No grow is needed — the slot just
-       freed leaves room. */
-    char *m = z->members[idx];
-    memmove(&z->members[idx], &z->members[idx + 1],
-            (z->len - (size_t)idx - 1) * sizeof(char *));
-    memmove(&z->scores[idx], &z->scores[idx + 1],
-            (z->len - (size_t)idx - 1) * sizeof(double));
-    z->len--;
-    z->members[z->len] = NULL;
-    size_t pos = 0;
-    while (pos < z->len &&
-           zset_cmp(z->scores[pos], z->members[pos], score, m) < 0)
-        pos++;
-    memmove(&z->members[pos + 1], &z->members[pos],
-            (z->len - pos) * sizeof(char *));
-    memmove(&z->scores[pos + 1], &z->scores[pos],
-            (z->len - pos) * sizeof(double));
-    z->members[pos] = m;
-    z->scores[pos] = score;
-    z->len++;
+    zslNode *node = zset_find(z, member);
+    if (!node) {
+        zslNode *n = zsl_insert(z->sl, score, member);
+        if (!n) return -1;
+        if (!zdict_set(z->dict, n)) {
+            zslNode *gone = zsl_delete(z->sl, score, member);
+            if (gone) {
+                free(gone->member);
+                free(gone);
+            }
+            return -1;
+        }
+        z->len++;
+        return 1;
+    }
+    if (node->score == score) return 2;
+    /* A changed score can move the member: insert at the new
+       position first, then drop the old node, so an OOM on the
+       insert leaves the set untouched. */
+    zslNode *n = zsl_insert(z->sl, score, member);
+    if (!n) return -1;
+    zslNode *old = zsl_delete(z->sl, node->score, member);
+    zdict_set(z->dict, n);
+    if (old) {
+        free(old->member);
+        free(old);
+    }
     return 0;
 }
 
 /* Remove a member. Returns 1 removed, 0 when the member was absent. */
 static int zset_remove(ZSet *z, const char *member) {
-    long long idx = zset_find(z, member);
-    if (idx < 0) return 0;
-    free(z->members[idx]);
-    memmove(&z->members[idx], &z->members[idx + 1],
-            (z->len - (size_t)idx - 1) * sizeof(char *));
-    memmove(&z->scores[idx], &z->scores[idx + 1],
-            (z->len - (size_t)idx - 1) * sizeof(double));
+    zslNode *node = zset_find(z, member);
+    if (!node) return 0;
+    zdict_remove(z->dict, member);
+    zslNode *gone = zsl_delete(z->sl, node->score, member);
+    if (gone) {
+        free(gone->member);
+        free(gone);
+    }
     z->len--;
-    z->members[z->len] = NULL;
     return 1;
+}
+
+/* Visit every member in (score, member) order: level 0 of the skip
+   list is the set in order. */
+int zset_foreach(const ZSet *z, zset_foreach_fn fn, void *arg) {
+    if (!z || !z->sl) return -1;
+    for (zslNode *n = z->sl->header->level[0].forward; n;
+         n = n->level[0].forward) {
+        int rc = fn(n->member, n->score, arg);
+        if (rc) return rc;
+    }
+    return 0;
 }
 
 static Hash *hash_new(void) {
@@ -1986,9 +2278,9 @@ int store_zscore(Store *s, const char *key, const char *member,
     if (!e) return 0;
     if (e->type != ENTRY_ZSET) return -1;
     e->last_access = ++s->clock;
-    long long idx = zset_find(e->zset, member);
-    if (idx < 0) return 0;
-    *out = e->zset->scores[idx];
+    zslNode *node = zset_find(e->zset, member);
+    if (!node) return 0;
+    *out = node->score;
     return 1;
 }
 
@@ -2027,9 +2319,13 @@ int store_zrank(Store *s, const char *key, const char *member, int reverse,
     if (!e) return 0;
     if (e->type != ENTRY_ZSET) return -1;
     e->last_access = ++s->clock;
-    long long idx = zset_find(e->zset, member);
-    if (idx < 0) return 0;
-    *out = reverse ? (long long)e->zset->len - 1 - idx : idx;
+    zslNode *node = zset_find(e->zset, member);
+    if (!node) return 0;
+    /* zsl_get_rank is 1-based; a 0-based rank is one less, and the
+       reversed rank counts down from the top. */
+    long long rank = (long long)zsl_get_rank(e->zset->sl, node->score,
+                                            member);
+    *out = reverse ? (long long)e->zset->len - rank : rank - 1;
     return 1;
 }
 
@@ -2068,17 +2364,21 @@ int store_zrange(Store *s, const char *key, long long start, long long stop,
     for (size_t i = 0; i < n; i++) {
         /* Reversed ranges index into the reversed ordering, as in
            Redis: ZREVRANGE -2 -1 is the last two members of the
-           highest-first sequence, not the ascending slice reversed. */
-        long long idx = reverse ? len - 1 - start - (long long)i
-                                : start + (long long)i;
-        members[i] = strdup(z->members[idx]);
+           highest-first sequence, not the ascending slice reversed.
+           Ranks are 1-based, so the i-th element of the range is
+           rank start+i+1 ascending, or len-start-i descending. */
+        unsigned long rank = (unsigned long)(reverse
+            ? len - start - (long long)i
+            : start + (long long)i + 1);
+        zslNode *node = zsl_get_by_rank(z->sl, rank);
+        members[i] = strdup(node->member);
         if (!members[i]) {
             for (size_t j = 0; j < i; j++) free(members[j]);
             free(members);
             free(scores);
             return -2;
         }
-        scores[i] = z->scores[idx];
+        scores[i] = node->score;
     }
     *members_out = members;
     *scores_out = scores;
@@ -2089,8 +2389,8 @@ int store_zrange(Store *s, const char *key, long long start, long long stop,
 /* Members whose scores fall in [min, max], ascending by score, or
    descending when reverse is set, with an endpoint excluded when
    its flag is set. Skips `offset` matches and returns at most
-   `count` (`count < 0` means all). The array is already sorted by
-   (score, member), so one linear scan finds the matching slice; a
+   `count` (`count < 0` means all). The skip list finds the first
+   match in O(log n) and level 0 walks the matching slice; a
    reversed scan walks it from the top down. */
 int store_zrangebyscore(Store *s, const char *key, double min, int min_excl,
                         double max, int max_excl, long long offset,
@@ -2106,13 +2406,12 @@ int store_zrangebyscore(Store *s, const char *key, double min, int min_excl,
     e->last_access = ++s->clock;
     ZSet *z = e->zset;
     if (min > max) return 0;
+    zslNode *first = zsl_first_in_range(z->sl, min, min_excl, max, max_excl);
+    if (!first) return 0;
     /* Count the matches first so the result arrays are sized once. */
     size_t total = 0;
-    for (size_t i = 0; i < z->len; i++) {
-        double sc = z->scores[i];
-        if ((min_excl ? sc <= min : sc < min) ||
-            (max_excl ? sc >= max : sc > max))
-            continue;
+    for (zslNode *node = first; node; node = node->level[0].forward) {
+        if (max_excl ? node->score >= max : node->score > max) break;
         total++;
     }
     if ((long long)total <= offset) return 0;
@@ -2126,25 +2425,51 @@ int store_zrangebyscore(Store *s, const char *key, double min, int min_excl,
         return -2;
     }
     size_t seen = 0, out = 0;
-    for (size_t k = 0; k < z->len && out < n; k++) {
-        /* Reversed scans walk the sorted array from the top down, so
-           the highest scores (and, on a tie, the last member) come
+    zslNode *node;
+    if (reverse) {
+        /* Start at the last match and walk backwards, so the
+           highest scores (and, on a tie, the last member) come
            first, as in Redis. */
-        size_t i = reverse ? z->len - 1 - k : k;
-        double sc = z->scores[i];
-        if ((min_excl ? sc <= min : sc < min) ||
-            (max_excl ? sc >= max : sc > max))
-            continue;
-        if ((long long)seen++ < offset) continue;
-        members[out] = strdup(z->members[i]);
-        if (!members[out]) {
-            for (size_t j = 0; j < out; j++) free(members[j]);
-            free(members);
-            free(scores);
-            return -2;
+        node = first;
+        for (size_t i = 1; i < total; i++) node = node->level[0].forward;
+        while (node && out < n) {
+            /* Walking backwards the scores only fall, so stop
+               once the lower bound is passed. */
+            if (min_excl ? node->score <= min : node->score < min) break;
+            if ((long long)seen++ < offset) {
+                node = node->backward;
+                continue;
+            }
+            members[out] = strdup(node->member);
+            if (!members[out]) {
+                for (size_t j = 0; j < out; j++) free(members[j]);
+                free(members);
+                free(scores);
+                return -2;
+            }
+            scores[out] = node->score;
+            out++;
+            node = node->backward;
         }
-        scores[out] = sc;
-        out++;
+    } else {
+        node = first;
+        while (node && out < n) {
+            if (max_excl ? node->score >= max : node->score > max) break;
+            if ((long long)seen++ < offset) {
+                node = node->level[0].forward;
+                continue;
+            }
+            members[out] = strdup(node->member);
+            if (!members[out]) {
+                for (size_t j = 0; j < out; j++) free(members[j]);
+                free(members);
+                free(scores);
+                return -2;
+            }
+            scores[out] = node->score;
+            out++;
+            node = node->level[0].forward;
+        }
     }
     *members_out = members;
     *scores_out = scores;
@@ -2162,9 +2487,9 @@ int store_zincrby(Store *s, const char *key, const char *member,
     Entry *e = store_find(s, key, NULL);
     if (e) {
         if (e->type != ENTRY_ZSET) return -1;
-        long long idx = zset_find(e->zset, member);
-        if (idx >= 0) {
-            double cur = e->zset->scores[idx];
+        zslNode *node = zset_find(e->zset, member);
+        if (node) {
+            double cur = node->score;
             if (incr == 0) {
                 *out = cur;
                 return 2;
@@ -2233,33 +2558,34 @@ int store_zpop(Store *s, const char *key, long long count, int from_max,
         free(scores);
         return -2;
     }
-    size_t start = from_max ? z->len - n : 0;
+    /* Collect the members to pop first, so an OOM while copying
+       leaves the set untouched. Popping from the top returns the
+       highest score first, as in Redis; popping from the bottom
+       returns the lowest first. The cursor walks from the end
+       without removing anything yet. */
+    zslNode *cursor = from_max ? z->sl->tail
+                               : z->sl->header->level[0].forward;
     for (size_t i = 0; i < n; i++) {
-        /* Popping from the top returns the highest score first, as
-           in Redis; popping from the bottom returns the lowest
-           first. */
-        size_t src = from_max ? z->len - 1 - i : start + i;
-        members[i] = strdup(z->members[src]);
+        members[i] = strdup(cursor->member);
         if (!members[i]) {
             for (size_t j = 0; j < i; j++) free(members[j]);
             free(members);
             free(scores);
             return -2;
         }
-        scores[i] = z->scores[src];
+        scores[i] = cursor->score;
+        cursor = from_max ? cursor->backward : cursor->level[0].forward;
     }
-    /* Free the popped members, then close the gap: popping from the
-       low end shifts the survivors down, popping from the high end
-       just shortens the arrays. */
-    for (size_t i = 0; i < n; i++) free(z->members[start + i]);
-    if (!from_max) {
-        memmove(&z->members[0], &z->members[n],
-                (z->len - n) * sizeof(char *));
-        memmove(&z->scores[0], &z->scores[n],
-                (z->len - n) * sizeof(double));
+    /* The copies are safe in members[] now; remove the originals. */
+    for (size_t i = 0; i < n; i++) {
+        zdict_remove(z->dict, members[i]);
+        zslNode *gone = zsl_delete(z->sl, scores[i], members[i]);
+        if (gone) {
+            free(gone->member);
+            free(gone);
+        }
+        z->len--;
     }
-    z->len -= n;
-    z->members[z->len] = NULL;
     if (z->len == 0) {
         /* A sorted set emptied by popping is gone, as in Redis. */
         *pp = e->next;
@@ -2278,8 +2604,8 @@ int store_zpop(Store *s, const char *key, long long count, int from_max,
 /* `count` random members: count > 0 returns distinct members (at most
    the whole set), count < 0 returns -count members sampled with
    replacement, count == 0 returns none. Distinct sampling is a
-   partial Fisher-Yates shuffle over an index array, so no member
-   comes back twice and no retry loop is needed. */
+   partial Fisher-Yates shuffle over an array of 1-based ranks, so
+   no member comes back twice and no retry loop is needed. */
 int store_zrandmember(Store *s, const char *key, long long count,
                       char ***members_out, double **scores_out,
                       size_t *n_out) {
@@ -2312,15 +2638,18 @@ int store_zrandmember(Store *s, const char *key, long long count,
     }
     if (with_replacement) {
         for (size_t i = 0; i < n; i++) {
-            size_t idx = (size_t)rand() % z->len;
-            members[i] = strdup(z->members[idx]);
+            /* Ranks are 1-based; a random rank is O(log n) in the
+               skip list. */
+            unsigned long rank = (unsigned long)((size_t)rand() % z->len) + 1;
+            zslNode *node = zsl_get_by_rank(z->sl, rank);
+            members[i] = strdup(node->member);
             if (!members[i]) {
                 for (size_t j = 0; j < i; j++) free(members[j]);
                 free(members);
                 free(scores);
                 return -2;
             }
-            scores[i] = z->scores[idx];
+            scores[i] = node->score;
         }
     } else {
         size_t *idx = malloc(z->len * sizeof(size_t));
@@ -2329,13 +2658,14 @@ int store_zrandmember(Store *s, const char *key, long long count,
             free(scores);
             return -2;
         }
-        for (size_t i = 0; i < z->len; i++) idx[i] = i;
+        for (size_t i = 0; i < z->len; i++) idx[i] = i + 1; /* ranks */
         for (size_t i = 0; i < n; i++) {
             size_t j = i + (size_t)rand() % (z->len - i);
             size_t tmp = idx[i];
             idx[i] = idx[j];
             idx[j] = tmp;
-            members[i] = strdup(z->members[idx[i]]);
+            zslNode *node = zsl_get_by_rank(z->sl, idx[i]);
+            members[i] = strdup(node->member);
             if (!members[i]) {
                 for (size_t k = 0; k < i; k++) free(members[k]);
                 free(members);
@@ -2343,7 +2673,7 @@ int store_zrandmember(Store *s, const char *key, long long count,
                 free(idx);
                 return -2;
             }
-            scores[i] = z->scores[idx[i]];
+            scores[i] = node->score;
         }
         free(idx);
     }

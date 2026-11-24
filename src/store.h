@@ -36,16 +36,17 @@ typedef struct Hash {
     size_t len;
 } Hash;
 
-/* A sorted-set value: parallel arrays of malloc'd members and their
-   scores, kept sorted by (score, member) — score ascending, then
-   member lexicographically, as in Redis. Lookup and insertion are
-   linear scans, like the set and hash types; a skip list would be
-   the next step if sorted sets grow large. Range commands
-   (ZRANGE and friends) are not implemented yet. */
+/* A sorted-set value: a skip list ordered by (score, member) —
+   score ascending, then member lexicographically, as in Redis —
+   plus a hash table from member to skip-list node, so member
+   lookup is O(1) and insert, delete, rank and range-by-index are
+   O(log n) instead of the linear scans the old sorted array
+   needed. The skip list and the dict are opaque here; their
+   definitions live in store.c. `len` mirrors the skip list's
+   length. */
 typedef struct ZSet {
-    char **members;
-    double *scores;
-    size_t cap;
+    struct zsl *sl;
+    struct zdict *dict;
     size_t len;
 } ZSet;
 
@@ -436,5 +437,15 @@ int store_zpop(Store *s, const char *key, long long count, int from_max,
 int store_zrandmember(Store *s, const char *key, long long count,
                       char ***members_out, double **scores_out,
                       size_t *n_out);
+/* Visit every member of a sorted set in (score, member) order — the
+   order the skip list keeps. Returns 0 on success, -1 = wrong type
+   (or no such key, which the caller can treat the same way: no
+   members are visited). The callback receives each member and its
+   score; returning non-zero stops the iteration and that value is
+   returned. The members are owned by the set and must not be freed
+   or kept past the call. Used by the snapshot writer and the
+   replication emitter, which only need the set in order. */
+typedef int (*zset_foreach_fn)(const char *member, double score, void *arg);
+int zset_foreach(const ZSet *z, zset_foreach_fn fn, void *arg);
 
 #endif

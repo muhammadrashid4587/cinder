@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.34.0.
+Version 0.35.0.
 
 ## Why
 
@@ -127,8 +127,9 @@ src/
              strings, lists (circular-buffer lists, O(1) push/pop),
              sets (unordered member arrays, dedup on insert),
              hashes (parallel field/value arrays, insertion order)
-             and sorted sets (parallel member/score arrays kept
-             sorted by score then member, linear scan)
+             and sorted sets (skip list ordered by score then
+             member, plus a member-to-node hash table for O(1)
+             lookup)
   resp.c     RESP parser (array + inline commands) and encoders
   aof.c      append-only log: every mutation is a RESP array, replayed on start;
              fsync policy `always` or `everysec`; under `everysec` a
@@ -767,3 +768,17 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       logs nothing. Limitation: member lookup is still a
       linear scan, so large sorted sets are slower than a
       skip list would be
+
+- [x] Sorted-set skip list (0.35.0): the sorted array is gone —
+      a sorted set is now a skip list ordered by (score, member)
+      with span counts, plus a hash table from member to node,
+      so `ZADD` / `ZREM` / `ZSCORE` / `ZRANK` / `ZRANGE` /
+      `ZRANGEBYSCORE` / `ZINCRBY` / `ZPOPMIN` / `ZPOPMAX` /
+      `ZRANDMEMBER` are O(log n) (member lookup O(1)) instead of
+      linear scans with memmoves. The public store API is
+      unchanged; the snapshot writer and the replication emitter
+      now walk the set through a `zset_foreach` iterator over
+      level 0 of the skip list, and RDB load still rebuilds via
+      `store_zadd`. This retires the "slower than a skip list"
+      limitation on every sorted-set entry above. Limitation:
+      sets and hashes still use linear scans

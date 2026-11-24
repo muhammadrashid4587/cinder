@@ -75,6 +75,20 @@ typedef struct {
     int err;
 } SaveCtx;
 
+/* One member of a sorted set being written to the snapshot: the
+   score is a %.17g string, which round-trips a double exactly, so
+   the snapshot needs no binary float format and stays portable. */
+static int save_zset_member(const char *member, double score, void *arg) {
+    SaveCtx *ctx = arg;
+    char scorebuf[32];
+    snprintf(scorebuf, sizeof(scorebuf), "%.17g", score);
+    if (w_str(ctx->f, member) < 0 || w_str(ctx->f, scorebuf) < 0) {
+        ctx->err = 1;
+        return 1;
+    }
+    return 0;
+}
+
 static int save_entry(const Entry *e, void *arg) {
     SaveCtx *ctx = arg;
     if (ctx->err) return 1;
@@ -111,20 +125,9 @@ static int save_entry(const Entry *e, void *arg) {
             }
         }
     } else if (e->type == ENTRY_ZSET) {
-        /* Scores are stored as %.17g strings, which round-trip a
-           double exactly, so the snapshot needs no binary float
-           format and stays portable. */
         ZSet *z = e->zset;
         if (w_u32(f, (uint32_t)z->len) < 0) { ctx->err = 1; return 1; }
-        for (size_t i = 0; i < z->len; i++) {
-            char scorebuf[32];
-            snprintf(scorebuf, sizeof(scorebuf), "%.17g", z->scores[i]);
-            if (w_str(f, z->members[i]) < 0 ||
-                w_str(f, scorebuf) < 0) {
-                ctx->err = 1;
-                return 1;
-            }
-        }
+        if (zset_foreach(z, save_zset_member, ctx) != 0) return 1;
     }
     return 0;
 }

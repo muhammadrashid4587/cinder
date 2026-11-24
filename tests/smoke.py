@@ -4,6 +4,7 @@ Starts the server on a scratch port with a scratch data dir, runs through
 the core commands, checks AOF durability across a restart, and shuts it down.
 """
 import os
+import random
 import shutil
 import socket
 import subprocess
@@ -1094,6 +1095,62 @@ def main():
         check("COMMAND lists ZPOPMIN", "ZPOPMIN" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZPOPMAX", "ZPOPMAX" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZRANDMEMBER", "ZRANDMEMBER" in c.cmd("COMMAND"), True)
+        # Skip-list sorted sets at scale: 300 members added in
+        # shuffled order, with repeated scores so member tiebreaks
+        # matter, then the order, ranks, ranges and pops must all
+        # agree with the same ordering computed here. The key is
+        # deleted at the end so the AOF restart below still sees
+        # its expected key count.
+        rng = random.Random(42)
+        pairs = [("m%03d" % i, rng.choice([1, 2, 3, 5, 8]))
+                 for i in range(300)]
+        rng.shuffle(pairs)
+        args = []
+        for member, score in pairs:
+            args += [str(score), member]
+        check("ZADD bigzset", c.cmd("ZADD", "bigzset", *args), 300)
+        check("ZCARD bigzset", c.cmd("ZCARD", "bigzset"), 300)
+        want = sorted(pairs, key=lambda p: (p[1], p[0]))
+        check("ZRANGE bigzset all", c.cmd("ZRANGE", "bigzset", "0", "-1"),
+              [m for m, _ in want])
+        check("ZREVRANGE bigzset all", c.cmd("ZREVRANGE", "bigzset", "0", "-1"),
+              [m for m, _ in reversed(want)])
+        check("ZRANGE bigzset slice", c.cmd("ZRANGE", "bigzset", "100", "109"),
+              [m for m, _ in want[100:110]])
+        check("ZRANGE bigzset neg slice", c.cmd("ZRANGE", "bigzset", "-3", "-1"),
+              [m for m, _ in want[-3:]])
+        check("ZRANK bigzset first", c.cmd("ZRANK", "bigzset", want[0][0]), 0)
+        check("ZRANK bigzset mid", c.cmd("ZRANK", "bigzset", want[150][0]), 150)
+        check("ZRANK bigzset last", c.cmd("ZRANK", "bigzset", want[-1][0]), 299)
+        check("ZSCORE bigzset mid", c.cmd("ZSCORE", "bigzset", want[150][0]),
+              str(want[150][1]))
+        check("ZRANGEBYSCORE bigzset 2", c.cmd("ZRANGEBYSCORE", "bigzset", "2", "2"),
+              [m for m, s in want if s == 2])
+        check("ZREVRANGEBYSCORE bigzset 2",
+              c.cmd("ZREVRANGEBYSCORE", "bigzset", "2", "2"),
+              [m for m, s in reversed([p for p in want if p[1] == 2])])
+        check("ZRANGEBYSCORE bigzset limit",
+              c.cmd("ZRANGEBYSCORE", "bigzset", "1", "3", "LIMIT", "5", "3"),
+              [m for m, s in want if 1 <= s <= 3][5:8])
+        # Rescore the first member across the set: it must move,
+        # not duplicate, then an increment must bring it back.
+        check("ZADD bigzset rescore", c.cmd("ZADD", "bigzset", "9", want[0][0]), 0)
+        check("ZCARD after rescore", c.cmd("ZCARD", "bigzset"), 300)
+        check("ZRANK after rescore", c.cmd("ZRANK", "bigzset", want[0][0]), 299)
+        check("ZRANGE last after rescore",
+              c.cmd("ZRANGE", "bigzset", "-1", "-1"), [want[0][0]])
+        check("ZINCRBY bigzset", c.cmd("ZINCRBY", "bigzset", "-8", want[0][0]), "1")
+        check("ZRANK after zincrby", c.cmd("ZRANK", "bigzset", want[0][0]), 0)
+        check("ZPOPMIN bigzset", c.cmd("ZPOPMIN", "bigzset", "2"),
+              [want[0][0], "1", want[1][0], str(want[1][1])])
+        check("ZCARD after bigzset pops", c.cmd("ZCARD", "bigzset"), 298)
+        check("ZRANGE first after pops", c.cmd("ZRANGE", "bigzset", "0", "0"),
+              [want[2][0]])
+        check("ZRANDMEMBER bigzset distinct",
+              len(set(c.cmd("ZRANDMEMBER", "bigzset", "10"))), 10)
+        check("ZREM bigzset mid", c.cmd("ZREM", "bigzset", want[150][0]), 1)
+        check("ZRANK bigzset after rem", c.cmd("ZRANK", "bigzset", want[151][0]), 148)
+        check("DEL bigzset", c.cmd("DEL", "bigzset"), 1)
         # Transactions: MULTI queues, EXEC runs the queue in order and
         # returns one reply per command, DISCARD drops the queue, and
         # the error cases. A second client proves the queued writes
@@ -1598,7 +1655,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.34.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.35.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
