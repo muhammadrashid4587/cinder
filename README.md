@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.46.0.
+Version 0.47.0.
 
 ## Why
 
@@ -116,6 +116,7 @@ OK
 | `ZREM key member [member ...]` | Remove members; returns number removed (the key is deleted when the last member is removed) |
 | `ZREMRANGEBYSCORE key min max` | Remove the members whose scores fall in `[min, max]`, with the same bounds as `ZRANGEBYSCORE` (`-inf`/`+inf`, or a leading `(` for an exclusive endpoint); returns the number removed, `0` when missing or the range is empty, including a finite min above the max, and the key is deleted when the last member is removed |
 | `ZREMRANGEBYRANK key start stop` | Remove the members ranked `[start, stop]` (0-based, negative indices count from the end, as in `ZRANGE`, out-of-range ends clamped); returns the number removed, `0` when missing or the range is empty, and the key is deleted when the last member is removed |
+| `ZREMRANGEBYLEX key min max` | Remove the members whose names fall in `[min, max]` lexicographically, with the same bounds as `ZRANGEBYLEX` (`-`/`+` or `[x`/`(x`); returns the number removed, `0` when missing or the range is empty, including a finite min above the max, and the key is deleted when the last member is removed |
 | `ZRANK key member` | 0-based rank of a member, lowest score first (`nil` when missing) |
 | `ZREVRANK key member` | 0-based rank of a member, highest score first (`nil` when missing) |
 | `ZINCRBY key increment member` | Add to a member's score (creating member and key when missing); returns the new score |
@@ -1001,3 +1002,20 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       `ZREM`. A removal is logged to the AOF and replicated and
       invalidates `WATCH` on the key; removing nothing is a no-op,
       so it is none of those.
+
+- [x] `ZREMRANGEBYLEX` (0.47.0): remove the members whose names
+      fall in `[min, max]` lexicographically, `ZREMRANGEBYLEX key
+      min max`, with the same bounds as `ZRANGEBYLEX` (`-` / `+` or
+      `[x` / `(x`) but no `REV` — the removed set does not depend
+      on order. The store gains `store_zremrangebylex`, which finds
+      the matching slice with a level-0 scan (the skip list is
+      ordered by (score, member), so a lex range cannot walk it in
+      order) and drops each member through `zset_remove` (the next
+      node is saved before each removal, since removing frees the
+      node). A missing key answers `0`, as does an empty range
+      including a finite min above the max, and a non-sorted-set
+      key is a `WRONGTYPE` error, listed by `COMMAND`. Removing
+      the last member deletes the key, as with `ZREM`. A removal
+      is logged to the AOF and replicated and invalidates `WATCH`
+      on the key; removing nothing is a no-op, so it is none of
+      those.

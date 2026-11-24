@@ -3220,6 +3220,56 @@ long long store_zremrangebyrank(Store *s, const char *key, long long start,
     return removed;
 }
 
+/* Remove the members whose names fall in [min, max]
+   lexicographically, with the same bound conventions as
+   store_zrangebylex. The skip list is ordered by (score, member),
+   so a lex range cannot walk it in order: the matching slice is
+   found with a level-0 scan and each member is dropped through
+   zset_remove, which keeps the dict and the skip list in step. The
+   next node is saved before the removal, since removing frees the
+   node being stood on. */
+long long store_zremrangebylex(Store *s, const char *key, const char *min,
+                              int min_excl, const char *max, int max_excl) {
+    Entry **pp = NULL;
+    Entry *e = store_find(s, key, &pp);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    if (min && max && strcmp(min, max) > 0) return 0;
+    ZSet *z = e->zset;
+    long long removed = 0;
+    for (zslNode *node = z->sl->header->level[0].forward; node;) {
+        const char *m = node->member;
+        zslNode *next = node->level[0].forward;
+        if (min) {
+            int c = strcmp(m, min);
+            if (c < 0 || (c == 0 && min_excl)) {
+                node = next;
+                continue;
+            }
+        }
+        if (max) {
+            int c = strcmp(m, max);
+            if (c > 0 || (c == 0 && max_excl)) {
+                node = next;
+                continue;
+            }
+        }
+        if (zset_remove(z, m)) removed++;
+        node = next;
+    }
+    if (removed == 0) return 0;
+    if (z->len == 0) {
+        /* A sorted set emptied by removing is gone, as in Redis. */
+        *pp = e->next;
+        entry_free(e);
+        s->count--;
+    } else {
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+    }
+    return removed;
+}
+
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing

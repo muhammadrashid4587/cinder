@@ -518,6 +518,19 @@ long long store_zremrangebyscore(Store *s, const char *key, double min,
    at level 0. */
 long long store_zremrangebyrank(Store *s, const char *key, long long start,
                                 long long stop);
+/* Remove the members whose names fall in [min, max]
+   lexicographically, with the same bound conventions as
+   store_zrangebylex (NULL min = -inf, NULL max = +inf, an endpoint
+   excluded when its flag is set). Returns the number removed (0 for
+   a missing key or an empty range, including min > max), -1 = wrong
+   type. The key is deleted when the last member is removed, as with
+   store_zrem; a removal touches the key's version, a no-op does
+   not. The skip list is ordered by (score, member), so a lex range
+   cannot walk it in order: the matching slice is found with a
+   level-0 scan and dropped through zset_remove, which keeps the
+   dict and the skip list in step. */
+long long store_zremrangebylex(Store *s, const char *key, const char *min,
+                              int min_excl, const char *max, int max_excl);
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing

@@ -1381,6 +1381,36 @@ def main():
         check("ZREMRANGEBYRANK wrongtype", c.cmd("ZREMRANGEBYRANK", "after", "0", "-1"),
               wrongtype)
         check("COMMAND lists ZREMRANGEBYRANK", "ZREMRANGEBYRANK" in c.cmd("COMMAND"), True)
+        # ZREMRANGEBYLEX. rlzset holds a=1, b=2, c=3, d=4, e=5.
+        check("ZADD rlzset", c.cmd("ZADD", "rlzset", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e"), 5)
+        check("ZREMRANGEBYLEX mid", c.cmd("ZREMRANGEBYLEX", "rlzset", "[b", "[d"), 3)
+        check("ZRANGE after ZREMRANGEBYLEX", c.cmd("ZRANGE", "rlzset", "0", "-1"), ["a", "e"])
+        check("ZREMRANGEBYLEX excl both empty",
+              c.cmd("ZREMRANGEBYLEX", "rlzset", "(a", "(e"), 0)
+        check("ZCARD after excl empty", c.cmd("ZCARD", "rlzset"), 2)
+        check("ZREMRANGEBYLEX excl max", c.cmd("ZREMRANGEBYLEX", "rlzset", "[a", "(e"), 1)
+        check("ZRANGE after excl max", c.cmd("ZRANGE", "rlzset", "0", "-1"), ["e"])
+        check("ZREMRANGEBYLEX from start", c.cmd("ZREMRANGEBYLEX", "rlzset", "-", "(e"), 0)
+        check("ZREMRANGEBYLEX last one", c.cmd("ZREMRANGEBYLEX", "rlzset", "[e", "+"), 1)
+        check("EXISTS emptied by ZREMRANGEBYLEX", c.cmd("EXISTS", "rlzset"), 0)
+        check("ZREMRANGEBYLEX missing", c.cmd("ZREMRANGEBYLEX", "ghostzset", "-", "+"), 0)
+        check("ZREMRANGEBYLEX min above max",
+              c.cmd("ZREMRANGEBYLEX", "rlzset2", "[d", "[a"), 0)
+        check("ZREMRANGEBYLEX empty slice",
+              c.cmd("ZREMRANGEBYLEX", "rlzset2", "[x", "[z"), 0)
+        check("ZREMRANGEBYLEX wrong args", c.cmd("ZREMRANGEBYLEX", "rlzset2", "[a"),
+              ("error", "ERR wrong number of arguments for 'zremrangebylex' command"))
+        check("ZREMRANGEBYLEX bare bound", c.cmd("ZREMRANGEBYLEX", "rlzset2", "a", "[z"),
+              ("error", "ERR syntax error"))
+        check("ZREMRANGEBYLEX plus as min", c.cmd("ZREMRANGEBYLEX", "rlzset2", "+", "[z"),
+              ("error", "ERR syntax error"))
+        check("ZREMRANGEBYLEX minus as max", c.cmd("ZREMRANGEBYLEX", "rlzset2", "[a", "-"),
+              ("error", "ERR syntax error"))
+        check("ZREMRANGEBYLEX empty bracket", c.cmd("ZREMRANGEBYLEX", "rlzset2", "[", "+"),
+              ("error", "ERR syntax error"))
+        check("ZREMRANGEBYLEX wrongtype", c.cmd("ZREMRANGEBYLEX", "after", "-", "+"),
+              wrongtype)
+        check("COMMAND lists ZREMRANGEBYLEX", "ZREMRANGEBYLEX" in c.cmd("COMMAND"), True)
         check("ZREM one", c.cmd("ZREM", "myzset", "b"), 1)
         check("ZCARD after ZREM", c.cmd("ZCARD", "myzset"), 3)
         check("ZRANK removed member", c.cmd("ZRANK", "myzset", "b"), None)
@@ -2087,7 +2117,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.46.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.47.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
