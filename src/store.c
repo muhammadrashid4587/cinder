@@ -1617,6 +1617,116 @@ long long store_linsert(Store *s, const char *key, int before,
     return (long long)l->len;
 }
 
+/* Push onto an existing list only: a missing key is a no-op, as in
+   Redis. Returns the new length, 0 when the key is missing,
+   -1 = wrong type, -2 = out of memory. */
+static long long store_list_pushx(Store *s, const char *key, const char *elem,
+                                  int at_head) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_LIST) return -1;
+    if (!(at_head ? list_push_head(e->list, elem)
+                  : list_push_tail(e->list, elem)))
+        return -2;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return (long long)e->list->len;
+}
+
+long long store_lpushx(Store *s, const char *key, const char *elem) {
+    return store_list_pushx(s, key, elem, 1);
+}
+
+long long store_rpushx(Store *s, const char *key, const char *elem) {
+    return store_list_pushx(s, key, elem, 0);
+}
+
+/* Keep only the elements from start to stop inclusive, negative
+   indexes count from the end, as in Redis. An empty range deletes
+   the key. Preserves the key's TTL. Returns 0 when the key existed
+   (trimmed, or deleted by an empty range), 1 when the key is
+   missing, -1 = wrong type, -2 = out of memory. */
+int store_ltrim(Store *s, const char *key, long long start, long long stop) {
+    Entry **pp = NULL;
+    Entry *e = store_find(s, key, &pp);
+    if (!e) return 1;
+    if (e->type != ENTRY_LIST) return -1;
+    List *l = e->list;
+    long long len = (long long)l->len;
+    if (start < 0) start += len;
+    if (stop < 0) stop += len;
+    if (start < 0) start = 0;
+    if (stop >= len) stop = len - 1;
+    if (start > stop || start >= len) {
+        /* Empty range: the key is gone, as in Redis. */
+        *pp = e->next;
+        entry_free(e);
+        s->count--;
+        return 0;
+    }
+    size_t keep = (size_t)(stop - start + 1);
+    if (keep == l->len) {
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+        return 0;
+    }
+    if (!list_linearize(l)) return -2;
+    for (size_t i = 0; i < (size_t)start; i++) free(l->items[i]);
+    for (size_t i = (size_t)stop + 1; i < l->len; i++) free(l->items[i]);
+    if (start > 0)
+        memmove(l->items, &l->items[start], keep * sizeof(char *));
+    l->len = keep;
+    l->head = 0;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return 0;
+}
+
+/* Move one element from source to dest, as in Redis: from_head picks
+   the head (LEFT) or the tail (RIGHT) of the source, to_head the
+   head or tail of the destination. The source is deleted when
+   emptied; the destination keeps its TTL, a new destination key has
+   none; the source keeps its TTL. Returns 1 on success (*out is a
+   malloc'd copy of the moved element), 0 when the source is missing
+   or empty, -1 = wrong type on either key, -2 = out of memory. */
+int store_lmove(Store *s, const char *source, const char *dest,
+                int from_head, int to_head, char **out) {
+    *out = NULL;
+    Entry *se = store_find(s, source, NULL);
+    if (!se) return 0;
+    if (se->type != ENTRY_LIST) return -1;
+    List *sl = se->list;
+    if (sl->len == 0) return 0;
+    /* Copy the element, then push the copy onto the destination
+       first: the destination is created when missing, and a
+       wrong-type destination errors before the source is touched.
+       The copy is ours to hand back, so a grow of the source list
+       during the push cannot leave *out dangling. */
+    char *el = strdup(sl->items[(sl->head + (from_head ? 0 : sl->len - 1))
+                                % sl->cap]);
+    if (!el) return -2;
+    long long n = to_head ? store_lpush(s, dest, el)
+                          : store_rpush(s, dest, el);
+    if (n < 0) {
+        free(el);
+        return (int)n; /* -1 wrong type, -2 out of memory */
+    }
+    /* The push succeeded: now take the element off the source. When
+       source and destination are the same key this is a rotation. */
+    int wrongtype = 0;
+    char *moved = from_head ? store_lpop(s, source, &wrongtype)
+                            : store_rpop(s, source, &wrongtype);
+    if (!moved) {
+        /* Unreachable: the source was a non-empty list above, and
+           the destination push only added to it (same key or not). */
+        free(el);
+        return -2;
+    }
+    free(moved);
+    *out = el;
+    return 1;
+}
+
 /* ---------- sets ---------- */
 
 long long store_sadd(Store *s, const char *key, const char *member) {

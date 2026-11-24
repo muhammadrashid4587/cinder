@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.32.0"
+#define CINDER_VERSION "0.33.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -993,6 +993,60 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            so they are not logged or replicated. */
         return n > 0 ? 1 : 0;
     }
+    if (strcasecmp(cmd, "LPUSHX") == 0 || strcasecmp(cmd, "RPUSHX") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'lpushx' command"), 0;
+        int at_head = strcasecmp(cmd, "LPUSHX") == 0;
+        long long len = 0;
+        for (int i = 2; i < argc; i++) {
+            len = at_head ? store_lpushx(g_store, argv[1], argv[i])
+                          : store_rpushx(g_store, argv[1], argv[i]);
+            if (len == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (len == -2)
+                return dbuf_error(reply, "out of memory"), 0;
+        }
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_int(reply, len);
+        /* 0 (no such key) changes nothing, so it is not logged or
+           replicated. */
+        return len > 0 ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "LTRIM") == 0) {
+        if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'ltrim' command"), 0;
+        long long start, stop;
+        if (!parse_ll(argv[2], &start) || !parse_ll(argv[3], &stop))
+            return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        int rc = store_ltrim(g_store, argv[1], start, stop);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_simple(reply, "OK");
+        /* A missing key changes nothing, so it is not logged or
+           replicated. */
+        return rc == 0 ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "LMOVE") == 0) {
+        if (argc != 5) return dbuf_error(reply, "wrong number of arguments for 'lmove' command"), 0;
+        int from_head, to_head;
+        if (strcasecmp(argv[3], "LEFT") == 0) from_head = 1;
+        else if (strcasecmp(argv[3], "RIGHT") == 0) from_head = 0;
+        else return dbuf_error(reply, "syntax error"), 0;
+        if (strcasecmp(argv[4], "LEFT") == 0) to_head = 1;
+        else if (strcasecmp(argv[4], "RIGHT") == 0) to_head = 0;
+        else return dbuf_error(reply, "syntax error"), 0;
+        char *el = NULL;
+        int rc = store_lmove(g_store, argv[1], argv[2], from_head, to_head, &el);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (!el) return dbuf_null(reply), 0;
+        dbuf_bulk(reply, el, strlen(el));
+        free(el);
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        return 1;
+    }
     if (strcasecmp(cmd, "SADD") == 0) {
         if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'sadd' command"), 0;
         long long added = 0;
@@ -1478,7 +1532,8 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "GETRANGE", "SETRANGE", "SETBIT", "GETBIT", "BITCOUNT", "BITOP", "BITFIELD",
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
-            "LINDEX", "LSET", "LINSERT",
+            "LINDEX", "LSET", "LINSERT", "LPUSHX", "RPUSHX", "LTRIM",
+            "LMOVE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",

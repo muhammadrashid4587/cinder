@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.32.0.
+Version 0.33.0.
 
 ## Why
 
@@ -80,6 +80,9 @@ OK
 | `LINDEX key index` | Element at index, negative indexes count from the end (`nil` when missing or out of range) |
 | `LSET key index element` | Set the element at index (`no such key` when missing, `index out of range` when out of range); preserves the TTL; setting an element to the value it already holds changes nothing and is not logged |
 | `LINSERT key BEFORE\|AFTER pivot element` | Insert before or after the first occurrence of `pivot`; returns the new length, `0` when the pivot is not in the list, `-1` when the key is missing; preserves the TTL |
+| `LPUSHX key e [e ...]`, `RPUSHX key e [e ...]` | Push to head / tail only when the key already holds a list; returns the new length, `0` when the key is missing (creates nothing, logs nothing) |
+| `LTRIM key start stop` | Keep only elements from `start` to `stop` inclusive, negative indexes from the end; an empty range deletes the key; preserves the TTL |
+| `LMOVE source dest LEFT\|RIGHT LEFT\|RIGHT` | Move the head or tail element of `source` to the head or tail of `dest` (creating `dest` when missing); returns the moved element, `nil` when the source is missing or empty; emptying the source deletes it; same-key moves rotate the list; the destination keeps its TTL |
 | `SADD key member [member ...]` | Add to set; returns number added (duplicates ignored); creates the set |
 | `SREM key member [member ...]` | Remove from set; returns number removed; emptying the set deletes the key |
 | `SMEMBERS key` | All members (insertion order) |
@@ -450,7 +453,18 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # occurrence of a pivot, `0` when the pivot is absent,
             # `-1` when the key is missing, a bad direction error,
             # and wrong-type errors for all three; `COMMAND`
-            # listing all three)
+            # listing all three; `LPUSHX` / `RPUSHX` pushing
+            # onto an existing list only, `0` and no key created
+            # for a missing key; `LTRIM` keeping a middle and a
+            # negative range, a whole-list trim changing nothing,
+            # an empty range deleting the key, and the TTL
+            # surviving a trim; `LMOVE` moving head-to-head and
+            # tail-to-tail between lists, emptying the source,
+            # `nil` for a missing source, rotating one list when
+            # source and destination are the same key, a bad
+            # direction error, and wrong-type errors on either
+            # key leaving the source untouched; `COMMAND` listing
+            # all four)
 ```
 
 ## Roadmap
@@ -706,3 +720,21 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       commands, so the snapshot and full sync needed no change.
       Limitation: a middle insert is O(n) pointer moves, as a
       linked list would not be
+
+- [x] `LPUSHX` / `RPUSHX` / `LTRIM` / `LMOVE` (0.33.0): the
+      remaining list writes. `LPUSHX` / `RPUSHX` push only onto
+      an existing list and return `0` for a missing key without
+      creating it, so a no-op push is not AOF-logged or
+      replicated; `LTRIM` keeps the given range (negative
+      indexes from the end) and deletes the key on an empty
+      range, preserving the TTL; `LMOVE` moves the head or tail
+      element between two lists (or rotates one list when
+      source and destination are the same key), deletes the
+      source when emptied, creates the destination when
+      missing, and errors `WRONGTYPE` on either key before
+      touching the source, so a bad destination loses nothing.
+      All four are AOF-logged and replicated as raw commands
+      when they change state, so the snapshot and full sync
+      needed no change. Limitation: a trim is O(n) pointer
+      moves after linearizing the circular buffer, as a
+      middle insert already is

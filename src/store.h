@@ -303,6 +303,26 @@ int store_lset(Store *s, const char *key, long long index, const char *elem);
    -1 = no such key, -2 = wrong type, -3 = out of memory. */
 long long store_linsert(Store *s, const char *key, int before,
                         const char *pivot, const char *elem);
+/* Push one element onto an existing list only: a missing key is a
+   no-op. Returns the new length, 0 when the key is missing,
+   -1 = wrong type, -2 = out of memory. */
+long long store_lpushx(Store *s, const char *key, const char *elem);
+long long store_rpushx(Store *s, const char *key, const char *elem);
+/* Keep only the elements from start to stop inclusive; negative
+   indexes count from the end. An empty range deletes the key, as in
+   Redis. Preserves the key's TTL. Returns 0 when the key existed
+   (trimmed, or deleted by an empty range), 1 when the key is
+   missing, -1 = wrong type, -2 = out of memory. */
+int store_ltrim(Store *s, const char *key, long long start, long long stop);
+/* Move one element from source to dest: from_head picks the head
+   (LEFT) or the tail (RIGHT) of the source, to_head the head or
+   tail of the destination. The source is deleted when emptied; the
+   destination keeps its TTL, a new destination has none. Returns 1
+   on success (*out is a malloc'd copy of the moved element), 0 when
+   the source is missing or empty, -1 = wrong type on either key,
+   -2 = out of memory. */
+int store_lmove(Store *s, const char *source, const char *dest,
+                int from_head, int to_head, char **out);
 
 /* Add one member. Returns the number added (1 new, 0 already present),
    -1 = key holds a string or list, -2 = out of memory. Creates the set
