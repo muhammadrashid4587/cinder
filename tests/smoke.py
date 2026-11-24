@@ -1089,6 +1089,24 @@ def main():
               ("error", "ERR wrong number of arguments for 'zadd' command"))
         check("ZADD options wrongtype", c.cmd("ZADD", "after", "NX", "1", "x"), wrongtype)
         check("ZADD options cleanup", c.cmd("DEL", "optzset"), 1)
+        # A ZADD with more than 1024 arguments used to kill the
+        # connection: the RESP parser capped the argument count at
+        # 1024, so a ZADD of 1001 members (2004 args) was a protocol
+        # error and the server closed the connection with no reply.
+        # A throwaway client keeps a regression here from taking the
+        # main client down with it.
+        big = Client(PORT)
+        try:
+            pairs = [x for i in range(1001) for x in (str(i), f"m{i}")]
+            check("ZADD 1001 members", big.cmd("ZADD", "manyargszset", *pairs), 1001)
+            check("ZCARD 1001 members", big.cmd("ZCARD", "manyargszset"), 1001)
+            check("ZSCORE of last big member", big.cmd("ZSCORE", "manyargszset", "m1000"), "1000")
+            check("connection alive after big ZADD", big.cmd("PING"), "PONG")
+            check("ZADD 1001 members cleanup", big.cmd("DEL", "manyargszset"), 1)
+        except EOFError:
+            check("ZADD 1001 members (connection closed)", "closed", 1001)
+        finally:
+            big.close()
         # Sorted-set ranges, rank, removal and increment. myzset holds
         # c=0.5, a=3, b=5 at this point.
         check("ZRANGE all", c.cmd("ZRANGE", "myzset", "0", "-1"), ["c", "a", "b"])
@@ -2046,7 +2064,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.45.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.45.2" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

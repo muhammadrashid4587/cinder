@@ -5,6 +5,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* A RESP command is one array; cap its argument count. The per-client
+   input buffer is 64 KiB and every argument costs at least "$0\r\n\r\n"
+   (6 bytes), so a command that fits in the buffer can never carry more
+   than ~10,900 arguments — 65536 is a ceiling that never rejects a
+   command the buffer could hold, while bounding the argv calloc to
+   512 KiB. (The old cap, 1024, silently killed any command with more
+   than 1024 arguments: a ZADD of 1001 members is 2004 args, so the
+   parser returned a protocol error and the server closed the
+   connection with no reply.) */
+#define RESP_MAX_ARGC 65536
+
 static int put_bytes(char *out, size_t cap, size_t *len, const char *src, size_t n) {
     if (*len + n > cap) return -1;
     memcpy(out + *len, src, n);
@@ -103,7 +114,7 @@ int resp_parse_command(const char *buf, size_t len, char ***argv_out,
         long line_end = find_crlf(buf, 1, len);
         if (line_end < 0) return 0; /* need more data */
         long long count = 0;
-        if (!parse_long(buf, 1, (size_t)line_end, &count) || count <= 0 || count > 1024)
+        if (!parse_long(buf, 1, (size_t)line_end, &count) || count <= 0 || count > RESP_MAX_ARGC)
             return -1;
         char **argv = calloc((size_t)count, sizeof(char *));
         if (!argv) return -1;

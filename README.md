@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.45.1.
+Version 0.45.2.
 
 ## Why
 
@@ -969,3 +969,18 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       version and the smoke test pinned it. The define and the
       smoke-test expectation now both say 0.45.0; no behaviour
       change.
+
+- [x] Large-command fix (0.45.2): the RESP parser capped the
+      argument count at 1024, so a single `ZADD` of 1001 members
+      (2004 arguments) was a protocol error and the server closed
+      the connection with no reply — the queued `-ERR Protocol
+      error` is never flushed before a dead client is removed.
+      The cap is now `RESP_MAX_ARGC` (65536): the per-client
+      input buffer is 64 KiB and every argument costs at least
+      6 bytes, so a command that fits in the buffer can never
+      carry more than ~10,900 arguments, and the ceiling bounds
+      the argv allocation to 512 KiB. A 1001-member `ZADD` now
+      answers `:1001` and the connection stays alive, covered by
+      a smoke test on a throwaway client. `CINDER_VERSION` and
+      the smoke-test expectation move to 0.45.2 with the README,
+      so the three can no longer drift apart.
