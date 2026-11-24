@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.49.0.
+Version 0.50.0.
 
 ## Why
 
@@ -1044,6 +1044,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       the type of every input key before reading any set. It
       reuses `store_zrange` for the first set and `store_zscore`
       for membership in the others, so it needs no new store code.
+      It is a read, so it is not logged to the AOF, not
+      replicated, and does not invalidate `WATCH`, and it is
+      listed by `COMMAND`.
+
+- [x] `ZUNION` (0.50.0): return the union of several sorted sets,
+      `ZUNION numkeys key [key ...] [WITHSCORES]`, lowest score
+      first, with a member that is in several sets appearing once
+      with the sum of its scores, as in real Redis. A missing key
+      counts as an empty set and a non-sorted-set key is a
+      `WRONGTYPE` error; the handler checks the type of every
+      input key before reading any set. It reuses `store_zrange`
+      for each input set and sorts the merged members by score,
+      member name breaking ties, so it needs no new store code.
       It is a read, so it is not logged to the AOF, not
       replicated, and does not invalidate `WATCH`, and it is
       listed by `COMMAND`.

@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.49.0"
+#define CINDER_VERSION "0.50.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -298,6 +298,21 @@ static int parse_lex_bound(const char *s, const char **bound, int *excl) {
    ("2", not "2.0"). */
 static void format_score(char *buf, size_t cap, double score) {
     snprintf(buf, cap, "%.17g", score);
+}
+
+/* One member of a ZUNION result, with its summed score. */
+struct zunion_entry {
+    char *member;
+    double score;
+};
+
+/* qsort comparator for ZUNION results: lowest score first, and
+   member name breaks ties, as in real Redis. */
+static int cmp_zunion_entry(const void *a, const void *b) {
+    const struct zunion_entry *x = a, *y = b;
+    if (x->score < y->score) return -1;
+    if (x->score > y->score) return 1;
+    return strcmp(x->member, y->member);
 }
 
 /* ---------- command dispatch ----------
@@ -1650,6 +1665,109 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            and does not invalidate WATCH. */
         return 0;
     }
+    if (strcasecmp(cmd, "ZUNION") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'zunion' command"), 0;
+        long long numkeys;
+        if (!parse_ll(argv[1], &numkeys) || numkeys < 1)
+            return dbuf_error(reply, "at least 1 input key is needed for 'zunion' command"), 0;
+        if (argc < 2 + numkeys)
+            return dbuf_error(reply, "wrong number of arguments for 'zunion' command"), 0;
+        int withscores = 0;
+        if (argc == 3 + numkeys) {
+            if (strcasecmp(argv[2 + numkeys], "WITHSCORES") != 0)
+                return dbuf_error(reply, "syntax error"), 0;
+            withscores = 1;
+        } else if (argc > 3 + numkeys) {
+            return dbuf_error(reply, "syntax error"), 0;
+        }
+        /* The type of every input key is checked before any set
+           is read: a non-sorted-set key is a WRONGTYPE error, and
+           a missing key counts as an empty set, as in Redis. */
+        for (long long k = 0; k < numkeys; k++) {
+            int t = store_type(g_store, argv[2 + k]);
+            if (t != 0 && t != 5)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        }
+        /* Read every input set whole and add each member's score
+           to the running total for that member: a member in
+           several sets ends up once, with the sum of its scores,
+           as in Redis. The result is then ordered lowest score
+           first, member name breaking ties. A consumed string is
+           NULLed in its per-set array, so the cleanup below frees
+           exactly the strings that were not moved or already
+           freed. */
+        struct zunion_entry *entries = NULL;
+        size_t n = 0, cap = 0;
+        int failed = 0;
+        for (long long k = 0; k < numkeys && !failed; k++) {
+            char **kmembers = NULL;
+            double *kscores = NULL;
+            size_t kn = 0;
+            int rc = store_zrange(g_store, argv[2 + k], 0, -1, 0,
+                                  &kmembers, &kscores, &kn);
+            if (rc != 0) {
+                failed = rc;
+                break;
+            }
+            for (size_t i = 0; i < kn && !failed; i++) {
+                size_t j;
+                for (j = 0; j < n; j++)
+                    if (strcmp(entries[j].member, kmembers[i]) == 0) break;
+                if (j < n) {
+                    entries[j].score += kscores[i];
+                    free(kmembers[i]);
+                    kmembers[i] = NULL;
+                    continue;
+                }
+                if (n == cap) {
+                    size_t ncap = cap ? cap * 2 : 16;
+                    struct zunion_entry *grown =
+                        realloc(entries, ncap * sizeof(*grown));
+                    if (!grown) {
+                        failed = -2;
+                        break;
+                    }
+                    entries = grown;
+                    cap = ncap;
+                }
+                entries[n].member = kmembers[i];
+                entries[n].score = kscores[i];
+                kmembers[i] = NULL;
+                n++;
+            }
+            for (size_t i = 0; i < kn; i++) free(kmembers[i]);
+            free(kmembers);
+            free(kscores);
+        }
+        if (failed == -2) {
+            for (size_t i = 0; i < n; i++) free(entries[i].member);
+            free(entries);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        if (failed == -1) {
+            /* Unreachable: the type check above already rejected
+               non-sorted-set keys, and the loop is single-threaded. */
+            for (size_t i = 0; i < n; i++) free(entries[i].member);
+            free(entries);
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        }
+        if (n > 1)
+            qsort(entries, n, sizeof(*entries), cmp_zunion_entry);
+        dbuf_array_header(reply, withscores ? (long long)n * 2 : (long long)n);
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, entries[i].member, strlen(entries[i].member));
+            if (withscores) {
+                char buf[32];
+                format_score(buf, sizeof(buf), entries[i].score);
+                dbuf_bulk(reply, buf, strlen(buf));
+            }
+            free(entries[i].member);
+        }
+        free(entries);
+        /* A read, so it is not logged to the AOF, not replicated,
+           and does not invalidate WATCH. */
+        return 0;
+    }
     if (strcasecmp(cmd, "ZCARD") == 0) {
         if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'zcard' command"), 0;
         long long n = store_zcard(g_store, argv[1]);
@@ -2189,7 +2307,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",
-            "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
+            "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",
             "ZRANK", "ZREVRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",

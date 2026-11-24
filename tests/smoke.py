@@ -1444,6 +1444,31 @@ def main():
               ("error", "ERR syntax error"))
         check("COMMAND lists ZDIFF", "ZDIFF" in c.cmd("COMMAND"), True)
         check("ZDIFF cleanup", c.cmd("DEL", "dzset1", "dzset2"), 2)
+        # ZUNION. uzset1 holds a=1, b=2, c=3; uzset2 holds b=10, d=4,
+        # so b scores 12 in the union and the members order a, c, d, b.
+        check("ZADD uzset1", c.cmd("ZADD", "uzset1", "1", "a", "2", "b", "3", "c"), 3)
+        check("ZADD uzset2", c.cmd("ZADD", "uzset2", "10", "b", "4", "d"), 2)
+        check("ZUNION one", c.cmd("ZUNION", "1", "uzset1"), ["a", "b", "c"])
+        check("ZUNION two", c.cmd("ZUNION", "2", "uzset1", "uzset2"),
+              ["a", "c", "d", "b"])
+        check("ZUNION withscores", c.cmd("ZUNION", "2", "uzset1", "uzset2", "WITHSCORES"),
+              ["a", "1", "c", "3", "d", "4", "b", "12"])
+        check("ZUNION missing other", c.cmd("ZUNION", "2", "uzset1", "ghostzset"),
+              ["a", "b", "c"])
+        check("ZUNION missing first", c.cmd("ZUNION", "1", "ghostzset"), [])
+        check("ZUNION missing first two", c.cmd("ZUNION", "2", "ghostzset", "uzset1"),
+              ["a", "b", "c"])
+        check("ZUNION wrongtype", c.cmd("ZUNION", "2", "uzset1", "after"), wrongtype)
+        check("ZUNION wrong args", c.cmd("ZUNION", "uzset1"),
+              ("error", "ERR wrong number of arguments for 'zunion' command"))
+        check("ZUNION too few keys", c.cmd("ZUNION", "2", "uzset1"),
+              ("error", "ERR wrong number of arguments for 'zunion' command"))
+        check("ZUNION zero keys", c.cmd("ZUNION", "0", "uzset1"),
+              ("error", "ERR at least 1 input key is needed for 'zunion' command"))
+        check("ZUNION bad option", c.cmd("ZUNION", "1", "uzset1", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("COMMAND lists ZUNION", "ZUNION" in c.cmd("COMMAND"), True)
+        check("ZUNION cleanup", c.cmd("DEL", "uzset1", "uzset2"), 2)
         # Deleted again: the AOF restart below counts exactly 7 keys.
         check("ZMSCORE cleanup", c.cmd("DEL", "mszset"), 1)
         check("ZREMRANGEBYLEX wrongtype", c.cmd("ZREMRANGEBYLEX", "after", "-", "+"),
@@ -2155,7 +2180,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.49.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.50.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
