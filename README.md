@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.37.0.
+Version 0.38.0.
 
 ## Why
 
@@ -797,7 +797,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       level 0 of the skip list, and RDB load still rebuilds via
       `store_zadd`. This retires the "slower than a skip list"
       limitation on every sorted-set entry above. Limitation:
-      sets and hashes still use linear scans
+      sets still use linear scans
 
 - [x] Hash misc commands: `HMGET` / `HSETNX` / `HINCRBY`
       (0.36.0): the remaining core hash family. `HMGET` returns
@@ -828,4 +828,23 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       into the insertion-ordered fields, with `MATCH` glob
       filtering on field names and `COUNT` as a per-call hint.
       The hash family is now complete for the core commands.
-      Limitation: hashes still use a linear scan
+      Limitation: hashes still use a linear scan (retired in
+      0.38.0)
+
+- [x] Hash-table-backed hash type (0.38.0): a hash is still its
+      fields and values in insertion order, but field lookup no
+      longer scans them — a hash table maps each field to its
+      index in the arrays, modelled on the sorted set's member
+      dict, so `HSET` / `HGET` / `HDEL` / `HEXISTS` / `HSETNX` /
+      `HINCRBY` / `HINCRBYFLOAT` are O(1) instead of O(n).
+      `HGETALL` / `HKEYS` / `HVALS` / `HSCAN` still walk the
+      arrays in insertion order, so their replies are unchanged;
+      deleting a field memmoves the tail of the arrays and
+      re-indexes the fields that moved, so `HDEL` stays O(n).
+      The public store API is unchanged, TTL preservation, AOF
+      logging, `WATCH` invalidation and replication needed no
+      change — the snapshot writer and the replication emitter
+      still walk the same arrays — and RDB load still rebuilds
+      via `store_hset`. This retires the "hashes still use a
+      linear scan" limitation above. Limitation: sets still use
+      a linear scan

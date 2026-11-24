@@ -27,13 +27,20 @@ typedef struct Set {
     size_t len;
 } Set;
 
-/* A hash value: parallel arrays of malloc'd fields and values, in
-   insertion order; lookup by linear scan, like the set type. */
+/* A hash value: fields and values in insertion order (parallel
+   arrays of malloc'd strings), plus a hash table from field to its
+   index in those arrays, so field lookup is O(1) instead of a
+   linear scan. The dict is opaque here; its definition lives in
+   store.c. HGETALL / HKEYS / HVALS / HSCAN still walk the arrays
+   in insertion order; deleting a field memmoves the tail of the
+   arrays (preserving order) and re-indexes the fields that moved,
+   so HDEL stays O(n). */
 typedef struct Hash {
     char **fields;
     char **values;
     size_t cap;
     size_t len;
+    struct hdict *dict;
 } Hash;
 
 /* A sorted-set value: a skip list ordered by (score, member) —

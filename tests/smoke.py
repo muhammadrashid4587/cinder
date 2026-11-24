@@ -919,6 +919,39 @@ def main():
         check("COMMAND lists HVALS", "HVALS" in c.cmd("COMMAND"), True)
         check("COMMAND lists HINCRBYFLOAT", "HINCRBYFLOAT" in c.cmd("COMMAND"), True)
         check("COMMAND lists HSCAN", "HSCAN" in c.cmd("COMMAND"), True)
+        # Hash dict: a hash big enough to grow the field table, with
+        # deletes in the middle, so lookups after the delete exercise
+        # the re-indexing of the fields that moved down a slot.
+        big_fields = ["f%02d" % i for i in range(50)]
+        big_args = []
+        for f in big_fields:
+            big_args += [f, "v" + f[1:]]
+        check("HSET bighash 50 fields", c.cmd("HSET", "bighash", *big_args), 50)
+        check("HLEN bighash", c.cmd("HLEN", "bighash"), 50)
+        check("HGET bighash late field", c.cmd("HGET", "bighash", "f49"), "v49")
+        check("HDEL bighash middle", c.cmd("HDEL", "bighash", "f10", "f25"), 2)
+        check("HLEN bighash after HDEL", c.cmd("HLEN", "bighash"), 48)
+        check("HGET bighash after deleted field", c.cmd("HGET", "bighash", "f26"), "v26")
+        check("HGET bighash after deleted field 2", c.cmd("HGET", "bighash", "f11"), "v11")
+        check("HGET bighash deleted field", c.cmd("HGET", "bighash", "f10"), None)
+        check("HSET bighash update after delete", c.cmd("HSET", "bighash", "f26", "v26b"), 0)
+        check("HGET bighash updated", c.cmd("HGET", "bighash", "f26"), "v26b")
+        check("HSETNX bighash re-add deleted", c.cmd("HSETNX", "bighash", "f10", "new"), 1)
+        check("HINCRBY bighash", c.cmd("HINCRBY", "bighash", "ctr", "5"), 5)
+        big_keys = (["f%02d" % i for i in range(10)]
+                    + ["f%02d" % i for i in range(11, 25)]
+                    + ["f%02d" % i for i in range(26, 50)]
+                    + ["f10", "ctr"])
+        check("HKEYS bighash order", c.cmd("HKEYS", "bighash"), big_keys)
+        big_vals = {"f%02d" % i: "v%02d" % i for i in range(50)}
+        del big_vals["f25"]
+        big_vals["f10"] = "new"
+        big_vals["f26"] = "v26b"
+        big_vals["ctr"] = "5"
+        big_flat = [x for k in big_keys for x in (k, big_vals[k])]
+        check("HGETALL bighash order", c.cmd("HGETALL", "bighash"), big_flat)
+        check("HSCAN bighash all", c.cmd("HSCAN", "bighash", "0", "COUNT", "100"),
+              ["0", big_flat])
         # Sorted sets: add/update, scores, wrong type, TTL, AOF
         # persistence. Members are ordered by (score, member); range
         # commands are not implemented yet.

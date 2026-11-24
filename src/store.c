@@ -60,6 +60,123 @@ static void set_free(Set *st) {
     free(st);
 }
 
+/* ---------- hash field dict ---------- */
+
+/* A hash value keeps its fields in insertion order (the parallel
+   arrays) and a hash table from field to its index in those arrays,
+   so field lookup is O(1) instead of a linear scan. The dict
+   entries borrow the field strings owned by the arrays, so freeing
+   the dict frees only the entries, never the strings. Deleting a
+   field memmoves the tail of the arrays (preserving insertion
+   order) and re-indexes the fields that moved, so HDEL stays O(n).
+   Modelled on the zdict the sorted set uses, but keyed by field
+   with an index as the value instead of a skip-list node. */
+
+#define HDICT_INIT_CAP 16
+
+typedef struct hdictEntry {
+    char *field; /* borrowed from the Hash arrays, not owned */
+    size_t index;
+    struct hdictEntry *next;
+} hdictEntry;
+
+typedef struct hdict {
+    hdictEntry **buckets;
+    size_t cap;
+    size_t count;
+} hdict;
+
+static hdict *hdict_new(void) {
+    hdict *d = calloc(1, sizeof(hdict));
+    if (!d) return NULL;
+    d->cap = HDICT_INIT_CAP;
+    d->buckets = calloc(d->cap, sizeof(hdictEntry *));
+    if (!d->buckets) {
+        free(d);
+        return NULL;
+    }
+    return d;
+}
+
+static void hdict_free(hdict *d) {
+    if (!d) return;
+    for (size_t i = 0; i < d->cap; i++) {
+        hdictEntry *en = d->buckets[i];
+        while (en) {
+            hdictEntry *next = en->next;
+            free(en);
+            en = next;
+        }
+    }
+    free(d->buckets);
+    free(d);
+}
+
+/* Index of field in the hash's arrays, or -1 when absent. */
+static long long hdict_find(hdict *d, const char *field) {
+    size_t idx = hash_key(field) % d->cap;
+    for (hdictEntry *en = d->buckets[idx]; en; en = en->next)
+        if (strcmp(en->field, field) == 0) return (long long)en->index;
+    return -1;
+}
+
+static int hdict_grow(hdict *d) {
+    size_t ncap = d->cap * 2;
+    hdictEntry **nb = calloc(ncap, sizeof(hdictEntry *));
+    if (!nb) return 0;
+    for (size_t i = 0; i < d->cap; i++) {
+        hdictEntry *en = d->buckets[i];
+        while (en) {
+            hdictEntry *next = en->next;
+            size_t idx = hash_key(en->field) % ncap;
+            en->next = nb[idx];
+            nb[idx] = en;
+            en = next;
+        }
+    }
+    free(d->buckets);
+    d->buckets = nb;
+    d->cap = ncap;
+    return 1;
+}
+
+/* Point the field's dict entry at index, adding the entry when the
+   field is new. Returns 0 on OOM; re-indexing an existing field
+   cannot fail, it only updates the stored index. */
+static int hdict_set(hdict *d, char *field, size_t index) {
+    size_t idx = hash_key(field) % d->cap;
+    for (hdictEntry *en = d->buckets[idx]; en; en = en->next)
+        if (strcmp(en->field, field) == 0) {
+            en->index = index;
+            return 1;
+        }
+    if (d->count + 1 > d->cap * 3 / 4 && !hdict_grow(d)) return 0;
+    idx = hash_key(field) % d->cap;
+    hdictEntry *en = malloc(sizeof(hdictEntry));
+    if (!en) return 0;
+    en->field = field;
+    en->index = index;
+    en->next = d->buckets[idx];
+    d->buckets[idx] = en;
+    d->count++;
+    return 1;
+}
+
+static void hdict_remove(hdict *d, const char *field) {
+    size_t idx = hash_key(field) % d->cap;
+    hdictEntry **pp = &d->buckets[idx];
+    while (*pp) {
+        if (strcmp((*pp)->field, field) == 0) {
+            hdictEntry *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            d->count--;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
 static void hash_free(Hash *h) {
     if (!h) return;
     for (size_t i = 0; i < h->len; i++) {
@@ -68,6 +185,7 @@ static void hash_free(Hash *h) {
     }
     free(h->fields);
     free(h->values);
+    hdict_free(h->dict);
     free(h);
 }
 
@@ -499,7 +617,8 @@ static Hash *hash_new(void) {
     h->cap = 8;
     h->fields = calloc(h->cap, sizeof(char *));
     h->values = calloc(h->cap, sizeof(char *));
-    if (!h->fields || !h->values) {
+    h->dict = hdict_new();
+    if (!h->fields || !h->values || !h->dict) {
         hash_free(h);
         return NULL;
     }
@@ -508,9 +627,7 @@ static Hash *hash_new(void) {
 
 /* Index of field, or -1 when absent. */
 static long long hash_find(Hash *h, const char *field) {
-    for (size_t i = 0; i < h->len; i++)
-        if (strcmp(h->fields[i], field) == 0) return (long long)i;
-    return -1;
+    return hdict_find(h->dict, field);
 }
 
 /* Set field to value, adding it if absent. Returns 1 new, 0 updated,
@@ -547,6 +664,16 @@ static int hash_put(Hash *h, const char *field, const char *value) {
     h->fields[h->len] = f;
     h->values[h->len] = v;
     h->len++;
+    if (!hdict_set(h->dict, f, h->len - 1)) {
+        /* The field is appended but unindexed; roll the append back
+           rather than leave a field no lookup can find. */
+        h->len--;
+        free(h->fields[h->len]);
+        free(h->values[h->len]);
+        h->fields[h->len] = NULL;
+        h->values[h->len] = NULL;
+        return -1;
+    }
     return 1;
 }
 
@@ -555,6 +682,7 @@ static int hash_put(Hash *h, const char *field, const char *value) {
 static int hash_remove(Hash *h, const char *field) {
     long long idx = hash_find(h, field);
     if (idx < 0) return 0;
+    hdict_remove(h->dict, field);
     free(h->fields[idx]);
     free(h->values[idx]);
     for (size_t i = (size_t)idx + 1; i < h->len; i++) {
@@ -564,6 +692,10 @@ static int hash_remove(Hash *h, const char *field) {
     h->len--;
     h->fields[h->len] = NULL;
     h->values[h->len] = NULL;
+    /* The fields that moved down one slot need their dict indexes
+       moved with them; re-indexing an existing field cannot fail. */
+    for (size_t i = (size_t)idx; i < h->len; i++)
+        hdict_set(h->dict, h->fields[i], i);
     return 1;
 }
 
