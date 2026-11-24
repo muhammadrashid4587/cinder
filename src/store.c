@@ -1535,6 +1535,88 @@ int store_lrange(Store *s, const char *key, long long start, long long stop,
     return 0;
 }
 
+/* Re-lay a circular list out from index 0, keeping the capacity: the
+   middle-insert in store_linsert shifts pointers with memmove, which
+   only works on a linear layout. */
+static int list_linearize(List *l) {
+    if (l->head == 0) return 1;
+    char **ni = calloc(l->cap, sizeof(char *));
+    if (!ni) return 0;
+    for (size_t i = 0; i < l->len; i++)
+        ni[i] = l->items[(l->head + i) % l->cap];
+    free(l->items);
+    l->items = ni;
+    l->head = 0;
+    return 1;
+}
+
+int store_lindex(Store *s, const char *key, long long index, char **out) {
+    *out = NULL;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_LIST) return -1;
+    e->last_access = ++s->clock;
+    List *l = e->list;
+    long long len = (long long)l->len;
+    if (index < 0) index += len;
+    if (index < 0 || index >= len) return 0;
+    *out = strdup(l->items[(l->head + (size_t)index) % l->cap]);
+    return *out ? 0 : -2;
+}
+
+int store_lset(Store *s, const char *key, long long index, const char *elem) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_LIST) return -1;
+    List *l = e->list;
+    long long len = (long long)l->len;
+    if (index < 0) index += len;
+    if (index < 0 || index >= len) return -4;
+    size_t pos = (l->head + (size_t)index) % l->cap;
+    if (strcmp(l->items[pos], elem) == 0) return 1; /* no-op: same value */
+    char *ne = strdup(elem);
+    if (!ne) return -2;
+    free(l->items[pos]);
+    l->items[pos] = ne;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return 0;
+}
+
+long long store_linsert(Store *s, const char *key, int before,
+                        const char *pivot, const char *elem) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -1;
+    if (e->type != ENTRY_LIST) return -2;
+    List *l = e->list;
+    size_t pos = l->len; /* stays len when the pivot is absent */
+    for (size_t i = 0; i < l->len; i++) {
+        if (strcmp(l->items[(l->head + i) % l->cap], pivot) == 0) {
+            pos = i;
+            break;
+        }
+    }
+    if (pos == l->len) return 0;
+    if (!before) pos++; /* insert after the pivot */
+    char *ne = strdup(elem);
+    if (!ne) return -3;
+    if (l->len == l->cap && !list_grow(l)) {
+        free(ne);
+        return -3;
+    }
+    if (!list_linearize(l)) {
+        free(ne);
+        return -3;
+    }
+    memmove(&l->items[pos + 1], &l->items[pos],
+            (l->len - pos) * sizeof(char *));
+    l->items[pos] = ne;
+    l->len++;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return (long long)l->len;
+}
+
 /* ---------- sets ---------- */
 
 long long store_sadd(Store *s, const char *key, const char *member) {

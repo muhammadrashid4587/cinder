@@ -284,6 +284,26 @@ long long store_llen(Store *s, const char *key);
 int store_lrange(Store *s, const char *key, long long start, long long stop,
                  char ***out, size_t *n_out);
 
+/* The element at index, negative indexes count from the end, as in
+   Redis. Returns 0 on success (*out is a malloc'd copy of the
+   element, or NULL when the key is missing or the index is out of
+   range), -1 = wrong type, -2 = out of memory. Read-only: it does
+   not create the key. */
+int store_lindex(Store *s, const char *key, long long index, char **out);
+/* Set the element at index, negative indexes count from the end, as
+   in Redis. Preserves the key's TTL. Returns 0 when the element
+   changed, 1 when the element already held exactly that value (no
+   change, so no WATCH invalidation and nothing to log), -1 = wrong
+   type, -2 = out of memory, -3 = no such key, -4 = index out of
+   range. */
+int store_lset(Store *s, const char *key, long long index, const char *elem);
+/* Insert elem before (before = 1) or after (before = 0) the first
+   occurrence of pivot, as in Redis. Preserves the key's TTL.
+   Returns the new length, 0 when the pivot is not in the list,
+   -1 = no such key, -2 = wrong type, -3 = out of memory. */
+long long store_linsert(Store *s, const char *key, int before,
+                        const char *pivot, const char *elem);
+
 /* Add one member. Returns the number added (1 new, 0 already present),
    -1 = key holds a string or list, -2 = out of memory. Creates the set
    when the key is missing. */

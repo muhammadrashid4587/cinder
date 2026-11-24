@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.31.0"
+#define CINDER_VERSION "0.32.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -942,6 +942,57 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(elems);
         return 0;
     }
+    if (strcasecmp(cmd, "LINDEX") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'lindex' command"), 0;
+        long long index;
+        if (!parse_ll(argv[2], &index))
+            return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        char *el = NULL;
+        int rc = store_lindex(g_store, argv[1], index, &el);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (!el) return dbuf_null(reply), 0;
+        dbuf_bulk(reply, el, strlen(el));
+        free(el);
+        return 0;
+    }
+    if (strcasecmp(cmd, "LSET") == 0) {
+        if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'lset' command"), 0;
+        long long index;
+        if (!parse_ll(argv[2], &index))
+            return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        int rc = store_lset(g_store, argv[1], index, argv[3]);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == -3)
+            return dbuf_error(reply, "no such key"), 0;
+        if (rc == -4)
+            return dbuf_error(reply, "index out of range"), 0;
+        dbuf_simple(reply, "OK");
+        /* A no-op set (the element already held that value) changes
+           nothing, so it is not logged or replicated. */
+        return rc == 0 ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "LINSERT") == 0) {
+        if (argc != 5) return dbuf_error(reply, "wrong number of arguments for 'linsert' command"), 0;
+        int before;
+        if (strcasecmp(argv[2], "BEFORE") == 0) before = 1;
+        else if (strcasecmp(argv[2], "AFTER") == 0) before = 0;
+        else return dbuf_error(reply, "syntax error"), 0;
+        long long n = store_linsert(g_store, argv[1], before, argv[3], argv[4]);
+        if (n == -2)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (n == -3)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_int(reply, n);
+        /* -1 (no such key) and 0 (pivot not found) change nothing,
+           so they are not logged or replicated. */
+        return n > 0 ? 1 : 0;
+    }
     if (strcasecmp(cmd, "SADD") == 0) {
         if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'sadd' command"), 0;
         long long added = 0;
@@ -1427,6 +1478,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "GETRANGE", "SETRANGE", "SETBIT", "GETBIT", "BITCOUNT", "BITOP", "BITFIELD",
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
+            "LINDEX", "LSET", "LINSERT",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",

@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.31.0.
+Version 0.32.0.
 
 ## Why
 
@@ -77,6 +77,9 @@ OK
 | `LPOP key`, `RPOP key` | Pop from head / tail; popping the last element deletes the key |
 | `LLEN key` | List length (`0` when missing) |
 | `LRANGE key start stop` | Elements, inclusive, negative indexes from the end |
+| `LINDEX key index` | Element at index, negative indexes count from the end (`nil` when missing or out of range) |
+| `LSET key index element` | Set the element at index (`no such key` when missing, `index out of range` when out of range); preserves the TTL; setting an element to the value it already holds changes nothing and is not logged |
+| `LINSERT key BEFORE\|AFTER pivot element` | Insert before or after the first occurrence of `pivot`; returns the new length, `0` when the pivot is not in the list, `-1` when the key is missing; preserves the TTL |
 | `SADD key member [member ...]` | Add to set; returns number added (duplicates ignored); creates the set |
 | `SREM key member [member ...]` | Remove from set; returns number removed; emptying the set deletes the key |
 | `SMEMBERS key` | All members (insertion order) |
@@ -437,7 +440,17 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # errors, the max bit offset, a `BITFIELD` write
             # invalidating a `WATCH` while a no-op write does not,
             # `COMMAND` listing `BITFIELD`, and an AOF restart
-            # replaying a `BITFIELD` key)
+            # replaying a `BITFIELD` key), and list-index checks
+            # (`LINDEX` reading by positive and negative index,
+            # `nil` for a missing key or an out-of-range index;
+            # `LSET` setting by positive and negative index,
+            # `no such key` and `index out of range` errors, a
+            # no-op set changing nothing, and the TTL surviving a
+            # set; `LINSERT` inserting `BEFORE`/`AFTER` the first
+            # occurrence of a pivot, `0` when the pivot is absent,
+            # `-1` when the key is missing, a bad direction error,
+            # and wrong-type errors for all three; `COMMAND`
+            # listing all three)
 ```
 
 ## Roadmap
@@ -676,3 +689,20 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       Limitation: `u64` is rejected, as in Redis, because RESP
       integers are signed 64-bit, and the whole field is read and
       written bit by bit, so a 64-bit field costs 64 bit operations
+
+- [x] List index commands: `LINDEX` / `LSET` / `LINSERT`
+      (0.32.0): read, overwrite, and insert at an index in a list,
+      with Redis index semantics (negative indexes count from the
+      end). `LINDEX` answers `nil` for a missing key or an
+      out-of-range index; `LSET` errors `no such key` and `index
+      out of range` and preserves the TTL, and setting an element
+      to the value it already holds is a no-op (no AOF log, no
+      replication, no `WATCH` invalidation); `LINSERT` inserts
+      before or after the first occurrence of a pivot and returns
+      the new length, `0` when the pivot is absent, `-1` when
+      the key is missing. The list is a circular buffer, so a
+      middle insert linearizes it first (a grow already does);
+      the mutating two are AOF-logged and replicated as raw
+      commands, so the snapshot and full sync needed no change.
+      Limitation: a middle insert is O(n) pointer moves, as a
+      linked list would not be
