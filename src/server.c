@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.41.0"
+#define CINDER_VERSION "0.42.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1658,6 +1658,16 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_int(reply, rank);
         return 0;
     }
+    if (strcasecmp(cmd, "ZREVRANK") == 0) {
+        if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'zrevrank' command"), 0;
+        long long rank;
+        int rc = store_zrank(g_store, argv[1], argv[2], 1, &rank);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == 0) return dbuf_null(reply), 0;
+        dbuf_int(reply, rank);
+        return 0;
+    }
     if (strcasecmp(cmd, "ZINCRBY") == 0) {
         if (argc != 4) return dbuf_error(reply, "wrong number of arguments for 'zincrby' command"), 0;
         double incr;
@@ -1917,7 +1927,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HINCRBYFLOAT", "HSCAN",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZREM",
-            "ZRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",
+            "ZRANK", "ZREVRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",
             "KEYS", "SCAN", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
             "SYNC", "PSYNC", "REPLICAOF"};

@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.41.0.
+Version 0.42.0.
 
 ## Why
 
@@ -113,6 +113,7 @@ OK
 | `ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]` | Same range, highest score first; bounds are `max` first, as in Redis, with the same exclusive/inf/`WITHSCORES`/`LIMIT` handling |
 | `ZREM key member [member ...]` | Remove members; returns number removed (the key is deleted when the last member is removed) |
 | `ZRANK key member` | 0-based rank of a member, lowest score first (`nil` when missing) |
+| `ZREVRANK key member` | 0-based rank of a member, highest score first (`nil` when missing) |
 | `ZINCRBY key increment member` | Add to a member's score (creating member and key when missing); returns the new score |
 | `ZPOPMIN key [count]`, `ZPOPMAX key [count]` | Remove and return the lowest- / highest-scoring member(s) with their scores, flat `[member, score, ...]`; `count` defaults to 1 and must be positive, a count past the end pops the whole set, an empty array when missing, and popping the last member deletes the key |
 | `ZRANDMEMBER key [count [WITHSCORES]]` | A random member (bulk reply, `nil` when missing), or `count` of them as an array; a positive count returns distinct members (at most the whole set), a negative count samples with replacement so members may repeat, `0` returns an empty array, and `WITHSCORES` interleaves each score after its member |
@@ -366,7 +367,11 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # `WITHSCORES` pairing each score with its member, a
             # `COUNT` of 0, a cursor past the end, a missing key,
             # bad cursor and options, a duplicate `WITHSCORES`,
-            # and `COMMAND` listing it), an AOF
+            # and `COMMAND` listing it), and `ZREVRANK` checks
+            # (highest member ranks 0, lowest ranks last, `nil`
+            # for a missing key or member, wrong-type and
+            # wrong-argument errors, and `COMMAND` listing it),
+            # an AOF
             # restart test (data, a list, a set, a hash and a sorted set survive a
             # SHUTDOWN and reload), and everysec-policy checks (INFO
             # reports the policy, the AOF holds the record before any
@@ -905,3 +910,11 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       returned twice, as with `SCAN`. The store gains
       `store_zscan`; the command is read-only, so AOF logging,
       `WATCH` invalidation and replication needed no change.
+
+- [x] `ZREVRANK` (0.42.0): 0-based rank of a member, highest
+      score first — the reverse-rank path `store_zrank` already
+      had (`reverse` counts down from the top) finally gets a
+      command on it, mirroring `ZRANK`: `nil` for a missing key
+      or member, a `WRONGTYPE` error on a non-sorted-set key,
+      listed by `COMMAND`. Read-only, so AOF logging, `WATCH`
+      invalidation and replication needed no change.
