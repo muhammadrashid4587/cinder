@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.47.0"
+#define CINDER_VERSION "0.48.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1551,6 +1551,26 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_bulk(reply, buf, strlen(buf));
         return 0;
     }
+    if (strcasecmp(cmd, "ZMSCORE") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'zmscore' command"), 0;
+        int t = store_type(g_store, argv[1]);
+        if (t != 0 && t != 5)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_array_header(reply, (long long)(argc - 2));
+        for (int i = 2; i < argc; i++) {
+            double score;
+            int rc = store_zscore(g_store, argv[1], argv[i], &score);
+            if (rc == -1)
+                /* Unreachable: the type check above already rejected
+                   non-sorted-set keys, and the loop is single-threaded. */
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == 0) { dbuf_null(reply); continue; }
+            char buf[32];
+            format_score(buf, sizeof(buf), score);
+            dbuf_bulk(reply, buf, strlen(buf));
+        }
+        return 0;
+    }
     if (strcasecmp(cmd, "ZCARD") == 0) {
         if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'zcard' command"), 0;
         long long n = store_zcard(g_store, argv[1]);
@@ -2090,7 +2110,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",
-            "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
+            "ZADD", "ZSCORE", "ZMSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",
             "ZRANK", "ZREVRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",

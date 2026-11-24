@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.47.0.
+Version 0.48.0.
 
 ## Why
 
@@ -106,6 +106,7 @@ OK
 | `HSCAN key cursor [MATCH pattern] [COUNT n]` | Cursor-based iteration over a hash's fields: start at cursor `0`, repeat with the returned cursor until it comes back `0`; each call returns the next cursor and a flat `[field, value, ...]` array of matching pairs; `MATCH` filters field names with the same glob as `KEYS`, `COUNT` (default 10) is a hint for how many matching pairs to return per call |
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
+| `ZMSCORE key member [member ...]` | Scores of several members at once, in order (`nil` for a missing member, an array of `nil`s when the key is missing) |
 | `ZCARD key` | Number of members (`0` when missing) |
 | `ZRANGE key start stop [WITHSCORES]` | Members in index range, lowest score first; negative indices count from the end, `WITHSCORES` interleaves each score after its member |
 | `ZREVRANGE key start stop [WITHSCORES]` | Same range, highest score first |
@@ -1019,3 +1020,16 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       is logged to the AOF and replicated and invalidates `WATCH`
       on the key; removing nothing is a no-op, so it is none of
       those.
+
+- [x] `ZMSCORE` (0.48.0): return the scores of several members of a
+      sorted set in one command, `ZMSCORE key member [member ...]`,
+      in the order requested, `nil` for a member that is not in the
+      set and an array of `nil`s when the key is missing, as in real
+      Redis. It reuses `store_zscore`, so it needs no new store
+      code; the handler pre-checks the key type (missing or sorted
+      set, else `WRONGTYPE`) and writes one bulk score or `nil`
+      per member, following the `HMGET` pattern. A missing key
+      answers an array of `nil`s, not a `nil` array, because that
+      is what real Redis returns. It is a read, so it is not
+      logged to the AOF, not replicated, and does not invalidate
+      `WATCH`, and it is listed by `COMMAND`.

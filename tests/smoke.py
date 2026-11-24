@@ -1408,6 +1408,22 @@ def main():
               ("error", "ERR syntax error"))
         check("ZREMRANGEBYLEX empty bracket", c.cmd("ZREMRANGEBYLEX", "rlzset2", "[", "+"),
               ("error", "ERR syntax error"))
+        # ZMSCORE. mszset holds a=1, b=2.5, c=-3.
+        check("ZADD mszset", c.cmd("ZADD", "mszset", "1", "a", "2.5", "b", "-3", "c"), 3)
+        check("ZMSCORE all", c.cmd("ZMSCORE", "mszset", "a", "b", "c"),
+              ["1", "2.5", "-3"])
+        check("ZMSCORE order", c.cmd("ZMSCORE", "mszset", "c", "a"), ["-3", "1"])
+        check("ZMSCORE missing member", c.cmd("ZMSCORE", "mszset", "a", "ghost", "c"),
+              ["1", None, "-3"])
+        check("ZMSCORE missing key", c.cmd("ZMSCORE", "ghostzset", "a", "b"),
+              [None, None])
+        check("ZMSCORE one", c.cmd("ZMSCORE", "mszset", "b"), ["2.5"])
+        check("ZMSCORE wrongtype", c.cmd("ZMSCORE", "after", "x"), wrongtype)
+        check("ZMSCORE wrong args", c.cmd("ZMSCORE", "mszset"),
+              ("error", "ERR wrong number of arguments for 'zmscore' command"))
+        check("COMMAND lists ZMSCORE", "ZMSCORE" in c.cmd("COMMAND"), True)
+        # Deleted again: the AOF restart below counts exactly 7 keys.
+        check("ZMSCORE cleanup", c.cmd("DEL", "mszset"), 1)
         check("ZREMRANGEBYLEX wrongtype", c.cmd("ZREMRANGEBYLEX", "after", "-", "+"),
               wrongtype)
         check("COMMAND lists ZREMRANGEBYLEX", "ZREMRANGEBYLEX" in c.cmd("COMMAND"), True)
@@ -2117,7 +2133,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.47.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.48.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
