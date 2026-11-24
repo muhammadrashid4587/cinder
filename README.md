@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.39.0.
+Version 0.40.0.
 
 ## Why
 
@@ -86,6 +86,7 @@ OK
 | `SADD key member [member ...]` | Add to set; returns number added (duplicates ignored); creates the set |
 | `SREM key member [member ...]` | Remove from set; returns number removed; emptying the set deletes the key |
 | `SMEMBERS key` | All members (insertion order) |
+| `SSCAN key cursor [MATCH pattern] [COUNT n]` | Cursor-based iteration over a set's members: start at cursor `0`, repeat with the returned cursor until it comes back `0`; each call returns the next cursor and an array of matching members; `MATCH` filters member names with the same glob as `KEYS`, `COUNT` (default 10) is a hint for how many matching members to return per call |
 | `SISMEMBER key member` | `1` if member, `0` if not |
 | `SCARD key` | Set size (`0` when missing) |
 | `HSET key field value [field value ...]` | Set fields; returns number of new fields (updates return `0` for that field) |
@@ -871,3 +872,15 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       `store_sadd`. This retires the "sets still use a linear
       scan" limitation above, so no core type is left on a
       linear scan.
+
+- [x] `SSCAN` (0.40.0): cursor-based iteration over a set's
+      members, `SSCAN key cursor [MATCH pattern] [COUNT n]`,
+      modelled on `HSCAN` — the cursor is an index into the
+      set's members array, `MATCH` filters member names with
+      the same glob as `KEYS`, `COUNT` (default 10) is a hint
+      for how many matching members to return per call, and a
+      missing key answers `["0", []]`. A member added or
+      removed between calls may be skipped or returned twice,
+      as with `SCAN`. The store gains `store_sscan`; the
+      command is read-only, so AOF logging, `WATCH`
+      invalidation and replication needed no change.

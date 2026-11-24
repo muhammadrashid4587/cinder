@@ -2400,6 +2400,54 @@ int store_smembers(Store *s, const char *key, char ***out, size_t *n_out) {
     return 0;
 }
 
+int store_sscan(Store *s, const char *key, unsigned long long cursor,
+                const char *pattern, size_t count, char ***out,
+                size_t *n_out, unsigned long long *next_out) {
+    *out = NULL;
+    *n_out = 0;
+    *next_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_SET) return -1;
+    e->last_access = ++s->clock;
+    Set *st = e->set;
+    if (count == 0 || cursor >= st->len) return 0;
+    char **res = NULL;
+    size_t n = 0, cap = 0;
+    size_t i = (size_t)cursor;
+    while (i < st->len) {
+        if (glob_match(pattern, st->members[i])) {
+            if (n + 1 > cap) {
+                size_t ncap = cap ? cap * 2 : 16;
+                char **nres = realloc(res, ncap * sizeof(char *));
+                if (!nres) {
+                    for (size_t j = 0; j < n; j++) free(res[j]);
+                    free(res);
+                    return -2;
+                }
+                res = nres;
+                cap = ncap;
+            }
+            res[n] = strdup(st->members[i]);
+            if (!res[n]) {
+                for (size_t j = 0; j < n; j++) free(res[j]);
+                free(res);
+                return -2;
+            }
+            n++;
+            if (n >= count) {
+                i++;
+                break;
+            }
+        }
+        i++;
+    }
+    *out = res;
+    *n_out = n;
+    *next_out = (i >= st->len) ? 0 : (unsigned long long)i;
+    return 0;
+}
+
 /* ---------- hashes ---------- */
 
 long long store_hset(Store *s, const char *key, const char *field,

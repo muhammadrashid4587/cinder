@@ -354,6 +354,20 @@ long long store_scard(Store *s, const char *key);
    empty), -1 = wrong type, -2 = out of memory. *out is a malloc'd
    array of malloc'd strings; the caller frees both. */
 int store_smembers(Store *s, const char *key, char ***out, size_t *n_out);
+/* Cursor-based iteration over a set's members, Redis SSCAN
+   semantics: start with cursor 0, repeat with the returned cursor
+   until it comes back 0. The cursor is an index into the set's
+   members array, so a member added or removed between calls may be
+   skipped or returned twice, as with SCAN. `pattern` is the same
+   glob as KEYS/SCAN, matched against member names; `count` is a
+   hint for how many matching members to return per call (0 returns
+   none and cursor 0). Returns 0 on success (*n_out is the member
+   count, 0 for a missing key, and *next_out is the next cursor),
+   -1 = wrong type, -2 = out of memory. *out is a malloc'd array of
+   malloc'd strings; the caller frees both. */
+int store_sscan(Store *s, const char *key, unsigned long long cursor,
+                const char *pattern, size_t count, char ***out,
+                size_t *n_out, unsigned long long *next_out);
 
 /* Set one field. Returns 1 when the field is new, 0 when it overwrote
    an existing field, -1 = key holds a string, list or set, -2 = out of

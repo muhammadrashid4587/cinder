@@ -934,6 +934,33 @@ def main():
               ("error", "ERR wrong number of arguments for 'hscan' command"))
         check("HSCAN bad option", c.cmd("HSCAN", "scanhash", "0", "NOPE"),
               ("error", "ERR syntax error"))
+        # SSCAN: full iteration, MATCH, COUNT pagination, errors.
+        check("SADD scanset", c.cmd("SADD", "scanset", "m1", "m2", "m3", "m4", "m5"), 5)
+        check("SSCAN all", c.cmd("SSCAN", "scanset", "0"),
+              ["0", ["m1", "m2", "m3", "m4", "m5"]])
+        check("SSCAN MATCH m1*", c.cmd("SSCAN", "scanset", "0", "MATCH", "m1*"),
+              ["0", ["m1"]])
+        check("SSCAN MATCH none", c.cmd("SSCAN", "scanset", "0", "MATCH", "zzz*"),
+              ["0", []])
+        check("SSCAN COUNT 2 page 1", c.cmd("SSCAN", "scanset", "0", "COUNT", "2"),
+              ["2", ["m1", "m2"]])
+        check("SSCAN COUNT 2 page 2", c.cmd("SSCAN", "scanset", "2", "COUNT", "2"),
+              ["4", ["m3", "m4"]])
+        check("SSCAN COUNT 2 page 3", c.cmd("SSCAN", "scanset", "4", "COUNT", "2"),
+              ["0", ["m5"]])
+        check("SSCAN COUNT 0", c.cmd("SSCAN", "scanset", "0", "COUNT", "0"),
+              ["0", []])
+        check("SSCAN cursor past end", c.cmd("SSCAN", "scanset", "99"),
+              ["0", []])
+        check("SSCAN missing key", c.cmd("SSCAN", "ghostset", "0"), ["0", []])
+        check("SSCAN wrongtype", c.cmd("SSCAN", "after", "0"), wrongtype)
+        check("SSCAN bad cursor", c.cmd("SSCAN", "scanset", "abc"),
+              ("error", "ERR invalid cursor"))
+        check("SSCAN wrong args", c.cmd("SSCAN", "scanset"),
+              ("error", "ERR wrong number of arguments for 'sscan' command"))
+        check("SSCAN bad option", c.cmd("SSCAN", "scanset", "0", "NOPE"),
+              ("error", "ERR syntax error"))
+        check("COMMAND lists SSCAN", "SSCAN" in c.cmd("COMMAND"), True)
         check("COMMAND lists HMGET", "HMGET" in c.cmd("COMMAND"), True)
         check("COMMAND lists HSETNX", "HSETNX" in c.cmd("COMMAND"), True)
         check("COMMAND lists HINCRBY", "HINCRBY" in c.cmd("COMMAND"), True)
@@ -1844,7 +1871,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.39.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.40.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

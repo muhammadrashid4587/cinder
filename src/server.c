@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.39.0"
+#define CINDER_VERSION "0.40.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1091,6 +1091,63 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(members);
         return 0;
     }
+    if (strcasecmp(cmd, "SSCAN") == 0) {
+        if (argc < 3)
+            return dbuf_error(reply, "wrong number of arguments for 'sscan' command"), 0;
+        /* The cursor is an unsigned decimal integer, as in SCAN;
+           anything else is the same "invalid cursor" error. */
+        unsigned long long cursor = 0;
+        if (!*argv[2])
+            return dbuf_error(reply, "invalid cursor"), 0;
+        for (const char *p = argv[2]; *p; p++) {
+            if (*p < '0' || *p > '9')
+                return dbuf_error(reply, "invalid cursor"), 0;
+            cursor = cursor * 10 + (unsigned long long)(*p - '0');
+        }
+        const char *pattern = "*";
+        long long count = 10; /* Redis's default COUNT */
+        int seen_match = 0, seen_count = 0;
+        for (int i = 3; i < argc; i++) {
+            if (strcasecmp(argv[i], "MATCH") == 0) {
+                if (seen_match || i + 1 >= argc)
+                    return dbuf_error(reply, "syntax error"), 0;
+                seen_match = 1;
+                pattern = argv[++i];
+            } else if (strcasecmp(argv[i], "COUNT") == 0) {
+                if (seen_count || i + 1 >= argc)
+                    return dbuf_error(reply, "syntax error"), 0;
+                seen_count = 1;
+                long long n;
+                if (!parse_ll(argv[++i], &n))
+                    return dbuf_error(reply, "value is not an integer or out of range"), 0;
+                if (n < 0)
+                    return dbuf_error(reply, "syntax error"), 0;
+                count = n;
+            } else {
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        }
+        char **members = NULL;
+        size_t n = 0;
+        unsigned long long next = 0;
+        int rc = store_sscan(g_store, argv[1], cursor, pattern,
+                             (size_t)count, &members, &n, &next);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_array_header(reply, 2);
+        char curbuf[32];
+        snprintf(curbuf, sizeof(curbuf), "%llu", next);
+        dbuf_bulk(reply, curbuf, strlen(curbuf));
+        dbuf_array_header(reply, (long long)n);
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, members[i], strlen(members[i]));
+            free(members[i]);
+        }
+        free(members);
+        return 0;
+    }
     if (strcasecmp(cmd, "SISMEMBER") == 0) {
         if (argc != 3) return dbuf_error(reply, "wrong number of arguments for 'sismember' command"), 0;
         int rc = store_sismember(g_store, argv[1], argv[2]);
@@ -1783,7 +1840,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "LINDEX", "LSET", "LINSERT", "LPUSHX", "RPUSHX", "LTRIM",
             "LMOVE",
-            "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
+            "SADD", "SREM", "SMEMBERS", "SSCAN", "SISMEMBER", "SCARD",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",
