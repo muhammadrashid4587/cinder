@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.40.0"
+#define CINDER_VERSION "0.41.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1766,6 +1766,77 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(scores);
         return 0;
     }
+    if (strcasecmp(cmd, "ZSCAN") == 0) {
+        if (argc < 3)
+            return dbuf_error(reply, "wrong number of arguments for 'zscan' command"), 0;
+        /* The cursor is a skip-list rank, an unsigned decimal
+           integer, as in SCAN; anything else is the same
+           "invalid cursor" error. */
+        unsigned long long cursor = 0;
+        if (!*argv[2])
+            return dbuf_error(reply, "invalid cursor"), 0;
+        for (const char *p = argv[2]; *p; p++) {
+            if (*p < '0' || *p > '9')
+                return dbuf_error(reply, "invalid cursor"), 0;
+            cursor = cursor * 10 + (unsigned long long)(*p - '0');
+        }
+        const char *pattern = "*";
+        long long count = 10; /* Redis's default COUNT */
+        int withscores = 0;
+        int seen_match = 0, seen_count = 0, seen_withscores = 0;
+        for (int i = 3; i < argc; i++) {
+            if (strcasecmp(argv[i], "MATCH") == 0) {
+                if (seen_match || i + 1 >= argc)
+                    return dbuf_error(reply, "syntax error"), 0;
+                seen_match = 1;
+                pattern = argv[++i];
+            } else if (strcasecmp(argv[i], "COUNT") == 0) {
+                if (seen_count || i + 1 >= argc)
+                    return dbuf_error(reply, "syntax error"), 0;
+                seen_count = 1;
+                long long n;
+                if (!parse_ll(argv[++i], &n))
+                    return dbuf_error(reply, "value is not an integer or out of range"), 0;
+                if (n < 0)
+                    return dbuf_error(reply, "syntax error"), 0;
+                count = n;
+            } else if (strcasecmp(argv[i], "WITHSCORES") == 0) {
+                if (seen_withscores)
+                    return dbuf_error(reply, "syntax error"), 0;
+                seen_withscores = 1;
+                withscores = 1;
+            } else {
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        }
+        char **members = NULL;
+        double *scores = NULL;
+        size_t n = 0;
+        unsigned long long next = 0;
+        int rc = store_zscan(g_store, argv[1], cursor, pattern,
+                             (size_t)count, &members, &scores, &n, &next);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_array_header(reply, 2);
+        char curbuf[32];
+        snprintf(curbuf, sizeof(curbuf), "%llu", next);
+        dbuf_bulk(reply, curbuf, strlen(curbuf));
+        dbuf_array_header(reply, (long long)(withscores ? n * 2 : n));
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, members[i], strlen(members[i]));
+            if (withscores) {
+                char buf[32];
+                format_score(buf, sizeof(buf), scores[i]);
+                dbuf_bulk(reply, buf, strlen(buf));
+            }
+            free(members[i]);
+        }
+        free(members);
+        free(scores);
+        return 0;
+    }
     if (strcasecmp(cmd, "FLUSHALL") == 0) {
         store_flush(g_store);
         dbuf_simple(reply, "OK");
@@ -1846,7 +1917,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HINCRBYFLOAT", "HSCAN",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZREM",
-            "ZRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER",
+            "ZRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",
             "KEYS", "SCAN", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
             "SYNC", "PSYNC", "REPLICAOF"};

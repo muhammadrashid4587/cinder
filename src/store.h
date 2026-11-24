@@ -497,6 +497,23 @@ int store_zpop(Store *s, const char *key, long long count, int from_max,
 int store_zrandmember(Store *s, const char *key, long long count,
                       char ***members_out, double **scores_out,
                       size_t *n_out);
+/* Cursor-based iteration over a sorted set's members, Redis ZSCAN
+   semantics: start with cursor 0, repeat with the returned cursor
+   until it comes back 0. The cursor is a skip-list rank (0-based),
+   so members are visited in (score, member) order, and a member
+   added or removed between calls may be skipped or returned twice,
+   as with SCAN. `pattern` is the same glob as KEYS/SCAN, matched
+   against member names; `count` is a hint for how many matching
+   members to return per call (0 returns none and cursor 0).
+   Returns 0 on success (*n_out is the member count, 0 for a
+   missing key, and *next_out is the next cursor), -1 = wrong type,
+   -2 = out of memory. *members_out is a malloc'd array of
+   malloc'd strings and *scores_out a malloc'd array of the
+   matching scores; the caller frees both. */
+int store_zscan(Store *s, const char *key, unsigned long long cursor,
+                const char *pattern, size_t count,
+                char ***members_out, double **scores_out,
+                size_t *n_out, unsigned long long *next_out);
 /* Visit every member of a sorted set in (score, member) order — the
    order the skip list keeps. Returns 0 on success, -1 = wrong type
    (or no such key, which the caller can treat the same way: no

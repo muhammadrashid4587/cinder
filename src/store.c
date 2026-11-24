@@ -2854,6 +2854,79 @@ int store_zrange(Store *s, const char *key, long long start, long long stop,
     return 0;
 }
 
+/* Cursor-based iteration over a sorted set's members, in
+   (score, member) order. The cursor is a 0-based rank into the
+   skip list, so the scan starts at the node at rank cursor + 1
+   and walks level 0 forward, collecting up to `count` members
+   whose names match the glob. The next cursor is the rank after
+   the last member returned, or 0 when the end was reached. */
+int store_zscan(Store *s, const char *key, unsigned long long cursor,
+                const char *pattern, size_t count,
+                char ***members_out, double **scores_out,
+                size_t *n_out, unsigned long long *next_out) {
+    *members_out = NULL;
+    *scores_out = NULL;
+    *n_out = 0;
+    *next_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    e->last_access = ++s->clock;
+    ZSet *z = e->zset;
+    if (count == 0 || cursor >= z->len) return 0;
+    char **members = NULL;
+    double *scores = NULL;
+    size_t n = 0, cap = 0;
+    /* Ranks are 1-based, so the cursor's node is rank cursor + 1. */
+    zslNode *node = zsl_get_by_rank(z->sl, (unsigned long)cursor + 1);
+    size_t i = (size_t)cursor;
+    while (node) {
+        if (glob_match(pattern, node->member)) {
+            if (n + 1 > cap) {
+                size_t ncap = cap ? cap * 2 : 16;
+                char **nm = realloc(members, ncap * sizeof(char *));
+                if (!nm) {
+                    for (size_t j = 0; j < n; j++) free(members[j]);
+                    free(members);
+                    free(scores);
+                    return -2;
+                }
+                members = nm;
+                double *ns = realloc(scores, ncap * sizeof(double));
+                if (!ns) {
+                    for (size_t j = 0; j < n; j++) free(members[j]);
+                    free(members);
+                    free(scores);
+                    return -2;
+                }
+                scores = ns;
+                cap = ncap;
+            }
+            members[n] = strdup(node->member);
+            if (!members[n]) {
+                for (size_t j = 0; j < n; j++) free(members[j]);
+                free(members);
+                free(scores);
+                return -2;
+            }
+            scores[n] = node->score;
+            n++;
+            if (n >= count) {
+                node = node->level[0].forward;
+                i++;
+                break;
+            }
+        }
+        node = node->level[0].forward;
+        i++;
+    }
+    *members_out = members;
+    *scores_out = scores;
+    *n_out = n;
+    *next_out = (i >= z->len) ? 0 : (unsigned long long)i;
+    return 0;
+}
+
 /* Members whose scores fall in [min, max], ascending by score, or
    descending when reverse is set, with an endpoint excluded when
    its flag is set. Skips `offset` matches and returns at most

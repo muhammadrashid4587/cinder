@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.40.0.
+Version 0.41.0.
 
 ## Why
 
@@ -116,6 +116,7 @@ OK
 | `ZINCRBY key increment member` | Add to a member's score (creating member and key when missing); returns the new score |
 | `ZPOPMIN key [count]`, `ZPOPMAX key [count]` | Remove and return the lowest- / highest-scoring member(s) with their scores, flat `[member, score, ...]`; `count` defaults to 1 and must be positive, a count past the end pops the whole set, an empty array when missing, and popping the last member deletes the key |
 | `ZRANDMEMBER key [count [WITHSCORES]]` | A random member (bulk reply, `nil` when missing), or `count` of them as an array; a positive count returns distinct members (at most the whole set), a negative count samples with replacement so members may repeat, `0` returns an empty array, and `WITHSCORES` interleaves each score after its member |
+| `ZSCAN key cursor [MATCH pattern] [COUNT n] [WITHSCORES]` | Cursor-based iteration over a sorted set's members, in (score, member) order: start at cursor `0`, repeat with the returned cursor until it comes back `0`; each call returns the next cursor and an array of matching members; `MATCH` filters member names with the same glob as `KEYS`, `COUNT` (default 10) is a hint for how many matching members to return per call, `WITHSCORES` interleaves each score after its member |
 | `KEYS pattern` | Glob match (`*` and `?`) |
 | `SCAN cursor [MATCH pattern] [COUNT n]` | Cursor-based keyspace iteration: start at cursor `0`, repeat with the returned cursor until it comes back `0`; `MATCH` filters with the same glob as `KEYS`, `COUNT` (default 10) is a hint for how many matching keys to return per call |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
@@ -359,7 +360,13 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # `ZRANDMEMBER` single and count forms, distinct and
             # with-replacement sampling, `WITHSCORES` pairing each
             # score with its member, missing key, bad count and
-            # option, and wrong-type errors for all three), an AOF
+            # option, and wrong-type errors for all three), and
+            # `ZSCAN` checks (full iteration in score order, `MATCH`
+            # filtering, `COUNT` pagination across three pages,
+            # `WITHSCORES` pairing each score with its member, a
+            # `COUNT` of 0, a cursor past the end, a missing key,
+            # bad cursor and options, a duplicate `WITHSCORES`,
+            # and `COMMAND` listing it), an AOF
             # restart test (data, a list, a set, a hash and a sorted set survive a
             # SHUTDOWN and reload), and everysec-policy checks (INFO
             # reports the policy, the AOF holds the record before any
@@ -884,3 +891,17 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       as with `SCAN`. The store gains `store_sscan`; the
       command is read-only, so AOF logging, `WATCH`
       invalidation and replication needed no change.
+
+- [x] `ZSCAN` (0.41.0): cursor-based iteration over a sorted
+      set's members, `ZSCAN key cursor [MATCH pattern] [COUNT n]
+      [WITHSCORES]`, completing the SCAN family — the cursor is
+      a skip-list rank (0-based), so members come back in
+      (score, member) order, `MATCH` filters member names with
+      the same glob as `KEYS`, `COUNT` (default 10) is a hint
+      for how many matching members to return per call, and
+      `WITHSCORES` interleaves each score after its member, as
+      in `ZRANGE`. A missing key answers `["0", []]`, and a
+      member added or removed between calls may be skipped or
+      returned twice, as with `SCAN`. The store gains
+      `store_zscan`; the command is read-only, so AOF logging,
+      `WATCH` invalidation and replication needed no change.

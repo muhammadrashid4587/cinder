@@ -1281,6 +1281,42 @@ def main():
         check("COMMAND lists ZPOPMIN", "ZPOPMIN" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZPOPMAX", "ZPOPMAX" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZRANDMEMBER", "ZRANDMEMBER" in c.cmd("COMMAND"), True)
+        # ZSCAN: full iteration in score order, MATCH, COUNT
+        # pagination, WITHSCORES, empty/missing key, errors.
+        check("ZADD scanzset", c.cmd("ZADD", "scanzset", "1", "a1", "2", "a2", "3", "b1", "4", "b2", "5", "c1"), 5)
+        check("ZSCAN all", c.cmd("ZSCAN", "scanzset", "0"),
+              ["0", ["a1", "a2", "b1", "b2", "c1"]])
+        check("ZSCAN WITHSCORES", c.cmd("ZSCAN", "scanzset", "0", "WITHSCORES"),
+              ["0", ["a1", "1", "a2", "2", "b1", "3", "b2", "4", "c1", "5"]])
+        check("ZSCAN MATCH a*", c.cmd("ZSCAN", "scanzset", "0", "MATCH", "a*"),
+              ["0", ["a1", "a2"]])
+        check("ZSCAN MATCH none", c.cmd("ZSCAN", "scanzset", "0", "MATCH", "zzz*"),
+              ["0", []])
+        check("ZSCAN COUNT 2 page 1", c.cmd("ZSCAN", "scanzset", "0", "COUNT", "2"),
+              ["2", ["a1", "a2"]])
+        check("ZSCAN COUNT 2 page 2", c.cmd("ZSCAN", "scanzset", "2", "COUNT", "2"),
+              ["4", ["b1", "b2"]])
+        check("ZSCAN COUNT 2 page 3", c.cmd("ZSCAN", "scanzset", "4", "COUNT", "2"),
+              ["0", ["c1"]])
+        check("ZSCAN COUNT 2 WITHSCORES page 1",
+              c.cmd("ZSCAN", "scanzset", "0", "COUNT", "2", "WITHSCORES"),
+              ["2", ["a1", "1", "a2", "2"]])
+        check("ZSCAN COUNT 0", c.cmd("ZSCAN", "scanzset", "0", "COUNT", "0"),
+              ["0", []])
+        check("ZSCAN cursor past end", c.cmd("ZSCAN", "scanzset", "99"),
+              ["0", []])
+        check("ZSCAN missing key", c.cmd("ZSCAN", "ghostzset", "0"), ["0", []])
+        check("ZSCAN wrongtype", c.cmd("ZSCAN", "after", "0"), wrongtype)
+        check("ZSCAN bad cursor", c.cmd("ZSCAN", "scanzset", "abc"),
+              ("error", "ERR invalid cursor"))
+        check("ZSCAN wrong args", c.cmd("ZSCAN", "scanzset"),
+              ("error", "ERR wrong number of arguments for 'zscan' command"))
+        check("ZSCAN bad option", c.cmd("ZSCAN", "scanzset", "0", "NOPE"),
+              ("error", "ERR syntax error"))
+        check("ZSCAN duplicate WITHSCORES",
+              c.cmd("ZSCAN", "scanzset", "0", "WITHSCORES", "WITHSCORES"),
+              ("error", "ERR syntax error"))
+        check("COMMAND lists ZSCAN", "ZSCAN" in c.cmd("COMMAND"), True)
         # Skip-list sorted sets at scale: 300 members added in
         # shuffled order, with repeated scores so member tiebreaks
         # matter, then the order, ranks, ranges and pops must all
@@ -1871,7 +1907,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.40.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.41.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
