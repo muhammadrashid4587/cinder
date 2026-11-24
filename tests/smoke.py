@@ -780,6 +780,28 @@ def main():
         check("SREM empties set", c.cmd("SREM", "myset", "b", "c", "d"), 3)
         check("EXISTS after set emptied", c.cmd("EXISTS", "myset"), 0)
         check("SADD persist set", c.cmd("SADD", "pset", "x", "y", "z"), 3)
+        # Large-set dict checks: 100 members force the member dict to
+        # grow several times, and removing a middle member swaps the
+        # last member into its hole, so the swapped member must still
+        # be found (its dict index moved with it).
+        big = ["m%d" % i for i in range(100)]
+        check("SADD big set", c.cmd("SADD", "bigset", *big), 100)
+        check("SCARD big set", c.cmd("SCARD", "bigset"), 100)
+        check("SISMEMBER big first", c.cmd("SISMEMBER", "bigset", "m0"), 1)
+        check("SISMEMBER big mid", c.cmd("SISMEMBER", "bigset", "m50"), 1)
+        check("SISMEMBER big last", c.cmd("SISMEMBER", "bigset", "m99"), 1)
+        check("SADD big dup", c.cmd("SADD", "bigset", "m50", "new"), 1)
+        check("SREM big middle", c.cmd("SREM", "bigset", "m0"), 1)
+        check("SISMEMBER swapped-in last", c.cmd("SISMEMBER", "bigset", "m99"), 1)
+        check("SISMEMBER removed", c.cmd("SISMEMBER", "bigset", "m0"), 0)
+        check("SCARD big after SREM", c.cmd("SCARD", "bigset"), 100)
+        check("SREM big last", c.cmd("SREM", "bigset", "m99"), 1)
+        check("SISMEMBER big last gone", c.cmd("SISMEMBER", "bigset", "m99"), 0)
+        check("SADD big re-add", c.cmd("SADD", "bigset", "m0"), 1)
+        check("SMEMBERS big count", len(c.cmd("SMEMBERS", "bigset")), 100)
+        check("SMEMBERS big contents", sorted(c.cmd("SMEMBERS", "bigset")),
+              sorted([m for m in big if m != "m99"] + ["new"]))
+        check("DEL bigset", c.cmd("DEL", "bigset"), 1)
         check("RPUSH persist list", c.cmd("RPUSH", "plist", "x", "y", "z"), 3)
         # Hashes: set/get multiple fields, update, delete, wrong type,
         # TTL, emptying, and AOF persistence.
@@ -1822,7 +1844,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.37.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.39.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

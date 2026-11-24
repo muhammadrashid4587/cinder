@@ -18,13 +18,18 @@ typedef struct List {
     size_t len;
 } List;
 
-/* A set value: unordered array of malloc'd strings, membership by
-   linear scan. Simple and fast enough at this scale; a hash table
-   would be the next step if sets grow large. */
+/* A set value: unordered array of malloc'd strings (insertion order
+   apart from removals, which swap the last member into the hole),
+   plus a hash table from member to its index in the array, so
+   membership is O(1) instead of a linear scan. The dict is opaque
+   here; its definition lives in store.c. SMEMBERS still walks the
+   array, so its reply is unchanged; deleting a member re-indexes
+   the member that moved into the hole, so SREM stays correct. */
 typedef struct Set {
     char **members;
     size_t cap;
     size_t len;
+    struct sdict *dict;
 } Set;
 
 /* A hash value: fields and values in insertion order (parallel

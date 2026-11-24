@@ -52,11 +52,14 @@ static void list_free(List *l) {
     free(l);
 }
 
+static void sdict_free(struct sdict *d);
+
 static void set_free(Set *st) {
     if (!st) return;
     for (size_t i = 0; i < st->len; i++)
         free(st->members[i]);
     free(st->members);
+    sdict_free(st->dict);
     free(st);
 }
 
@@ -168,6 +171,122 @@ static void hdict_remove(hdict *d, const char *field) {
     while (*pp) {
         if (strcmp((*pp)->field, field) == 0) {
             hdictEntry *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            d->count--;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+/* ---------- set member dict ---------- */
+
+/* A set value keeps its members in an unordered array and a hash
+   table from member to its index in that array, so membership is
+   O(1) instead of a linear scan. The dict entries borrow the member
+   strings owned by the array, so freeing the dict frees only the
+   entries, never the strings. Removing a member swaps the last
+   member into the hole (the array is unordered) and re-indexes the
+   member that moved, so SREM stays correct. Modelled on the hdict
+   the hash type uses, but keyed by member. */
+
+#define SDICT_INIT_CAP 16
+
+typedef struct sdictEntry {
+    char *member; /* borrowed from the Set array, not owned */
+    size_t index;
+    struct sdictEntry *next;
+} sdictEntry;
+
+typedef struct sdict {
+    sdictEntry **buckets;
+    size_t cap;
+    size_t count;
+} sdict;
+
+static sdict *sdict_new(void) {
+    sdict *d = calloc(1, sizeof(sdict));
+    if (!d) return NULL;
+    d->cap = SDICT_INIT_CAP;
+    d->buckets = calloc(d->cap, sizeof(sdictEntry *));
+    if (!d->buckets) {
+        free(d);
+        return NULL;
+    }
+    return d;
+}
+
+static void sdict_free(sdict *d) {
+    if (!d) return;
+    for (size_t i = 0; i < d->cap; i++) {
+        sdictEntry *en = d->buckets[i];
+        while (en) {
+            sdictEntry *next = en->next;
+            free(en);
+            en = next;
+        }
+    }
+    free(d->buckets);
+    free(d);
+}
+
+/* Index of member in the set's array, or -1 when absent. */
+static long long sdict_find(sdict *d, const char *member) {
+    size_t idx = hash_key(member) % d->cap;
+    for (sdictEntry *en = d->buckets[idx]; en; en = en->next)
+        if (strcmp(en->member, member) == 0) return (long long)en->index;
+    return -1;
+}
+
+static int sdict_grow(sdict *d) {
+    size_t ncap = d->cap * 2;
+    sdictEntry **nb = calloc(ncap, sizeof(sdictEntry *));
+    if (!nb) return 0;
+    for (size_t i = 0; i < d->cap; i++) {
+        sdictEntry *en = d->buckets[i];
+        while (en) {
+            sdictEntry *next = en->next;
+            size_t idx = hash_key(en->member) % ncap;
+            en->next = nb[idx];
+            nb[idx] = en;
+            en = next;
+        }
+    }
+    free(d->buckets);
+    d->buckets = nb;
+    d->cap = ncap;
+    return 1;
+}
+
+/* Point the member's dict entry at index, adding the entry when the
+   member is new. Returns 0 on OOM; re-indexing an existing member
+   cannot fail, it only updates the stored index. */
+static int sdict_set(sdict *d, char *member, size_t index) {
+    size_t idx = hash_key(member) % d->cap;
+    for (sdictEntry *en = d->buckets[idx]; en; en = en->next)
+        if (strcmp(en->member, member) == 0) {
+            en->index = index;
+            return 1;
+        }
+    if (d->count + 1 > d->cap * 3 / 4 && !sdict_grow(d)) return 0;
+    idx = hash_key(member) % d->cap;
+    sdictEntry *en = malloc(sizeof(sdictEntry));
+    if (!en) return 0;
+    en->member = member;
+    en->index = index;
+    en->next = d->buckets[idx];
+    d->buckets[idx] = en;
+    d->count++;
+    return 1;
+}
+
+static void sdict_remove(sdict *d, const char *member) {
+    size_t idx = hash_key(member) % d->cap;
+    sdictEntry **pp = &d->buckets[idx];
+    while (*pp) {
+        if (strcmp((*pp)->member, member) == 0) {
+            sdictEntry *dead = *pp;
             *pp = dead->next;
             free(dead);
             d->count--;
@@ -708,14 +827,18 @@ static Set *set_new(void) {
         free(st);
         return NULL;
     }
+    st->dict = sdict_new();
+    if (!st->dict) {
+        free(st->members);
+        free(st);
+        return NULL;
+    }
     return st;
 }
 
-/* Index of member, or -1 when absent. */
+/* Index of member, or -1 when absent. O(1) via the member dict. */
 static long long set_find(Set *st, const char *member) {
-    for (size_t i = 0; i < st->len; i++)
-        if (strcmp(st->members[i], member) == 0) return (long long)i;
-    return -1;
+    return sdict_find(st->dict, member);
 }
 
 /* Add member if absent. Returns 1 added, 0 already present, -1 = OOM. */
@@ -733,16 +856,30 @@ static int set_add(Set *st, const char *member) {
         st->members = nm;
         st->cap = ncap;
     }
-    st->members[st->len++] = m;
+    st->members[st->len] = m;
+    if (!sdict_set(st->dict, m, st->len)) {
+        /* The dict insert failed (OOM): roll the array append back
+           so the set and its dict stay in agreement. */
+        free(m);
+        return -1;
+    }
+    st->len++;
     return 1;
 }
 
-/* Remove member if present. Returns 1 removed, 0 absent. */
+/* Remove member if present. Returns 1 removed, 0 absent. The last
+   member swaps into the hole, as before, and is re-indexed in the
+   dict so a later lookup finds it at its new slot. */
 static int set_remove(Set *st, const char *member) {
     long long idx = set_find(st, member);
     if (idx < 0) return 0;
+    sdict_remove(st->dict, member);
     free(st->members[idx]);
-    st->members[idx] = st->members[--st->len];
+    st->len--;
+    if ((size_t)idx != st->len) {
+        st->members[idx] = st->members[st->len];
+        sdict_set(st->dict, st->members[idx], (size_t)idx);
+    }
     st->members[st->len] = NULL;
     return 1;
 }

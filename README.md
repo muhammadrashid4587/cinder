@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.38.0.
+Version 0.39.0.
 
 ## Why
 
@@ -132,8 +132,10 @@ src/
   server.c   TCP listener, epoll event loop, command dispatch
   store.c    hash table (djb2, chaining, resize at 0.75 load), TTLs,
              strings, lists (circular-buffer lists, O(1) push/pop),
-             sets (unordered member arrays, dedup on insert),
-             hashes (parallel field/value arrays, insertion order)
+             sets (unordered member arrays, plus a member-to-index
+             hash table for O(1) membership),
+             hashes (parallel field/value arrays, insertion order,
+             plus a field-to-index hash table for O(1) lookup)
              and sorted sets (skip list ordered by score then
              member, plus a member-to-node hash table for O(1)
              lookup)
@@ -317,7 +319,11 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # checks (push/pop both ends, length, range with negative
             # indexes, wrong-type errors, list TTL expiry), set checks
             # (add/dedup, membership, remove, wrong-type errors, set
-            # TTL expiry, emptying a set deletes the key), hash checks
+            # TTL expiry, emptying a set deletes the key, and a 100-member
+            # set exercising the member dict: dict growth, a duplicate add,
+            # removing a middle member and finding the member that swapped
+            # into its hole, removing the last member, re-adding a removed
+            # member, and the full member list), hash checks
             # (multi-field set, update, get, delete, exists, length,
             # getall in insertion order, wrong-type errors, hash TTL
             # expiry, emptying a hash deletes the key), hash-misc
@@ -397,7 +403,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # is a startup error), and a benchmark-tool check
             # (`tools/bench.py` runs against a live server, exits 0, and
             # prints one table row per operation, and `INFO` reports
-            # version 0.30.0), and `always`-policy checks (a pipeline
+            # version 0.39.0), and `always`-policy checks (a pipeline
             # mixing writes and reads returns its replies in command
             # order, two clients writing at once each get their own
             # +OK, a QUIT sent in the same packet as a SET still
@@ -848,3 +854,20 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       via `store_hset`. This retires the "hashes still use a
       linear scan" limitation above. Limitation: sets still use
       a linear scan
+
+- [x] Hash-table-backed set type (0.39.0): a set is still its
+      members in an unordered array, but membership no longer
+      scans it — a hash table maps each member to its index in
+      the array, modelled on the hash type's field dict, so
+      `SADD` / `SREM` / `SISMEMBER` are O(1) instead of O(n).
+      `SMEMBERS` still walks the array, so its reply is
+      unchanged; deleting a member swaps the last member into
+      the hole, as before, and re-indexes the member that moved,
+      so `SREM` stays correct. The public store API is
+      unchanged, TTL preservation, AOF logging, `WATCH`
+      invalidation and replication needed no change — the
+      snapshot writer and the replication emitter still walk
+      the same array — and RDB load still rebuilds via
+      `store_sadd`. This retires the "sets still use a linear
+      scan" limitation above, so no core type is left on a
+      linear scan.

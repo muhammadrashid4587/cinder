@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.37.0"
+#define CINDER_VERSION "0.39.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
