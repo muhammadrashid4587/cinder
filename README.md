@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.44.0.
+Version 0.45.0.
 
 ## Why
 
@@ -114,6 +114,7 @@ OK
 | `ZRANGEBYLEX key min max [LIMIT offset count] [REV]` | Members whose names fall in `[min, max]` lexicographically, regardless of score; bounds are `-` (-inf) / `+` (+inf) or inclusive `[x` / exclusive `(x`; `REV` returns them in reverse member order with the bounds given max-first, as in Redis; `LIMIT` skips `offset` matches and returns at most `count` (negative `count` means all) |
 | `ZLEXCOUNT key min max` | Number of members whose names fall in `[min, max]` lexicographically, with the same bounds as `ZRANGEBYLEX` but no `REV` — the count does not depend on order; `0` when missing or the range is empty, including a finite min above the max |
 | `ZREM key member [member ...]` | Remove members; returns number removed (the key is deleted when the last member is removed) |
+| `ZREMRANGEBYSCORE key min max` | Remove the members whose scores fall in `[min, max]`, with the same bounds as `ZRANGEBYSCORE` (`-inf`/`+inf`, or a leading `(` for an exclusive endpoint); returns the number removed, `0` when missing or the range is empty, including a finite min above the max, and the key is deleted when the last member is removed |
 | `ZRANK key member` | 0-based rank of a member, lowest score first (`nil` when missing) |
 | `ZREVRANK key member` | 0-based rank of a member, highest score first (`nil` when missing) |
 | `ZINCRBY key increment member` | Add to a member's score (creating member and key when missing); returns the new score |
@@ -946,3 +947,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       and a non-sorted-set key is a `WRONGTYPE` error, listed by
       `COMMAND`. Read-only, so AOF logging, `WATCH` invalidation
       and replication needed no change.
+
+- [x] `ZREMRANGEBYSCORE` (0.45.0): remove the members in a score
+      range, `ZREMRANGEBYSCORE key min max`, with the same bounds
+      as `ZRANGEBYSCORE` (`-inf` / `+inf`, or a leading `(` for an
+      exclusive endpoint). The store gains
+      `store_zremrangebyscore`, which finds the first match with
+      the skip list in O(log n) and walks the matching slice once
+      at level 0, dropping each member through `zset_remove` (the
+      next node is saved before each removal, since removing frees
+      the node). A missing key answers `0`, as does an empty range
+      including a finite min above the max, and a non-sorted-set
+      key is a `WRONGTYPE` error, listed by `COMMAND`. Removing
+      the last member deletes the key, as with `ZREM`. A removal
+      is logged to the AOF and replicated and invalidates `WATCH`
+      on the key; removing nothing is a no-op, so it is none of
+      those.

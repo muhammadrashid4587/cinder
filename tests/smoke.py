@@ -1311,6 +1311,35 @@ def main():
               wrongtype)
         check("COMMAND lists ZLEXCOUNT", "ZLEXCOUNT" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZRANGEBYLEX", "ZRANGEBYLEX" in c.cmd("COMMAND"), True)
+        # ZREMRANGEBYSCORE. rrzset holds a=1, b=2, c=3, d=4, e=5.
+        check("ZADD rrzset", c.cmd("ZADD", "rrzset", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e"), 5)
+        check("ZREMRANGEBYSCORE mid", c.cmd("ZREMRANGEBYSCORE", "rrzset", "2", "4"), 3)
+        check("ZRANGE after ZREMRANGEBYSCORE", c.cmd("ZRANGE", "rrzset", "0", "-1"), ["a", "e"])
+        check("ZREMRANGEBYSCORE excl both empty",
+              c.cmd("ZREMRANGEBYSCORE", "rrzset", "(1", "(5"), 0)
+        check("ZCARD after excl empty", c.cmd("ZCARD", "rrzset"), 2)
+        check("ZREMRANGEBYSCORE excl max", c.cmd("ZREMRANGEBYSCORE", "rrzset", "1", "(5"), 1)
+        check("ZRANGE after excl max", c.cmd("ZRANGE", "rrzset", "0", "-1"), ["e"])
+        check("ZREMRANGEBYSCORE all", c.cmd("ZREMRANGEBYSCORE", "rrzset", "-inf", "+inf"), 1)
+        check("EXISTS emptied by ZREMRANGEBYSCORE", c.cmd("EXISTS", "rrzset"), 0)
+        check("ZREMRANGEBYSCORE missing", c.cmd("ZREMRANGEBYSCORE", "ghostzset", "0", "10"), 0)
+        check("ZADD rrzset2", c.cmd("ZADD", "rrzset2", "1", "a", "2", "b"), 2)
+        check("ZREMRANGEBYSCORE min above max",
+              c.cmd("ZREMRANGEBYSCORE", "rrzset2", "5", "1"), 0)
+        check("ZCARD after reversed range", c.cmd("ZCARD", "rrzset2"), 2)
+        check("ZREMRANGEBYSCORE empty point",
+              c.cmd("ZREMRANGEBYSCORE", "rrzset2", "(2", "2"), 0)
+        check("ZREMRANGEBYSCORE bad float",
+              c.cmd("ZREMRANGEBYSCORE", "rrzset2", "xx", "5"),
+              ("error", "ERR value is not a valid float"))
+        check("ZREMRANGEBYSCORE NaN",
+              c.cmd("ZREMRANGEBYSCORE", "rrzset2", "nan", "5"),
+              ("error", "ERR value is not a valid float"))
+        check("ZREMRANGEBYSCORE wrong args", c.cmd("ZREMRANGEBYSCORE", "rrzset2", "1"),
+              ("error", "ERR wrong number of arguments for 'zremrangebyscore' command"))
+        check("ZREMRANGEBYSCORE wrongtype", c.cmd("ZREMRANGEBYSCORE", "after", "0", "10"),
+              wrongtype)
+        check("COMMAND lists ZREMRANGEBYSCORE", "ZREMRANGEBYSCORE" in c.cmd("COMMAND"), True)
         check("ZREM one", c.cmd("ZREM", "myzset", "b"), 1)
         check("ZCARD after ZREM", c.cmd("ZCARD", "myzset"), 3)
         check("ZRANK removed member", c.cmd("ZRANK", "myzset", "b"), None)
@@ -1667,7 +1696,9 @@ def main():
         # Clean up the transaction keys: the AOF restart below counts
         # exact keys (7: after, plist, pset, phash, pzset, prange, pfield).
         # ZINCRBY and ZREM on pzset before the restart, so the AOF
-        # replay section below can prove they were logged.
+        # replay section below can prove they were logged; the
+        # ZREMRANGEBYSCORE removes y (2.25) from pzset the same way.
+        check("AOF pre-restart ZREMRANGEBYSCORE", c.cmd("ZREMRANGEBYSCORE", "pzset", "2", "3"), 1)
         check("AOF pre-restart ZINCRBY", c.cmd("ZINCRBY", "pzset", "1", "x"), "2.5")
         check("AOF pre-restart ZREM", c.cmd("ZREM", "pzset", "z"), 1)
         check("AOF pre-restart HINCRBY", c.cmd("HINCRBY", "phash", "a", "5"), 6)
@@ -1698,10 +1729,10 @@ def main():
         check("AOF replay set card", c.cmd("SCARD", "pset"), 3)
         check("AOF replay hash", c.cmd("HGETALL", "phash"), ["a", "6", "b", "2"])
         check("AOF replay hash len", c.cmd("HLEN", "phash"), 2)
-        check("AOF replay zset card", c.cmd("ZCARD", "pzset"), 2)
-        check("AOF replay zset score", c.cmd("ZSCORE", "pzset", "y"), "2.25")
+        check("AOF replay zset card", c.cmd("ZCARD", "pzset"), 1)
+        check("AOF replay zset range-removed gone", c.cmd("ZSCORE", "pzset", "y"), None)
         check("AOF replay zset incr score", c.cmd("ZSCORE", "pzset", "x"), "2.5")
-        check("AOF replay zset range", c.cmd("ZRANGE", "pzset", "0", "-1"), ["y", "x"])
+        check("AOF replay zset range", c.cmd("ZRANGE", "pzset", "0", "-1"), ["x"])
         check("AOF replay zset removed gone", c.cmd("ZSCORE", "pzset", "z"), None)
         check("AOF replay padded GET", c.cmd("GET", "prange"), "\x00" * 5 + "pad")
         check("AOF replay padded STRLEN", c.cmd("STRLEN", "prange"), 8)
@@ -2082,13 +2113,15 @@ def main():
         check("repl live INCR", p.cmd("INCR", "repcounter"), 1)
         check("repl live DEL", p.cmd("DEL", "repstr"), 1)
         check("repl live LPUSH", p.cmd("LPUSH", "replist", "front"), 4)
+        check("repl live ZREMRANGEBYSCORE", p.cmd("ZREMRANGEBYSCORE", "repzset", "1", "2"), 2)
         deadline = time.time() + 5
         streamed = False
         while time.time() < deadline:
             try:
                 if (r.cmd("GET", "newkey") == "live" and
                         r.cmd("GET", "repstr") is None and
-                        r.cmd("GET", "repcounter") == "1"):
+                        r.cmd("GET", "repcounter") == "1" and
+                        r.cmd("ZCARD", "repzset") == 0):
                     streamed = True
                     break
             except (EOFError, OSError):

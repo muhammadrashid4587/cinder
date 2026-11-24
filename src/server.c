@@ -1738,6 +1738,26 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_int(reply, n);
         return 0;
     }
+    if (strcasecmp(cmd, "ZREMRANGEBYSCORE") == 0) {
+        if (argc != 4)
+            return dbuf_error(reply, "wrong number of arguments for 'zremrangebyscore' command"), 0;
+        /* Same bounds as ZRANGEBYSCORE: a plain double, "-inf" /
+           "+inf", or a leading '(' for an exclusive endpoint. */
+        double min, max;
+        int min_excl, max_excl;
+        if (!parse_score_bound(argv[2], &min, &min_excl) ||
+            !parse_score_bound(argv[3], &max, &max_excl))
+            return dbuf_error(reply, "value is not a valid float"), 0;
+        long long removed = store_zremrangebyscore(g_store, argv[1], min,
+                                                   min_excl, max, max_excl);
+        if (removed == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_int(reply, removed);
+        /* A removal is logged to the AOF and replicated, and it
+           invalidates WATCH on the key; removing nothing is a
+           no-op, so it is neither. */
+        return removed > 0 ? 1 : 0;
+    }
     if (strcasecmp(cmd, "ZREM") == 0) {
         if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'zrem' command"), 0;
         long long removed = 0;
@@ -2029,6 +2049,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HINCRBYFLOAT", "HSCAN",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
+            "ZREMRANGEBYSCORE",
             "ZRANK", "ZREVRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",
             "KEYS", "SCAN", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",

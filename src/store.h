@@ -497,6 +497,16 @@ int store_zrangebylex(Store *s, const char *key, const char *min, int min_excl,
    out of memory. */
 long long store_zlexcount(Store *s, const char *key, const char *min,
                           int min_excl, const char *max, int max_excl);
+/* Remove the members whose scores fall in [min, max], with an
+   endpoint excluded when its flag is set, as in
+   store_zrangebyscore. Returns the number removed (0 for a missing
+   key or an empty range, including min > max), -1 = wrong type.
+   The key is deleted when the last member is removed, as with
+   store_zrem; a removal touches the key's version, a no-op does
+   not. The skip list finds the first match in O(log n) and the
+   matching slice is walked once at level 0. */
+long long store_zremrangebyscore(Store *s, const char *key, double min,
+                                 int min_excl, double max, int max_excl);
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing

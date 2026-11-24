@@ -3144,6 +3144,42 @@ long long store_zlexcount(Store *s, const char *key, const char *min,
     return n;
 }
 
+/* Remove the members whose scores fall in [min, max], with an
+   endpoint excluded when its flag is set. The skip list finds the
+   first match in O(log n); the matching slice is walked once at
+   level 0, each member dropped through zset_remove, which keeps
+   the dict and the skip list in step. The next node is saved before
+   the removal, since removing frees the node being stood on. */
+long long store_zremrangebyscore(Store *s, const char *key, double min,
+                                 int min_excl, double max, int max_excl) {
+    Entry **pp = NULL;
+    Entry *e = store_find(s, key, &pp);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    if (min > max) return 0;
+    ZSet *z = e->zset;
+    zslNode *node = zsl_first_in_range(z->sl, min, min_excl, max, max_excl);
+    if (!node) return 0;
+    long long removed = 0;
+    while (node) {
+        if (max_excl ? node->score >= max : node->score > max) break;
+        zslNode *next = node->level[0].forward;
+        if (zset_remove(z, node->member)) removed++;
+        node = next;
+    }
+    if (removed == 0) return 0;
+    if (z->len == 0) {
+        /* A sorted set emptied by removing is gone, as in Redis. */
+        *pp = e->next;
+        entry_free(e);
+        s->count--;
+    } else {
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+    }
+    return removed;
+}
+
 /* Add increment to a member's score, creating the member (with score
    = increment) and the key when missing. Returns 1 when the member
    is new, 0 when an existing member's score changed, 2 when nothing
