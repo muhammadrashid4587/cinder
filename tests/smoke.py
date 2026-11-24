@@ -1043,6 +1043,57 @@ def main():
         check("COMMAND lists ZREM", "ZREM" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZRANK", "ZRANK" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZINCRBY", "ZINCRBY" in c.cmd("COMMAND"), True)
+        # ZPOPMIN / ZPOPMAX / ZRANDMEMBER. popzset holds a=1, b=2, c=3, d=4.
+        check("ZADD popzset", c.cmd("ZADD", "popzset", "1", "a", "2", "b", "3", "c", "4", "d"), 4)
+        check("ZPOPMIN one", c.cmd("ZPOPMIN", "popzset"), ["a", "1"])
+        check("ZCARD after ZPOPMIN", c.cmd("ZCARD", "popzset"), 3)
+        check("ZPOPMIN count", c.cmd("ZPOPMIN", "popzset", "2"), ["b", "2", "c", "3"])
+        check("ZPOPMIN rest", c.cmd("ZPOPMIN", "popzset", "10"), ["d", "4"])
+        check("EXISTS emptied by ZPOPMIN", c.cmd("EXISTS", "popzset"), 0)
+        check("ZPOPMIN missing", c.cmd("ZPOPMIN", "ghostzset"), [])
+        check("ZPOPMIN zero count", c.cmd("ZPOPMIN", "popzset", "0"),
+              ("error", "ERR value is out of range, must be positive"))
+        check("ZPOPMIN negative count", c.cmd("ZPOPMIN", "popzset", "-1"),
+              ("error", "ERR value is out of range, must be positive"))
+        check("ZPOPMIN bad count", c.cmd("ZPOPMIN", "popzset", "xx"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("ZPOPMIN wrong args", c.cmd("ZPOPMIN", "popzset", "1", "2"),
+              ("error", "ERR wrong number of arguments for 'zpopmin' command"))
+        check("ZADD maxzset", c.cmd("ZADD", "maxzset", "1", "a", "2", "b", "3", "c"), 3)
+        check("ZPOPMAX one", c.cmd("ZPOPMAX", "maxzset"), ["c", "3"])
+        check("ZPOPMAX count", c.cmd("ZPOPMAX", "maxzset", "2"), ["b", "2", "a", "1"])
+        check("EXISTS emptied by ZPOPMAX", c.cmd("EXISTS", "maxzset"), 0)
+        check("ZPOPMAX missing", c.cmd("ZPOPMAX", "ghostzset"), [])
+        check("ZPOPMAX wrongtype", c.cmd("ZPOPMAX", "after", "1"), wrongtype)
+        check("ZPOPMIN wrongtype", c.cmd("ZPOPMIN", "after"), wrongtype)
+        # ZRANDMEMBER. randzset holds x=1, y=2, z=3; the single-member
+        # form is random, so the checks assert membership, not a
+        # particular member, and the count forms sort before comparing.
+        check("ZADD randzset", c.cmd("ZADD", "randzset", "1", "x", "2", "y", "3", "z"), 3)
+        check("ZRANDMEMBER one in set", c.cmd("ZRANDMEMBER", "randzset") in ["x", "y", "z"], True)
+        check("ZRANDMEMBER missing", c.cmd("ZRANDMEMBER", "ghostzset"), None)
+        check("ZRANDMEMBER all", sorted(c.cmd("ZRANDMEMBER", "randzset", "3")), ["x", "y", "z"])
+        check("ZRANDMEMBER over count", sorted(c.cmd("ZRANDMEMBER", "randzset", "10")),
+              ["x", "y", "z"])
+        check("ZRANDMEMBER zero", c.cmd("ZRANDMEMBER", "randzset", "0"), [])
+        got = c.cmd("ZRANDMEMBER", "randzset", "-5")
+        check("ZRANDMEMBER negative count len", len(got), 5)
+        check("ZRANDMEMBER negative count members",
+              all(m in ["x", "y", "z"] for m in got), True)
+        got = c.cmd("ZRANDMEMBER", "randzset", "2", "WITHSCORES")
+        check("ZRANDMEMBER withscores len", len(got), 4)
+        want_scores = {"x": "1", "y": "2", "z": "3"}
+        check("ZRANDMEMBER withscores scores match",
+              all(want_scores[m] == s for m, s in zip(got[::2], got[1::2])), True)
+        check("ZRANDMEMBER bad count", c.cmd("ZRANDMEMBER", "randzset", "xx"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("ZRANDMEMBER bad option", c.cmd("ZRANDMEMBER", "randzset", "2", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("ZRANDMEMBER wrongtype", c.cmd("ZRANDMEMBER", "after"), wrongtype)
+        check("ZRANDMEMBER wrongtype count", c.cmd("ZRANDMEMBER", "after", "2"), wrongtype)
+        check("COMMAND lists ZPOPMIN", "ZPOPMIN" in c.cmd("COMMAND"), True)
+        check("COMMAND lists ZPOPMAX", "ZPOPMAX" in c.cmd("COMMAND"), True)
+        check("COMMAND lists ZRANDMEMBER", "ZRANDMEMBER" in c.cmd("COMMAND"), True)
         # Transactions: MULTI queues, EXEC runs the queue in order and
         # returns one reply per command, DISCARD drops the queue, and
         # the error cases. A second client proves the queued writes
@@ -1547,7 +1598,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.33.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.34.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

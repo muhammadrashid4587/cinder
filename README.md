@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.33.0.
+Version 0.34.0.
 
 ## Why
 
@@ -106,6 +106,8 @@ OK
 | `ZREM key member [member ...]` | Remove members; returns number removed (the key is deleted when the last member is removed) |
 | `ZRANK key member` | 0-based rank of a member, lowest score first (`nil` when missing) |
 | `ZINCRBY key increment member` | Add to a member's score (creating member and key when missing); returns the new score |
+| `ZPOPMIN key [count]`, `ZPOPMAX key [count]` | Remove and return the lowest- / highest-scoring member(s) with their scores, flat `[member, score, ...]`; `count` defaults to 1 and must be positive, a count past the end pops the whole set, an empty array when missing, and popping the last member deletes the key |
+| `ZRANDMEMBER key [count [WITHSCORES]]` | A random member (bulk reply, `nil` when missing), or `count` of them as an array; a positive count returns distinct members (at most the whole set), a negative count samples with replacement so members may repeat, `0` returns an empty array, and `WITHSCORES` interleaves each score after its member |
 | `KEYS pattern` | Glob match (`*` and `?`) |
 | `SCAN cursor [MATCH pattern] [COUNT n]` | Cursor-based keyspace iteration: start at cursor `0`, repeat with the returned cursor until it comes back `0`; `MATCH` filters with the same glob as `KEYS`, `COUNT` (default 10) is a hint for how many matching keys to return per call |
 | `FLUSHALL`, `DBSIZE`, `INFO` | Admin / introspection |
@@ -326,7 +328,14 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # and reversed score-range checks (max-first bounds,
             # exclusive bounds and infinities, WITHSCORES, LIMIT
             # offset/count, ties in reverse member order, missing
-            # key, bad bounds and options), an AOF
+            # key, bad bounds and options), and pop/random checks
+            # (`ZPOPMIN` / `ZPOPMAX` popping one, several, and past
+            # the end, deleting the key when emptied, empty array
+            # for a missing key, bad and non-positive counts;
+            # `ZRANDMEMBER` single and count forms, distinct and
+            # with-replacement sampling, `WITHSCORES` pairing each
+            # score with its member, missing key, bad count and
+            # option, and wrong-type errors for all three), an AOF
             # restart test (data, a list, a set, a hash and a sorted set survive a
             # SHUTDOWN and reload), and everysec-policy checks (INFO
             # reports the policy, the AOF holds the record before any
@@ -738,3 +747,23 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       needed no change. Limitation: a trim is O(n) pointer
       moves after linearizing the circular buffer, as a
       middle insert already is
+
+- [x] Sorted-set pop and random member: `ZPOPMIN` / `ZPOPMAX` /
+      `ZRANDMEMBER` (0.34.0): `ZPOPMIN` / `ZPOPMAX` remove and
+      return the lowest- / highest-scoring member(s) with their
+      scores, flat `[member, score, ...]`, with an optional
+      positive `count` (default 1, a count past the end pops the
+      whole set); popping the last member deletes the key, and
+      a missing key answers an empty array. `ZRANDMEMBER`
+      returns one random member, or `count` of them: a positive
+      count returns distinct members (at most the whole set, by
+      a partial Fisher-Yates shuffle), a negative count samples
+      with replacement so members may repeat, `0` returns an
+      empty array, and `WITHSCORES` interleaves each score
+      after its member. The pops are mutating, so they are
+      AOF-logged and replicated as raw commands — the replay
+      pops the same members, since the sorted order is
+      deterministic — and `ZRANDMEMBER` is read-only, so it
+      logs nothing. Limitation: member lookup is still a
+      linear scan, so large sorted sets are slower than a
+      skip list would be

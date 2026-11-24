@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.33.0"
+#define CINDER_VERSION "0.34.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1460,6 +1460,95 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            invalidation. */
         return rc == 2 ? 0 : 1;
     }
+    if (strcasecmp(cmd, "ZPOPMIN") == 0 || strcasecmp(cmd, "ZPOPMAX") == 0) {
+        int from_max = strcasecmp(cmd, "ZPOPMAX") == 0;
+        if (argc != 2 && argc != 3)
+            return dbuf_error(reply, from_max ? "wrong number of arguments for 'zpopmax' command" : "wrong number of arguments for 'zpopmin' command"), 0;
+        long long count = 1;
+        if (argc == 3) {
+            if (!parse_ll(argv[2], &count))
+                return dbuf_error(reply, "value is not an integer or out of range"), 0;
+            if (count < 1)
+                return dbuf_error(reply, "value is out of range, must be positive"), 0;
+        }
+        char **members = NULL;
+        double *scores = NULL;
+        size_t n = 0;
+        int rc = store_zpop(g_store, argv[1], count, from_max,
+                            &members, &scores, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        dbuf_array_header(reply, (long long)(n * 2));
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, members[i], strlen(members[i]));
+            char buf[32];
+            format_score(buf, sizeof(buf), scores[i]);
+            dbuf_bulk(reply, buf, strlen(buf));
+            free(members[i]);
+        }
+        free(members);
+        free(scores);
+        /* A pop that removed nothing (a missing key) logs nothing;
+           a real pop is logged and replicated as the raw command,
+           which replays identically — the popped members are
+           determined by the sorted order, so a replica pops the
+           same ones. */
+        return n > 0 ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "ZRANDMEMBER") == 0) {
+        if (argc != 2 && argc != 3 && argc != 4)
+            return dbuf_error(reply, "wrong number of arguments for 'zrandmember' command"), 0;
+        long long count = 0;
+        int have_count = argc >= 3;
+        int withscores = 0;
+        if (have_count) {
+            if (!parse_ll(argv[2], &count))
+                return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        }
+        if (argc == 4) {
+            if (strcasecmp(argv[3], "WITHSCORES") != 0)
+                return dbuf_error(reply, "syntax error"), 0;
+            withscores = 1;
+        }
+        char **members = NULL;
+        double *scores = NULL;
+        size_t n = 0;
+        /* A bare ZRANDMEMBER is one member, or nil when the key is
+           missing; it reuses the count path with count 1. */
+        int rc = store_zrandmember(g_store, argv[1], have_count ? count : 1,
+                                   &members, &scores, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (!have_count) {
+            if (n == 0) {
+                free(members);
+                free(scores);
+                return dbuf_null(reply), 0;
+            }
+            dbuf_bulk(reply, members[0], strlen(members[0]));
+            free(members[0]);
+            free(members);
+            free(scores);
+            return 0;
+        }
+        dbuf_array_header(reply, (long long)(withscores ? n * 2 : n));
+        for (size_t i = 0; i < n; i++) {
+            dbuf_bulk(reply, members[i], strlen(members[i]));
+            if (withscores) {
+                char buf[32];
+                format_score(buf, sizeof(buf), scores[i]);
+                dbuf_bulk(reply, buf, strlen(buf));
+            }
+            free(members[i]);
+        }
+        free(members);
+        free(scores);
+        return 0;
+    }
     if (strcasecmp(cmd, "FLUSHALL") == 0) {
         store_flush(g_store);
         dbuf_simple(reply, "OK");
@@ -1538,7 +1627,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "ZADD", "ZSCORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZREM",
-            "ZRANK", "ZINCRBY",
+            "ZRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER",
             "KEYS", "SCAN", "FLUSHALL", "DBSIZE", "INFO", "COMMAND", "SAVE", "BGSAVE",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
             "SYNC", "PSYNC", "REPLICAOF"};

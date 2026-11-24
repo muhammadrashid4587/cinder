@@ -418,5 +418,23 @@ int store_zrangebyscore(Store *s, const char *key, double min, int min_excl,
    -2 = out of memory. *out is the member's new score. */
 int store_zincrby(Store *s, const char *key, const char *member,
                   double incr, double *out);
+/* Pop `count` members from the lowest-score end (from_max = 0) or the
+   highest-score end (from_max = 1), in score order — the lowest (or
+   highest) member first, as in Redis. Returns 0 on success (*n_out
+   is 0 for a missing key; the key is deleted when the last member
+   is popped), -1 = wrong type, -2 = out of memory. *members_out is
+   a malloc'd array of malloc'd strings and *scores_out a malloc'd
+   array of the popped scores; the caller frees both. */
+int store_zpop(Store *s, const char *key, long long count, int from_max,
+               char ***members_out, double **scores_out, size_t *n_out);
+/* `count` random members: count > 0 returns distinct members (at most
+   the whole set), count < 0 returns -count members sampled with
+   replacement (duplicates possible), count == 0 returns none. The
+   single-member form is this with count 1. Returns 0 on success
+   (*n_out is 0 for a missing key), -1 = wrong type, -2 = out of
+   memory. Same ownership as store_zpop. */
+int store_zrandmember(Store *s, const char *key, long long count,
+                      char ***members_out, double **scores_out,
+                      size_t *n_out);
 
 #endif

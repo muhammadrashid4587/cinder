@@ -2209,3 +2209,146 @@ int store_zincrby(Store *s, const char *key, const char *member,
     *out = incr;
     return 1;
 }
+
+/* Pop `count` members from the lowest-score end (from_max = 0) or the
+   highest-score end (from_max = 1). The popped members come back in
+   score order — the lowest (or highest) first, as in Redis — and the
+   key is deleted when the last member is popped, as with ZREM. */
+int store_zpop(Store *s, const char *key, long long count, int from_max,
+               char ***members_out, double **scores_out, size_t *n_out) {
+    *members_out = NULL;
+    *scores_out = NULL;
+    *n_out = 0;
+    Entry **pp = NULL;
+    Entry *e = store_find(s, key, &pp);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    ZSet *z = e->zset;
+    size_t n = (size_t)count < z->len ? (size_t)count : z->len;
+    if (n == 0) return 0;
+    char **members = malloc(n * sizeof(char *));
+    double *scores = malloc(n * sizeof(double));
+    if (!members || !scores) {
+        free(members);
+        free(scores);
+        return -2;
+    }
+    size_t start = from_max ? z->len - n : 0;
+    for (size_t i = 0; i < n; i++) {
+        /* Popping from the top returns the highest score first, as
+           in Redis; popping from the bottom returns the lowest
+           first. */
+        size_t src = from_max ? z->len - 1 - i : start + i;
+        members[i] = strdup(z->members[src]);
+        if (!members[i]) {
+            for (size_t j = 0; j < i; j++) free(members[j]);
+            free(members);
+            free(scores);
+            return -2;
+        }
+        scores[i] = z->scores[src];
+    }
+    /* Free the popped members, then close the gap: popping from the
+       low end shifts the survivors down, popping from the high end
+       just shortens the arrays. */
+    for (size_t i = 0; i < n; i++) free(z->members[start + i]);
+    if (!from_max) {
+        memmove(&z->members[0], &z->members[n],
+                (z->len - n) * sizeof(char *));
+        memmove(&z->scores[0], &z->scores[n],
+                (z->len - n) * sizeof(double));
+    }
+    z->len -= n;
+    z->members[z->len] = NULL;
+    if (z->len == 0) {
+        /* A sorted set emptied by popping is gone, as in Redis. */
+        *pp = e->next;
+        entry_free(e);
+        s->count--;
+    } else {
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+    }
+    *members_out = members;
+    *scores_out = scores;
+    *n_out = n;
+    return 0;
+}
+
+/* `count` random members: count > 0 returns distinct members (at most
+   the whole set), count < 0 returns -count members sampled with
+   replacement, count == 0 returns none. Distinct sampling is a
+   partial Fisher-Yates shuffle over an index array, so no member
+   comes back twice and no retry loop is needed. */
+int store_zrandmember(Store *s, const char *key, long long count,
+                      char ***members_out, double **scores_out,
+                      size_t *n_out) {
+    *members_out = NULL;
+    *scores_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    e->last_access = ++s->clock;
+    ZSet *z = e->zset;
+    if (count == 0 || z->len == 0) return 0;
+    size_t n;
+    int with_replacement = count < 0;
+    if (with_replacement) {
+        /* -count, computed in unsigned arithmetic so LLONG_MIN does
+           not overflow; a huge count just fails the allocation
+           below and answers out of memory. */
+        unsigned long long want = (unsigned long long)(-(count + 1)) + 1;
+        n = want > (unsigned long long)SIZE_MAX ? SIZE_MAX : (size_t)want;
+    } else {
+        n = (size_t)count < z->len ? (size_t)count : z->len;
+    }
+    char **members = malloc(n * sizeof(char *));
+    double *scores = malloc(n * sizeof(double));
+    if (!members || !scores) {
+        free(members);
+        free(scores);
+        return -2;
+    }
+    if (with_replacement) {
+        for (size_t i = 0; i < n; i++) {
+            size_t idx = (size_t)rand() % z->len;
+            members[i] = strdup(z->members[idx]);
+            if (!members[i]) {
+                for (size_t j = 0; j < i; j++) free(members[j]);
+                free(members);
+                free(scores);
+                return -2;
+            }
+            scores[i] = z->scores[idx];
+        }
+    } else {
+        size_t *idx = malloc(z->len * sizeof(size_t));
+        if (!idx) {
+            free(members);
+            free(scores);
+            return -2;
+        }
+        for (size_t i = 0; i < z->len; i++) idx[i] = i;
+        for (size_t i = 0; i < n; i++) {
+            size_t j = i + (size_t)rand() % (z->len - i);
+            size_t tmp = idx[i];
+            idx[i] = idx[j];
+            idx[j] = tmp;
+            members[i] = strdup(z->members[idx[i]]);
+            if (!members[i]) {
+                for (size_t k = 0; k < i; k++) free(members[k]);
+                free(members);
+                free(scores);
+                free(idx);
+                return -2;
+            }
+            scores[i] = z->scores[idx[i]];
+        }
+        free(idx);
+    }
+    *members_out = members;
+    *scores_out = scores;
+    *n_out = n;
+    return 0;
+}
