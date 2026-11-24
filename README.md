@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.30.0.
+Version 0.31.0.
 
 ## Why
 
@@ -68,6 +68,7 @@ OK
 | `GETBIT key offset` | Bit value (`0` when missing or out of range) |
 | `BITCOUNT key [start end]` | Count set bits, optionally over a byte range (negative indexes count from the end, out-of-range ends are clamped); `0` when missing |
 | `BITOP op dest key [key ...]` | Bitwise `AND` / `OR` / `XOR` across string keys (`NOT` takes exactly one key); a missing source counts as an empty string, the result is as long as the longest input, it overwrites the destination and clears its TTL; when every source is missing the result is empty and the destination is deleted, returning `0` |
+| `BITFIELD key [GET type off] [SET type off value] [INCRBY type off inc] [OVERFLOW WRAP \| SAT \| FAIL]` | Packed integer fields in a string key: types `i1`–`i64` / `u1`–`u63` (`u64` is not supported, RESP integers are signed 64-bit), offsets in bits or `#n` for the n-th field of the width; `GET` reads a field (`0` when missing), `SET` returns the old value, `INCRBY` returns the new value; `OVERFLOW` sets the policy for the `SET`/`INCRBY` operations that follow it (default `WRAP`, `SAT` clamps, `FAIL` answers nil and leaves the field unchanged); a write creates the key zero-padded when missing and preserves the TTL; one reply element per operation, in order |
 | `DEL key [key ...]`, `EXISTS key [key ...]` | Multi-key delete / existence |
 | `EXPIRE key s`, `PEXPIRE key ms` | Set a TTL |
 | `TTL key`, `PTTL key` | Remaining TTL (`-2` missing, `-1` no expiry) |
@@ -420,7 +421,23 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # missing key, the destination TTL being cleared, the
             # destination also being a source, bad-op and
             # wrong-argument and wrong-type errors, and `COMMAND`
-            # listing `BITOP`)
+            # listing `BITOP`), and `BITFIELD` checks (`GET` on a
+            # missing key reading `0` without creating it, `SET`
+            # returning the old value and `GET` reading it back
+            # signed and unsigned, `SET` wrapping an out-of-range
+            # value, multi-byte fields read as `u16`/`i16`, `#n`
+            # offsets addressing the n-th field of the width,
+            # `INCRBY` with positive and negative increments, several
+            # operations in one call replying in order, `OVERFLOW
+            # WRAP`/`SAT`/`FAIL` on `INCRBY` and on `SET`, the policy
+            # resetting to `WRAP` on the next call, `i64`/`u63`
+            # fields and `u64` rejected, `BITFIELD` preserving the
+            # TTL, a syntax error anywhere executing nothing,
+            # bad-type/bad-offset/bad-value/wrong-argument/wrong-type
+            # errors, the max bit offset, a `BITFIELD` write
+            # invalidating a `WATCH` while a no-op write does not,
+            # `COMMAND` listing `BITFIELD`, and an AOF restart
+            # replaying a `BITFIELD` key)
 ```
 
 ## Roadmap
@@ -643,7 +660,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       written, so a `BITOP` over 512 MB strings transiently holds two
       copies of the longest input
 
-## Next
-
-- [ ] `BITFIELD` (get/set/increment bit fields in a string key, the
-      natural follow-on to the bit commands)
+- [x] `BITFIELD` (0.31.0): packed integer fields in a string key,
+      the natural follow-on to the bit commands. `GET` / `SET` /
+      `INCRBY` over `i1`–`i64` / `u1`–`u63` fields at arbitrary bit
+      offsets (`#n` addresses the n-th field of the width), several
+      operations in one call replying in order, and `OVERFLOW
+      WRAP` / `SAT` / `FAIL` for the `SET` / `INCRBY` operations
+      that follow it in the call (default `WRAP`; `SAT` clamps to
+      the type's range; `FAIL` answers nil and leaves the field
+      unchanged). A write creates the key zero-padded when missing
+      and preserves the TTL, as in Redis; a `GET`-only call creates
+      nothing. The whole call is parsed before anything executes,
+      so a syntax error anywhere changes nothing, and only a real
+      change is AOF-logged or replicated or invalidates a `WATCH`.
+      Limitation: `u64` is rejected, as in Redis, because RESP
+      integers are signed 64-bit, and the whole field is read and
+      written bit by bit, so a 64-bit field costs 64 bit operations

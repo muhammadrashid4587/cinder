@@ -2,6 +2,7 @@
 #include "store.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -933,6 +934,236 @@ int store_bitop(Store *s, int op, const char *dest, const char **keys, int nkeys
     }
     free(res);
     *changed_out = 1;
+    return 0;
+}
+
+/* BITFIELD helpers. Bit 0 is the high bit of byte 0, as in SETBIT,
+   and the first bit of a field is its most significant bit, as in
+   Redis: a field's bits run from the highest to the lowest, so the
+   raw value is assembled by shifting each bit in from the right. */
+static unsigned long long bitfield_get_bits(const char *buf, size_t len,
+                                            unsigned long long offset, int bits) {
+    unsigned long long raw = 0;
+    for (int i = 0; i < bits; i++) {
+        unsigned long long pos = offset + (unsigned long long)i;
+        size_t byte = (size_t)(pos / 8);
+        int bit = 0;
+        if (byte < len)
+            bit = ((unsigned char)buf[byte] >> (7 - (pos % 8))) & 1;
+        raw = (raw << 1) | (unsigned long long)bit;
+    }
+    return raw;
+}
+
+static void bitfield_set_bits(char *buf, unsigned long long offset, int bits,
+                              unsigned long long raw) {
+    for (int i = 0; i < bits; i++) {
+        unsigned long long pos = offset + (unsigned long long)i;
+        size_t byte = (size_t)(pos / 8);
+        int bit = (int)((raw >> (bits - 1 - i)) & 1ULL);
+        if (bit) buf[byte] |= (char)(0x80 >> (pos % 8));
+        else buf[byte] &= (char)~(0x80 >> (pos % 8));
+    }
+}
+
+/* The raw bits of a signed field as a signed value. */
+long long store_bitfield_to_signed(unsigned long long raw, int bits) {
+    if (bits == 64) return (long long)raw;
+    if (raw & (1ULL << (bits - 1)))
+        return (long long)(raw - (1ULL << bits));
+    return (long long)raw;
+}
+
+/* Apply the overflow policy to a SET candidate value `v` for a field
+   of this type. Returns 0 and stores the raw bits to write in
+   *raw_out, or 1 when the policy is FAIL and v is out of range (the
+   caller replies nil and writes nothing). */
+static int bitfield_set_value(long long v, int is_signed, int bits,
+                              int overflow, unsigned long long *raw_out) {
+    unsigned long long mask = bits == 64 ? ~0ULL : ((1ULL << bits) - 1);
+    if (is_signed) {
+        long long min = bits == 64 ? INT64_MIN : -(1LL << (bits - 1));
+        long long max = bits == 64 ? INT64_MAX : (1LL << (bits - 1)) - 1;
+        if (overflow == BITFIELD_OVERFLOW_FAIL) {
+            if (v < min || v > max) return 1;
+        } else if (overflow == BITFIELD_OVERFLOW_SAT) {
+            if (v < min) v = min;
+            if (v > max) v = max;
+        }
+    } else {
+        unsigned long long max = (1ULL << bits) - 1; /* bits <= 63 */
+        if (overflow == BITFIELD_OVERFLOW_FAIL) {
+            if (v < 0 || (unsigned long long)v > max) return 1;
+        } else if (overflow == BITFIELD_OVERFLOW_SAT) {
+            if (v < 0) v = 0;
+            if ((unsigned long long)v > max) v = (long long)max;
+        }
+    }
+    *raw_out = (unsigned long long)v & mask;
+    return 0;
+}
+
+/* Apply the overflow policy to an INCRBY: the field currently holds
+   `old_raw`, and `inc` is added to it. Returns 0 and stores the raw
+   bits to write in *raw_out, or 1 when the policy is FAIL and the
+   sum is out of range (the caller replies nil and writes nothing).
+   No wide arithmetic: WRAP adds in the unsigned domain, where the
+   addition is defined modulo 2^64 and the mask keeps the low `bits`
+   bits of the true sum; SAT and FAIL detect the range crossing
+   first, with the int64 overflow checks keeping the signed addition
+   exact (a sum past INT64_MAX is past any signed field's max, and a
+   sum below INT64_MIN is below any signed field's min). */
+static int bitfield_incr_value(unsigned long long old_raw, long long inc,
+                               int is_signed, int bits, int overflow,
+                               unsigned long long *raw_out) {
+    unsigned long long mask = bits == 64 ? ~0ULL : ((1ULL << bits) - 1);
+    if (overflow == BITFIELD_OVERFLOW_WRAP) {
+        *raw_out = (old_raw + (unsigned long long)inc) & mask;
+        return 0;
+    }
+    if (is_signed) {
+        long long old = store_bitfield_to_signed(old_raw, bits);
+        long long min = bits == 64 ? INT64_MIN : -(1LL << (bits - 1));
+        long long max = bits == 64 ? INT64_MAX : (1LL << (bits - 1)) - 1;
+        int over = 0, under = 0;
+        long long sum = 0;
+        if (inc > 0 && old > INT64_MAX - inc) over = 1;
+        else if (inc < 0 && old < INT64_MIN - inc) under = 1;
+        else {
+            sum = old + inc;
+            if (sum > max) over = 1;
+            else if (sum < min) under = 1;
+        }
+        if (over || under) {
+            if (overflow == BITFIELD_OVERFLOW_FAIL) return 1;
+            sum = over ? max : min;
+        }
+        *raw_out = (unsigned long long)sum & mask;
+        return 0;
+    } else {
+        unsigned long long max = (1ULL << bits) - 1; /* bits <= 63 */
+        int over = 0, under = 0;
+        unsigned long long sum = 0;
+        if (inc >= 0) {
+            sum = old_raw + (unsigned long long)inc; /* at most 2^64-2 */
+            if (sum > max) over = 1;
+        } else {
+            unsigned long long mag = 0 - (unsigned long long)inc;
+            if (old_raw < mag) under = 1;
+            else sum = old_raw - mag;
+        }
+        if (over || under) {
+            if (overflow == BITFIELD_OVERFLOW_FAIL) return 1;
+            sum = over ? max : 0;
+        }
+        *raw_out = sum & mask;
+        return 0;
+    }
+}
+
+int store_bitfield(Store *s, const char *key, const BitfieldOp *ops, int nops,
+                   BitfieldResult *results, int *changed_out) {
+    *changed_out = 0;
+    for (int i = 0; i < nops; i++) results[i].is_nil = 0, results[i].raw = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (e && e->type != ENTRY_STRING) return -1;
+    int has_write = 0;
+    size_t needed = 0;
+    for (int i = 0; i < nops; i++) {
+        if (ops[i].kind == BITFIELD_GET) continue;
+        if (ops[i].offset + (unsigned long long)ops[i].bits > 4294967296ULL)
+            return -3;
+        has_write = 1;
+        size_t end = (size_t)((ops[i].offset + (unsigned long long)ops[i].bits + 7) / 8);
+        if (end > needed) needed = end;
+    }
+    /* A write creates the key zero-padded when missing and grows it
+       with zero bytes when a field runs past the end, preserving
+       the TTL, as in Redis — even a write that then fails under
+       OVERFLOW FAIL leaves the grown string behind, as in Redis. */
+    int created = 0;
+    if (has_write) {
+        if (!e) {
+            if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+                store_resize(s);
+            e = calloc(1, sizeof(Entry));
+            if (!e) return -2;
+            e->key = strdup(key);
+            e->value = calloc(needed + 1, 1);
+            if (!e->key || !e->value) {
+                entry_free(e);
+                return -2;
+            }
+            e->value_len = needed;
+            e->type = ENTRY_STRING;
+            e->expire_at = -1;
+            e->last_access = ++s->clock;
+            e->version = ++s->mod_seq;
+            size_t idx = hash_key(key) % s->cap;
+            e->next = s->buckets[idx];
+            s->buckets[idx] = e;
+            s->count++;
+            created = 1;
+        } else if (needed > e->value_len) {
+            char *nv = realloc(e->value, needed + 1);
+            if (!nv) return -2;
+            e->value = nv;
+            memset(e->value + e->value_len, 0, needed - e->value_len);
+            e->value[needed] = '\0';
+            e->value_len = needed;
+        }
+    }
+    /* Remember the bytes before the ops run, so a write that leaves
+       every byte identical is a no-op: no version bump, no log, as
+       with SETBIT and BITOP. */
+    size_t old_len = e ? e->value_len : 0;
+    char *old_bytes = NULL;
+    if (e && old_len > 0) {
+        old_bytes = malloc(old_len);
+        if (!old_bytes) return -2;
+        memcpy(old_bytes, e->value, old_len);
+    }
+    if (e) e->last_access = ++s->clock;
+    for (int i = 0; i < nops; i++) {
+        const BitfieldOp *op = &ops[i];
+        if (op->kind == BITFIELD_GET) {
+            /* A missing key, or bits past the end, read 0. */
+            results[i].raw = e ? bitfield_get_bits(e->value, e->value_len,
+                                                   op->offset, op->bits) : 0;
+            continue;
+        }
+        unsigned long long old_raw =
+            bitfield_get_bits(e->value, e->value_len, op->offset, op->bits);
+        unsigned long long new_raw = 0;
+        if (op->kind == BITFIELD_SET) {
+            if (bitfield_set_value(op->value, op->is_signed, op->bits,
+                                   op->overflow, &new_raw)) {
+                results[i].is_nil = 1;
+                results[i].raw = old_raw;
+                continue;
+            }
+            bitfield_set_bits(e->value, op->offset, op->bits, new_raw);
+            results[i].raw = old_raw; /* SET returns the old value */
+        } else { /* INCRBY */
+            if (bitfield_incr_value(old_raw, op->value, op->is_signed,
+                                    op->bits, op->overflow, &new_raw)) {
+                results[i].is_nil = 1;
+                results[i].raw = old_raw;
+                continue;
+            }
+            bitfield_set_bits(e->value, op->offset, op->bits, new_raw);
+            results[i].raw = new_raw; /* INCRBY returns the new value */
+        }
+    }
+    if (created) {
+        /* The key came into being, even if every byte is zero. */
+        *changed_out = 1;
+    } else if (e && (e->value_len != old_len ||
+                     (old_len > 0 && memcmp(e->value, old_bytes, old_len) != 0))) {
+        *changed_out = 1;
+    }
+    free(old_bytes);
+    if (*changed_out) entry_touch(s, e);
     return 0;
 }
 

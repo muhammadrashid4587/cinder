@@ -482,6 +482,111 @@ def main():
               ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
         check("COMMAND lists BITOP", "BITOP" in c.cmd("COMMAND"), True)
         check("string bits cleanup", c.cmd("DEL", "bits", "zb", "bt", "bl", "ba", "bb", "bd"), 7)
+        # BITFIELD: packed integer fields in a string key.
+        # GET on a missing key reads 0 and creates nothing.
+        check("BITFIELD GET missing", c.cmd("BITFIELD", "bf", "GET", "i8", "0"), [0])
+        check("BITFIELD GET missing no key", c.cmd("EXISTS", "bf"), 0)
+        # SET returns the old value; GET reads it back, signed and unsigned.
+        check("BITFIELD SET i8", c.cmd("BITFIELD", "bf", "SET", "i8", "0", "65"), [0])
+        check("BITFIELD GET i8", c.cmd("BITFIELD", "bf", "GET", "i8", "0"), [65])
+        check("BITFIELD GET u8", c.cmd("BITFIELD", "bf", "GET", "u8", "0"), [65])
+        check("BITFIELD STRLEN", c.cmd("STRLEN", "bf"), 1)
+        # A negative value in a signed field reads back unsigned as 255.
+        check("BITFIELD SET negative", c.cmd("BITFIELD", "bf", "SET", "i8", "0", "-1"), [65])
+        check("BITFIELD GET i8 negative", c.cmd("BITFIELD", "bf", "GET", "i8", "0"), [-1])
+        check("BITFIELD GET u8 negative", c.cmd("BITFIELD", "bf", "GET", "u8", "0"), [255])
+        # SET wraps a value that does not fit the width: 200 in i8 is -56.
+        check("BITFIELD SET wraps", c.cmd("BITFIELD", "bf", "SET", "i8", "0", "200"), [-1])
+        check("BITFIELD GET wrapped", c.cmd("BITFIELD", "bf", "GET", "i8", "0"), [-56])
+        # A second byte field: the u16 across both bytes is 0xC8FF.
+        check("BITFIELD SET second byte", c.cmd("BITFIELD", "bf", "SET", "u8", "8", "255"), [0])
+        check("BITFIELD GET u16", c.cmd("BITFIELD", "bf", "GET", "u16", "0"), [51455])
+        check("BITFIELD GET i16", c.cmd("BITFIELD", "bf", "GET", "i16", "0"), [-14081])
+        check("BITFIELD STRLEN two bytes", c.cmd("STRLEN", "bf"), 2)
+        # #n addresses the n-th field of the encoding's width.
+        check("BITFIELD SET hash offset", c.cmd("BITFIELD", "bf", "SET", "u8", "#1", "66"), [255])
+        check("BITFIELD GET hash u8", c.cmd("BITFIELD", "bf", "GET", "u8", "#1"), [66])
+        check("BITFIELD GET hash u16", c.cmd("BITFIELD", "bf", "GET", "u16", "0"), [51266])
+        # INCRBY returns the new value, including negative increments.
+        check("BITFIELD INCRBY", c.cmd("BITFIELD", "bf", "INCRBY", "i8", "0", "10"), [-46])
+        check("BITFIELD INCRBY negative", c.cmd("BITFIELD", "bf", "INCRBY", "i8", "0", "-5"), [-51])
+        # Several operations in one call run in order, one reply each.
+        check("BITFIELD multi op", c.cmd("BITFIELD", "bf", "GET", "i8", "0", "SET", "i8", "8", "42", "INCRBY", "i8", "16", "5"), [-51, 66, 5])
+        check("BITFIELD STRLEN three bytes", c.cmd("STRLEN", "bf"), 3)
+        # OVERFLOW WRAP (the default) wraps around: -51 + 200 = 149 -> -107.
+        check("BITFIELD OVERFLOW WRAP", c.cmd("BITFIELD", "bf", "OVERFLOW", "WRAP", "INCRBY", "i8", "0", "200"), [-107])
+        # OVERFLOW SAT clamps at the type's range, both ends.
+        check("BITFIELD OVERFLOW SAT", c.cmd("BITFIELD", "bf", "OVERFLOW", "SAT", "INCRBY", "i8", "0", "300"), [127])
+        check("BITFIELD OVERFLOW SAT low", c.cmd("BITFIELD", "bf", "OVERFLOW", "SAT", "INCRBY", "i8", "0", "-300"), [-128])
+        # OVERFLOW FAIL answers nil and leaves the field unchanged.
+        check("BITFIELD OVERFLOW FAIL", c.cmd("BITFIELD", "bf", "OVERFLOW", "FAIL", "INCRBY", "i8", "0", "-1"), [None])
+        check("BITFIELD FAIL unchanged", c.cmd("BITFIELD", "bf", "GET", "i8", "0"), [-128])
+        # OVERFLOW applies to SET too: FAIL refuses, SAT clamps.
+        check("BITFIELD SET FAIL overflow", c.cmd("BITFIELD", "bf", "OVERFLOW", "FAIL", "SET", "i8", "0", "200"), [None])
+        check("BITFIELD SET FAIL unchanged", c.cmd("BITFIELD", "bf", "GET", "i8", "0"), [-128])
+        check("BITFIELD SET SAT overflow", c.cmd("BITFIELD", "bf", "OVERFLOW", "SAT", "SET", "i8", "0", "200"), [-128])
+        check("BITFIELD SET SAT clamped", c.cmd("BITFIELD", "bf", "GET", "i8", "0"), [127])
+        # The overflow policy resets to WRAP on the next call.
+        check("BITFIELD overflow resets", c.cmd("BITFIELD", "bf", "INCRBY", "i8", "0", "1"), [-128])
+        # 64-bit fields on a fresh key; u64 is rejected, u63 is the max.
+        check("BITFIELD SET i64", c.cmd("BITFIELD", "bf64", "SET", "i64", "0", "-1"), [0])
+        check("BITFIELD GET i64", c.cmd("BITFIELD", "bf64", "GET", "i64", "0"), [-1])
+        check("BITFIELD GET u63", c.cmd("BITFIELD", "bf64", "GET", "u63", "0"), [9223372036854775807])
+        check("BITFIELD SET u63", c.cmd("BITFIELD", "bf64", "SET", "u63", "0", "9223372036854775807"), [9223372036854775807])
+        check("BITFIELD GET u63 max", c.cmd("BITFIELD", "bf64", "GET", "u63", "0"), [9223372036854775807])
+        check("BITFIELD INCRBY u63 wrap", c.cmd("BITFIELD", "bf64", "INCRBY", "u63", "0", "1"), [0])
+        check("BITFIELD STRLEN i64", c.cmd("STRLEN", "bf64"), 8)
+        check("BITFIELD u64 rejected", c.cmd("BITFIELD", "bf", "GET", "u64", "0"),
+              ("error", "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is the only unsigned 64 bit type."))
+        # BITFIELD preserves the TTL.
+        check("SET EX bitfield ttl", c.cmd("SET", "bft", "x", "EX", "100"), "OK")
+        check("BITFIELD preserves TTL", c.cmd("BITFIELD", "bft", "SET", "i8", "0", "1"), [120])
+        check("TTL after BITFIELD ~", 99 <= c.cmd("TTL", "bft") <= 100, True)
+        # A syntax error anywhere means nothing executes.
+        check("BITFIELD syntax error atomic", c.cmd("BITFIELD", "bf", "SET", "i8", "0", "99", "BOGUS", "i8", "0"),
+              ("error", "ERR syntax error"))
+        check("BITFIELD atomic GET", c.cmd("BITFIELD", "bf", "GET", "i8", "0"), [-128])
+        # Errors.
+        check("BITFIELD bad type", c.cmd("BITFIELD", "bf", "GET", "x8", "0"),
+              ("error", "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is the only unsigned 64 bit type."))
+        check("BITFIELD i0", c.cmd("BITFIELD", "bf", "GET", "i0", "0"),
+              ("error", "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is the only unsigned 64 bit type."))
+        check("BITFIELD bad subcommand", c.cmd("BITFIELD", "bf", "BOGUS", "i8", "0"),
+              ("error", "ERR syntax error"))
+        check("BITFIELD bad overflow", c.cmd("BITFIELD", "bf", "OVERFLOW", "MAYBE", "GET", "i8", "0"),
+              ("error", "ERR Invalid OVERFLOW type"))
+        check("BITFIELD bad offset", c.cmd("BITFIELD", "bf", "GET", "i8", "x"),
+              ("error", "ERR bit offset is not an integer or out of range"))
+        check("BITFIELD negative offset", c.cmd("BITFIELD", "bf", "GET", "i8", "-1"),
+              ("error", "ERR bit offset is not an integer or out of range"))
+        check("BITFIELD offset past max", c.cmd("BITFIELD", "bf", "GET", "i8", "4294967289"),
+              ("error", "ERR bit offset is not an integer or out of range"))
+        check("BITFIELD max offset GET", c.cmd("BITFIELD", "bf", "GET", "i8", "4294967288"), [0])
+        check("BITFIELD bad value", c.cmd("BITFIELD", "bf", "SET", "i8", "0", "x"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("BITFIELD wrong args", c.cmd("BITFIELD"),
+              ("error", "ERR wrong number of arguments for 'bitfield' command"))
+        check("BITFIELD no ops", c.cmd("BITFIELD", "bf"), [])
+        check("RPUSH bitfield list", c.cmd("RPUSH", "bfl", "a"), 1)
+        check("BITFIELD wrongtype", c.cmd("BITFIELD", "bfl", "GET", "i8", "0"),
+              ("error", "ERR WRONGTYPE Operation against a key holding the wrong kind of value"))
+        check("COMMAND lists BITFIELD", "BITFIELD" in c.cmd("COMMAND"), True)
+        # A BITFIELD write invalidates a WATCH; a no-op write does not.
+        c2 = Client(PORT)
+        check("BITFIELD watch", c2.cmd("WATCH", "bf"), "OK")
+        check("BITFIELD watch multi", c2.cmd("MULTI"), "OK")
+        check("BITFIELD watch queued", c2.cmd("SET", "bf", "z"), "QUEUED")
+        check("BITFIELD watch write", c.cmd("BITFIELD", "bf", "SET", "i8", "0", "7"), [-128])
+        check("BITFIELD watch exec aborts", c2.cmd("EXEC"), None)
+        check("BITFIELD watch value kept", c.cmd("BITFIELD", "bf", "GET", "i8", "0"), [7])
+        check("BITFIELD watch noop", c2.cmd("WATCH", "bf"), "OK")
+        check("BITFIELD watch noop multi", c2.cmd("MULTI"), "OK")
+        check("BITFIELD watch noop queued", c2.cmd("SET", "bf", "z"), "QUEUED")
+        check("BITFIELD noop write", c.cmd("BITFIELD", "bf", "SET", "i8", "0", "7"), [7])
+        check("BITFIELD watch noop exec runs", c2.cmd("EXEC"), ["OK"])
+        check("BITFIELD watch noop value", c.cmd("GET", "bf"), "z")
+        c2.close()
+        check("bitfield cleanup", c.cmd("DEL", "bf", "bf64", "bft", "bfl"), 4)
         # MSET / MGET: set and get several string keys at once.
         check("MSET", c.cmd("MSET", "m1", "one", "m2", "two", "m3", "three"), "OK")
         check("MGET all", c.cmd("MGET", "m1", "m2", "m3"), ["one", "two", "three"])
@@ -1001,11 +1106,12 @@ def main():
         check("COMMAND lists ZSCORE", "ZSCORE" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZCARD", "ZCARD" in c.cmd("COMMAND"), True)
         # Clean up the transaction keys: the AOF restart below counts
-        # exact keys (6: after, plist, pset, phash, pzset, prange).
+        # exact keys (7: after, plist, pset, phash, pzset, prange, pfield).
         # ZINCRBY and ZREM on pzset before the restart, so the AOF
         # replay section below can prove they were logged.
         check("AOF pre-restart ZINCRBY", c.cmd("ZINCRBY", "pzset", "1", "x"), "2.5")
         check("AOF pre-restart ZREM", c.cmd("ZREM", "pzset", "z"), 1)
+        check("AOF pre-restart BITFIELD", c.cmd("BITFIELD", "pfield", "SET", "u8", "0", "65", "SET", "u8", "8", "66"), [0, 0])
         check("tx cleanup", c.cmd("DEL", "txkey", "txctr", "txkey2", "txlist"), 4)
         c2.close()
         c.cmd("SHUTDOWN")
@@ -1040,6 +1146,7 @@ def main():
         check("AOF replay padded GET", c.cmd("GET", "prange"), "\x00" * 5 + "pad")
         check("AOF replay padded STRLEN", c.cmd("STRLEN", "prange"), 8)
         check("AOF replay padded GETRANGE", c.cmd("GETRANGE", "prange", "0", "4"), "\x00" * 5)
+        check("AOF replay bitfield", c.cmd("BITFIELD", "pfield", "GET", "u16", "0"), [16706])
         # The replayed PEXPIRE re-arms blinklist's 50 ms TTL from replay
         # time, so it is briefly alive again. The checks above run only
         # a few ms after the restart, so whether the TTL has passed by
@@ -1057,7 +1164,7 @@ def main():
         check("AOF replay expired set gone", c.cmd("SCARD", "blinkset"), 0)
         check("AOF replay expired hash gone", c.cmd("HLEN", "blinkhash"), 0)
         check("AOF replay expired zset gone", c.cmd("ZCARD", "blinkzset"), 0)
-        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 6)
+        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 7)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -1348,7 +1455,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.30.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.31.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

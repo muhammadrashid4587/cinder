@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.30.0"
+#define CINDER_VERSION "0.31.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -194,6 +194,55 @@ static int parse_ll(const char *s, long long *out) {
     long long v = strtoll(s, &end, 10);
     if (errno != 0 || end == s || *end != '\0') return 0;
     *out = v;
+    return 1;
+}
+
+/* Strict unsigned parse: digits only, no sign, no overflow. */
+static int parse_ull(const char *s, unsigned long long *out) {
+    if (!s || !*s) return 0;
+    unsigned long long v = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;
+        if (v > (UINT64_MAX - (unsigned long long)(*p - '0')) / 10) return 0;
+        v = v * 10 + (unsigned long long)(*p - '0');
+    }
+    *out = v;
+    return 1;
+}
+
+/* Parse a BITFIELD encoding: i1..i64 or u1..u63. Redis rejects u64
+   because RESP integers are signed 64-bit and a u64 field cannot be
+   returned. */
+static int parse_bitfield_type(const char *s, int *is_signed, int *bits) {
+    if (!s || (s[0] != 'i' && s[0] != 'u' && s[0] != 'I' && s[0] != 'U'))
+        return 0;
+    long long b;
+    if (!parse_ll(s + 1, &b)) return 0;
+    if (b < 1 || b > 64) return 0;
+    if ((s[0] == 'u' || s[0] == 'U') && b == 64) return 0;
+    *is_signed = (s[0] == 'i' || s[0] == 'I');
+    *bits = (int)b;
+    return 1;
+}
+
+/* Parse a BITFIELD offset for a field of `bits` width: a plain number
+   is a bit offset; #n is the n-th field of that width, so the bit
+   offset is n*bits. The field must end inside a 512 MB string
+   (offset + bits <= 2^32), as in Redis. */
+static int parse_bitfield_offset(const char *s, int bits,
+                                 unsigned long long *out) {
+    unsigned long long max_off = 4294967296ULL - (unsigned long long)bits;
+    if (s[0] == '#') {
+        unsigned long long n;
+        if (!parse_ull(s + 1, &n)) return 0;
+        if (n > max_off / (unsigned long long)bits) return 0;
+        *out = n * (unsigned long long)bits;
+        return 1;
+    }
+    long long off;
+    if (!parse_ll(s, &off)) return 0;
+    if (off < 0 || (unsigned long long)off > max_off) return 0;
+    *out = (unsigned long long)off;
     return 1;
 }
 
@@ -586,6 +635,129 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            whose result matches the destination, or one over
            missing keys with no destination to delete, changes
            nothing and does not invalidate a WATCH. */
+        if (changed) {
+            if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+            return 1;
+        }
+        return 0;
+    }
+    if (strcasecmp(cmd, "BITFIELD") == 0) {
+        if (argc < 2) return dbuf_error(reply, "wrong number of arguments for 'bitfield' command"), 0;
+        /* Parse every subcommand first: a syntax error anywhere means
+           nothing executes, as in Redis. OVERFLOW sets the policy for
+           the SET / INCRBY operations that follow it in this call. */
+        BitfieldOp *ops = calloc((size_t)(argc > 2 ? argc - 2 : 1), sizeof(BitfieldOp));
+        BitfieldResult *results = calloc((size_t)(argc > 2 ? argc - 2 : 1), sizeof(BitfieldResult));
+        if (!ops || !results) {
+            free(ops);
+            free(results);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        int nops = 0;
+        int overflow = BITFIELD_OVERFLOW_WRAP;
+        int bad = 0;
+        const char *err = NULL;
+        for (int i = 2; i < argc && !bad;) {
+            if (strcasecmp(argv[i], "GET") == 0) {
+                if (i + 2 >= argc) { err = "syntax error"; bad = 1; break; }
+                int is_signed, bits;
+                unsigned long long off;
+                if (!parse_bitfield_type(argv[i + 1], &is_signed, &bits)) {
+                    err = "Invalid bitfield type. Use something like i16 u8. Note that u64 is the only unsigned 64 bit type.";
+                    bad = 1; break;
+                }
+                if (!parse_bitfield_offset(argv[i + 2], bits, &off)) {
+                    err = "bit offset is not an integer or out of range";
+                    bad = 1; break;
+                }
+                ops[nops].kind = BITFIELD_GET;
+                ops[nops].is_signed = is_signed;
+                ops[nops].bits = bits;
+                ops[nops].offset = off;
+                nops++;
+                i += 3;
+            } else if (strcasecmp(argv[i], "SET") == 0 ||
+                       strcasecmp(argv[i], "INCRBY") == 0) {
+                int is_set = strcasecmp(argv[i], "SET") == 0;
+                if (i + 3 >= argc) { err = "syntax error"; bad = 1; break; }
+                int is_signed, bits;
+                unsigned long long off;
+                long long v;
+                if (!parse_bitfield_type(argv[i + 1], &is_signed, &bits)) {
+                    err = "Invalid bitfield type. Use something like i16 u8. Note that u64 is the only unsigned 64 bit type.";
+                    bad = 1; break;
+                }
+                if (!parse_bitfield_offset(argv[i + 2], bits, &off)) {
+                    err = "bit offset is not an integer or out of range";
+                    bad = 1; break;
+                }
+                if (!parse_ll(argv[i + 3], &v)) {
+                    err = "value is not an integer or out of range";
+                    bad = 1; break;
+                }
+                ops[nops].kind = is_set ? BITFIELD_SET : BITFIELD_INCRBY;
+                ops[nops].is_signed = is_signed;
+                ops[nops].bits = bits;
+                ops[nops].offset = off;
+                ops[nops].value = v;
+                ops[nops].overflow = overflow;
+                nops++;
+                i += 4;
+            } else if (strcasecmp(argv[i], "OVERFLOW") == 0) {
+                if (i + 1 >= argc) { err = "syntax error"; bad = 1; break; }
+                if (strcasecmp(argv[i + 1], "WRAP") == 0) overflow = BITFIELD_OVERFLOW_WRAP;
+                else if (strcasecmp(argv[i + 1], "SAT") == 0) overflow = BITFIELD_OVERFLOW_SAT;
+                else if (strcasecmp(argv[i + 1], "FAIL") == 0) overflow = BITFIELD_OVERFLOW_FAIL;
+                else { err = "Invalid OVERFLOW type"; bad = 1; break; }
+                i += 2;
+            } else {
+                err = "syntax error";
+                bad = 1;
+                break;
+            }
+        }
+        if (bad) {
+            free(ops);
+            free(results);
+            return dbuf_error(reply, err), 0;
+        }
+        int changed = 0;
+        int rc = store_bitfield(g_store, argv[1], ops, nops, results, &changed);
+        if (rc == -1) {
+            free(ops);
+            free(results);
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        }
+        if (rc == -2) {
+            free(ops);
+            free(results);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        if (rc == -3) {
+            free(ops);
+            free(results);
+            return dbuf_error(reply, "bit offset is not an integer or out of range"), 0;
+        }
+        /* One reply element per GET / SET / INCRBY, in order; an
+           INCRBY or SET that overflowed under OVERFLOW FAIL answers
+           nil. Unsigned fields are at most 63 bits, so every value
+           fits a signed 64-bit reply, as in Redis. */
+        dbuf_array_header(reply, (long long)nops);
+        for (int i = 0; i < nops; i++) {
+            if (results[i].is_nil) {
+                dbuf_null(reply);
+                continue;
+            }
+            long long v = ops[i].is_signed
+                ? store_bitfield_to_signed(results[i].raw, ops[i].bits)
+                : (long long)results[i].raw;
+            dbuf_int(reply, v);
+        }
+        free(ops);
+        free(results);
+        /* Only a real change is logged and replicated: a GET-only
+           call, or writes that leave every byte identical, change
+           nothing and do not invalidate a WATCH. */
         if (changed) {
             if (g_max_entries) store_evict_lru(g_store, g_max_entries);
             return 1;
@@ -1252,7 +1424,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         static const char *names[] = {"PING", "ECHO", "QUIT", "SHUTDOWN", "SET", "GET",
             "MSET", "MGET", "GETDEL", "GETEX",
             "SETNX", "SETEX", "GETSET", "APPEND", "STRLEN",
-            "GETRANGE", "SETRANGE", "SETBIT", "GETBIT", "BITCOUNT", "BITOP",
+            "GETRANGE", "SETRANGE", "SETBIT", "GETBIT", "BITCOUNT", "BITOP", "BITFIELD",
             "DEL", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "PTTL", "INCR", "DECR",
             "INCRBY", "DECRBY", "LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE",
             "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",

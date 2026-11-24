@@ -159,6 +159,52 @@ int store_bitcount(Store *s, const char *key, long long start, long long end,
    source holds a non-string), -2 = out of memory. */
 int store_bitop(Store *s, int op, const char *dest, const char **keys, int nkeys,
                 long long *len_out, int *changed_out);
+/* BITFIELD: packed integer fields in a string value, Redis BITFIELD
+   semantics. Encodings are i1..i64 (signed, two's complement) and
+   u1..u63 (unsigned; u64 is not supported because RESP integers are
+   signed 64-bit, as in Redis). Offsets are bit offsets, or #n for
+   the n-th field of the encoding's width (bit offset n*bits).
+   GET reads a field (0 for a missing key or bits past the end),
+   SET writes one (wrapping, saturating, or failing on overflow per
+   the overflow policy in effect) and returns the old value, INCRBY
+   adds an increment and returns the new value. OVERFLOW WRAP is the
+   default; SAT clamps to the type's range; FAIL returns nil for
+   that operation and leaves the field unchanged. A SET or INCRBY
+   creates the key zero-padded when missing and grows it with zero
+   bytes when the field runs past the end, preserving the TTL, as
+   in Redis; a GET-only call creates nothing. */
+#define BITFIELD_GET 0
+#define BITFIELD_SET 1
+#define BITFIELD_INCRBY 2
+#define BITFIELD_OVERFLOW_WRAP 0
+#define BITFIELD_OVERFLOW_SAT 1
+#define BITFIELD_OVERFLOW_FAIL 2
+typedef struct BitfieldOp {
+    int kind; /* BITFIELD_GET / SET / INCRBY */
+    int is_signed; /* 1 = i, 0 = u */
+    int bits; /* 1..64 signed, 1..63 unsigned */
+    unsigned long long offset; /* bit offset; offset + bits <= 2^32 */
+    long long value; /* SET value or INCRBY increment */
+    int overflow; /* WRAP / SAT / FAIL in effect for this op */
+} BitfieldOp;
+/* One BITFIELD result: raw holds the field value as raw bits
+   (interpret as signed per the op's encoding when is_signed);
+   is_nil is 1 when an INCRBY or SET overflowed under OVERFLOW
+   FAIL, in which case the field was left unchanged. */
+typedef struct BitfieldResult {
+    unsigned long long raw;
+    int is_nil;
+} BitfieldResult;
+/* Execute the ops in order against the key. Returns 0 on success
+   (results[i] holds one reply per op, *changed_out is 1 when the
+   stored state actually changed — a key created, the value grown,
+   or a byte different — 0 when every write was a no-op),
+   -1 = wrong type, -2 = out of memory, -3 = a field runs past the
+   end of the largest legal string (offset + bits > 2^32). */
+/* The raw bits of a signed BITFIELD result as a signed value. */
+long long store_bitfield_to_signed(unsigned long long raw, int bits);
+int store_bitfield(Store *s, const char *key, const BitfieldOp *ops, int nops,
+                   BitfieldResult *results, int *changed_out);
 /* Increment a string key's integer value by delta, in one hash lookup.
    Creates the key when missing (or expired). The TTL is untouched, so
    INCR preserves it, as in Redis. Returns 0 on success (*out is the
