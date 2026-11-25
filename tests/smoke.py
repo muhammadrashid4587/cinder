@@ -1716,7 +1716,79 @@ def main():
         check("ZINTERSTORE dest is input range", c.cmd("ZRANGE", "itzset1", "0", "-1", "WITHSCORES"),
               ["b", "12", "c", "33"])
         check("ZINTERSTORE cleanup", c.cmd("DEL", "itzset1", "itzset2", "itdest", "strdest2", "wtestkey"), 5)
-        # Deleted again: the AOF restart below counts exactly 7 keys.
+        # ZDIFFSTORE. dfzset1 holds a=1, b=2, c=3, e=5; dfzset2 holds
+        # b=10, c=30, d=4, so the difference is a=1, e=5, with the
+        # scores from the first set.
+        check("ZADD dfzset1", c.cmd("ZADD", "dfzset1", "1", "a", "2", "b", "3", "c", "5", "e"), 4)
+        check("ZADD dfzset2", c.cmd("ZADD", "dfzset2", "10", "b", "30", "c", "4", "d"), 3)
+        check("ZDIFFSTORE one", c.cmd("ZDIFFSTORE", "dfdest", "1", "dfzset1"), 4)
+        check("ZDIFFSTORE one range", c.cmd("ZRANGE", "dfdest", "0", "-1", "WITHSCORES"),
+              ["a", "1", "b", "2", "c", "3", "e", "5"])
+        check("ZDIFFSTORE two", c.cmd("ZDIFFSTORE", "dfdest", "2", "dfzset1", "dfzset2"), 2)
+        check("ZDIFFSTORE two range", c.cmd("ZRANGE", "dfdest", "0", "-1", "WITHSCORES"),
+              ["a", "1", "e", "5"])
+        check("ZDIFFSTORE missing other", c.cmd("ZDIFFSTORE", "dfdest", "2", "dfzset1", "ghostzset"), 4)
+        check("ZDIFFSTORE missing other range", c.cmd("ZRANGE", "dfdest", "0", "-1", "WITHSCORES"),
+              ["a", "1", "b", "2", "c", "3", "e", "5"])
+        check("ZDIFFSTORE missing first", c.cmd("ZDIFFSTORE", "dfdest", "2", "ghostzset", "dfzset2"), 0)
+        check("ZDIFFSTORE missing first dest gone", c.cmd("EXISTS", "dfdest"), 0)
+        # Overwriting a string destination replaces it, and the
+        # destination's TTL is cleared by the overwrite.
+        check("ZDIFFSTORE string dest setup", c.cmd("SET", "strdest3", "old"), "OK")
+        check("ZDIFFSTORE overwrites string", c.cmd("ZDIFFSTORE", "strdest3", "2", "dfzset1", "dfzset2"), 2)
+        check("ZDIFFSTORE string dest is zset", c.cmd("ZSCORE", "strdest3", "a"), "1")
+        check("ZDIFFSTORE string dest GET wrongtype", c.cmd("GET", "strdest3"), wrongtype)
+        check("ZDIFFSTORE restore diff", c.cmd("ZDIFFSTORE", "dfdest", "2", "dfzset1", "dfzset2"), 2)
+        check("ZDIFFSTORE TTL setup", c.cmd("EXPIRE", "dfdest", "100"), 1)
+        check("ZDIFFSTORE overwrites TTL", c.cmd("ZDIFFSTORE", "dfdest", "1", "dfzset1"), 4)
+        check("ZDIFFSTORE TTL cleared", c.cmd("TTL", "dfdest"), -1)
+        # An empty result deletes the destination instead of leaving
+        # an empty set, and a missing destination stays missing.
+        check("ZDIFFSTORE empty deletes", c.cmd("ZDIFFSTORE", "dfdest", "2", "dfzset1", "dfzset1"), 0)
+        check("ZDIFFSTORE empty dest gone", c.cmd("EXISTS", "dfdest"), 0)
+        check("ZDIFFSTORE empty missing dest", c.cmd("ZDIFFSTORE", "newdest2", "1", "ghostzset"), 0)
+        check("ZDIFFSTORE empty missing dest gone", c.cmd("EXISTS", "newdest2"), 0)
+        check("ZDIFFSTORE wrongtype", c.cmd("ZDIFFSTORE", "dfdest", "2", "dfzset1", "after"), wrongtype)
+        check("ZDIFFSTORE wrong args", c.cmd("ZDIFFSTORE", "dfdest"),
+              ("error", "ERR wrong number of arguments for 'zdiffstore' command"))
+        check("ZDIFFSTORE too few keys", c.cmd("ZDIFFSTORE", "dfdest", "2", "dfzset1"),
+              ("error", "ERR wrong number of arguments for 'zdiffstore' command"))
+        check("ZDIFFSTORE zero keys", c.cmd("ZDIFFSTORE", "dfdest", "0", "dfzset1"),
+              ("error", "ERR at least 1 input key is needed for 'zdiffstore' command"))
+        # ZDIFFSTORE takes no options: anything past the input keys
+        # is a syntax error, including WEIGHTS and WITHSCORES.
+        check("ZDIFFSTORE withscores rejected", c.cmd("ZDIFFSTORE", "dfdest", "1", "dfzset1",
+                                                      "WITHSCORES"),
+              ("error", "ERR syntax error"))
+        check("ZDIFFSTORE weights rejected", c.cmd("ZDIFFSTORE", "dfdest", "2", "dfzset1", "dfzset2",
+                                                   "WEIGHTS", "1", "1"),
+              ("error", "ERR syntax error"))
+        check("ZDIFFSTORE bad option", c.cmd("ZDIFFSTORE", "dfdest", "1", "dfzset1", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("COMMAND lists ZDIFFSTORE", "ZDIFFSTORE" in c.cmd("COMMAND"), True)
+        # A ZDIFFSTORE that reproduces the destination exactly is a
+        # no-op and does not invalidate a WATCH; one that changes it
+        # does. Restore the plain difference into dfdest first.
+        check("ZDIFFSTORE restore difference", c.cmd("ZDIFFSTORE", "dfdest", "2", "dfzset1", "dfzset2"), 2)
+        check("WATCH zdiffstore noop", c.cmd("WATCH", "dfdest"), "OK")
+        check("ZDIFFSTORE noop", c.cmd("ZDIFFSTORE", "dfdest", "2", "dfzset1", "dfzset2"), 2)
+        check("MULTI zdiffstore noop watch", c.cmd("MULTI"), "OK")
+        check("MULTI zdiffstore noop SET queued", c.cmd("SET", "wtestkey", "v1"), "QUEUED")
+        check("EXEC zdiffstore noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("wtestkey after zdiffstore noop EXEC", c.cmd("GET", "wtestkey"), "v1")
+        check("WATCH zdiffstore change", c.cmd("WATCH", "dfdest"), "OK")
+        check("ZDIFFSTORE change", c.cmd("ZDIFFSTORE", "dfdest", "1", "dfzset1"), 4)
+        check("MULTI zdiffstore change watch", c.cmd("MULTI"), "OK")
+        check("MULTI zdiffstore change SET queued", c.cmd("SET", "wtestkey", "v2"), "QUEUED")
+        check("EXEC zdiffstore change watch aborts", c.cmd("EXEC"), None)
+        check("wtestkey unchanged after zdiffstore abort", c.cmd("GET", "wtestkey"), "v1")
+        # The destination may be one of the inputs: the difference
+        # is computed before the destination is overwritten.
+        check("ZDIFFSTORE dest is input", c.cmd("ZDIFFSTORE", "dfzset1", "2", "dfzset1", "dfzset2"), 2)
+        check("ZDIFFSTORE dest is input range", c.cmd("ZRANGE", "dfzset1", "0", "-1", "WITHSCORES"),
+              ["a", "1", "e", "5"])
+        check("ZDIFFSTORE cleanup", c.cmd("DEL", "dfzset1", "dfzset2", "dfdest", "strdest3", "wtestkey"), 5)
+        # Deleted again: the AOF restart below counts exactly 9 keys.
         check("ZMSCORE cleanup", c.cmd("DEL", "mszset"), 1)
         check("ZREMRANGEBYLEX wrongtype", c.cmd("ZREMRANGEBYLEX", "after", "-", "+"),
               wrongtype)
@@ -2075,7 +2147,7 @@ def main():
         check("COMMAND lists ZSCORE", "ZSCORE" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZCARD", "ZCARD" in c.cmd("COMMAND"), True)
         # Clean up the transaction keys: the AOF restart below counts
-        # exact keys (8: after, plist, pset, phash, pzset, prange, pfield, punion).
+        # exact keys (9: after, plist, pset, phash, pzset, prange, pfield, punion, pdiff).
         # ZINCRBY and ZREM on pzset before the restart, so the AOF
         # replay section below can prove they were logged; the
         # ZREMRANGEBYSCORE removes y (2.25) from pzset the same way.
@@ -2084,6 +2156,7 @@ def main():
         check("AOF pre-restart ZREM", c.cmd("ZREM", "pzset", "z"), 1)
         check("AOF pre-restart HINCRBY", c.cmd("HINCRBY", "phash", "a", "5"), 6)
         check("AOF pre-restart ZUNIONSTORE", c.cmd("ZUNIONSTORE", "punion", "1", "pzset"), 1)
+        check("AOF pre-restart ZDIFFSTORE", c.cmd("ZDIFFSTORE", "pdiff", "1", "pzset"), 1)
         check("AOF pre-restart BITFIELD", c.cmd("BITFIELD", "pfield", "SET", "u8", "0", "65", "SET", "u8", "8", "66"), [0, 0])
         check("tx cleanup", c.cmd("DEL", "txkey", "txctr", "txkey2", "txlist"), 4)
         c2.close()
@@ -2119,6 +2192,9 @@ def main():
         check("AOF replay zunionstore card", c.cmd("ZCARD", "punion"), 1)
         check("AOF replay zunionstore score", c.cmd("ZSCORE", "punion", "x"), "2.5")
         check("AOF replay zunionstore range", c.cmd("ZRANGE", "punion", "0", "-1"), ["x"])
+        check("AOF replay zdiffstore card", c.cmd("ZCARD", "pdiff"), 1)
+        check("AOF replay zdiffstore score", c.cmd("ZSCORE", "pdiff", "x"), "2.5")
+        check("AOF replay zdiffstore range", c.cmd("ZRANGE", "pdiff", "0", "-1"), ["x"])
         check("AOF replay padded GET", c.cmd("GET", "prange"), "\x00" * 5 + "pad")
         check("AOF replay padded STRLEN", c.cmd("STRLEN", "prange"), 8)
         check("AOF replay padded GETRANGE", c.cmd("GETRANGE", "prange", "0", "4"), "\x00" * 5)
@@ -2140,7 +2216,7 @@ def main():
         check("AOF replay expired set gone", c.cmd("SCARD", "blinkset"), 0)
         check("AOF replay expired hash gone", c.cmd("HLEN", "blinkhash"), 0)
         check("AOF replay expired zset gone", c.cmd("ZCARD", "blinkzset"), 0)
-        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 8)
+        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 9)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -2431,7 +2507,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.53.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.54.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -2500,6 +2576,7 @@ def main():
         check("repl live LPUSH", p.cmd("LPUSH", "replist", "front"), 4)
         check("repl live ZADD zset2", p.cmd("ZADD", "repz2", "10", "a", "1", "c"), 2)
         check("repl live ZUNIONSTORE", p.cmd("ZUNIONSTORE", "repunion", "2", "repzset", "repz2"), 3)
+        check("repl live ZDIFFSTORE", p.cmd("ZDIFFSTORE", "repdiff", "2", "repzset", "repz2"), 1)
         check("repl live ZREMRANGEBYSCORE", p.cmd("ZREMRANGEBYSCORE", "repzset", "1", "2"), 2)
         deadline = time.time() + 5
         streamed = False
@@ -2517,6 +2594,7 @@ def main():
             time.sleep(0.1)
         check("repl streamed writes arrived", streamed, True)
         check("repl streamed zunionstore", r.cmd("ZSCORE", "repunion", "a"), "11.5")
+        check("repl streamed zdiffstore", r.cmd("ZSCORE", "repdiff", "b"), "2")
         check("repl streamed list", r.cmd("LRANGE", "replist", "0", "-1"),
               ["front", "x", "y", "z"])
         # Replication offsets: the primary counts forwarded stream bytes,

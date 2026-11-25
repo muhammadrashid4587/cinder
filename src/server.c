@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.53.0"
+#define CINDER_VERSION "0.54.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2317,6 +2317,150 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_int(reply, (long long)n);
         return 0;
     }
+    if (strcasecmp(cmd, "ZDIFFSTORE") == 0) {
+        if (argc < 4) return dbuf_error(reply, "wrong number of arguments for 'zdiffstore' command"), 0;
+        const char *dest = argv[1];
+        long long numkeys;
+        if (!parse_ll(argv[2], &numkeys) || numkeys < 1)
+            return dbuf_error(reply, "at least 1 input key is needed for 'zdiffstore' command"), 0;
+        if (argc < 3 + numkeys)
+            return dbuf_error(reply, "wrong number of arguments for 'zdiffstore' command"), 0;
+        /* Unlike ZUNIONSTORE / ZINTERSTORE there are no options here:
+           the scores come from the first set, as in Redis, so any
+           argument past the input keys is a syntax error. */
+        if (argc > 3 + numkeys)
+            return dbuf_error(reply, "syntax error"), 0;
+        /* The type of every input key is checked before any set is
+           read: a non-sorted-set key is a WRONGTYPE error, and a
+           missing key counts as an empty set, as in Redis. The
+           destination is not type-checked here, so it may hold any
+           type — it is overwritten — and it may be one of the
+           inputs, since the difference is computed before the
+           destination is touched. */
+        for (long long k = 0; k < numkeys; k++) {
+            int t = store_type(g_store, argv[3 + k]);
+            if (t != 0 && t != 5)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        }
+        /* Fetch the first set whole, in score order, then keep only
+           the members no other input set holds, with the scores from
+           the first set, as in ZDIFF. A member is tested with
+           store_zscore, which answers 0 for a missing key, so the
+           missing-key case needs no special casing. The kept members
+           stay in score order, so the result needs no resort. */
+        char **members = NULL;
+        double *scores = NULL;
+        size_t n = 0;
+        int rc = store_zrange(g_store, argv[3], 0, -1, 0,
+                              &members, &scores, &n);
+        if (rc == -1)
+            /* Unreachable: the type check above already rejected
+               non-sorted-set keys, and the loop is single-threaded. */
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        struct zunion_entry *entries = NULL;
+        size_t en = 0, ecap = 0;
+        int failed = 0;
+        for (size_t i = 0; i < n && !failed; i++) {
+            int in_other = 0;
+            for (long long k = 1; k < numkeys; k++) {
+                double s;
+                if (store_zscore(g_store, argv[3 + k], members[i], &s) == 1) {
+                    in_other = 1;
+                    break;
+                }
+            }
+            if (in_other) {
+                free(members[i]);
+                members[i] = NULL;
+                continue;
+            }
+            if (en == ecap) {
+                size_t ncap = ecap ? ecap * 2 : 16;
+                struct zunion_entry *grown =
+                    realloc(entries, ncap * sizeof(*grown));
+                if (!grown) {
+                    failed = 1;
+                    break;
+                }
+                entries = grown;
+                ecap = ncap;
+            }
+            entries[en].member = members[i];
+            entries[en].score = scores[i];
+            members[i] = NULL;
+            en++;
+        }
+        for (size_t i = 0; i < n; i++) free(members[i]);
+        free(members);
+        free(scores);
+        if (failed) {
+            for (size_t i = 0; i < en; i++) free(entries[i].member);
+            free(entries);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        n = en;
+        /* Only a real change is written: when the destination already
+           holds exactly this sorted set — same members in score
+           order with the same scores — the command changes nothing,
+           so it is not logged, not replicated, and does not
+           invalidate a WATCH, like a no-op ZADD. A non-sorted-set
+           destination is always a change: it is overwritten. */
+        int changed = 1;
+        char **dmembers = NULL;
+        double *dscores = NULL;
+        size_t dn = 0;
+        int drc = store_zrange(g_store, dest, 0, -1, 0,
+                               &dmembers, &dscores, &dn);
+        if (drc == 0 && dn == n) {
+            changed = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (strcmp(dmembers[i], entries[i].member) != 0 ||
+                    dscores[i] != entries[i].score) {
+                    changed = 1;
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < dn; i++) free(dmembers[i]);
+        free(dmembers);
+        free(dscores);
+        if (drc == -2) {
+            for (size_t i = 0; i < n; i++) free(entries[i].member);
+            free(entries);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        if (changed) {
+            /* The destination is overwritten whatever it held, and
+               its TTL is cleared with it, as in Redis; an empty
+               result deletes it instead of leaving an empty set. */
+            store_del(g_store, dest);
+            for (size_t i = 0; i < n; i++) {
+                long long zrc = store_zadd(g_store, dest, entries[i].member,
+                                           entries[i].score);
+                if (zrc == -2) {
+                    /* The members already added were freed in the
+                       loop above, so only this one and the ones not
+                       yet written are still owned here. */
+                    for (size_t j = i; j < n; j++) free(entries[j].member);
+                    free(entries);
+                    return dbuf_error(reply, "out of memory"), 0;
+                }
+                free(entries[i].member);
+            }
+            free(entries);
+            if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+            dbuf_int(reply, (long long)n);
+            /* A real write, so it is logged to the AOF, replicated,
+               and invalidates a WATCH on the destination. */
+            return 1;
+        }
+        for (size_t i = 0; i < n; i++) free(entries[i].member);
+        free(entries);
+        dbuf_int(reply, (long long)n);
+        return 0;
+    }
     if (strcasecmp(cmd, "ZCARD") == 0) {
         if (argc != 2) return dbuf_error(reply, "wrong number of arguments for 'zcard' command"), 0;
         long long n = store_zcard(g_store, argv[1]);
@@ -2856,7 +3000,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",
-            "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZINTER", "ZUNIONSTORE", "ZINTERSTORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
+            "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZINTER", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",
             "ZRANK", "ZREVRANK", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "ZRANDMEMBER", "ZSCAN",
