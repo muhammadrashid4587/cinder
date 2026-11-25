@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.52.0.
+Version 0.53.0.
 
 ## Why
 
@@ -110,6 +110,7 @@ OK
 | `ZDIFF numkeys key [key ...] [WITHSCORES]` | Members of the first sorted set that are in none of the other sets, lowest score first; `WITHSCORES` interleaves each score after its member; a missing key counts as an empty set |
 | `ZINTER numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]` | Members present in every input sorted set, lowest score first; each score is weighted per key and then aggregated (`SUM` by default, or `MIN`/`MAX`); `WITHSCORES` interleaves each score after its member; a missing key counts as an empty set |
 | `ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM\|MIN\|MAX]` | Store the union of several sorted sets at `destination` and return the number of members stored; each score is weighted per key and then aggregated (`SUM` by default, or `MIN`/`MAX`); the destination is overwritten whatever it held and its TTL is cleared, it may be one of the inputs, and an empty result deletes it; a missing key counts as an empty set |
+| `ZINTERSTORE destination numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM\|MIN\|MAX]` | Store the intersection of several sorted sets at `destination` and return the number of members stored; only members present in every input set are stored, each score weighted per key and then aggregated (`SUM` by default, or `MIN`/`MAX`); the destination is overwritten whatever it held and its TTL is cleared, it may be one of the inputs, and an empty result deletes it; a missing key counts as an empty set |
 | `ZCARD key` | Number of members (`0` when missing) |
 | `ZRANGE key start stop [WITHSCORES]` | Members in index range, lowest score first; negative indices count from the end, `WITHSCORES` interleaves each score after its member |
 | `ZREVRANGE key start stop [WITHSCORES]` | Same range, highest score first |
@@ -1098,5 +1099,28 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       store code. Only a real change is written: a `ZUNIONSTORE`
       that reproduces the destination exactly is a no-op, so it
       is not logged to the AOF, not replicated, and does not
+      invalidate `WATCH`, like a no-op `ZADD`; a real write is
+      all three, and it is listed by `COMMAND`.
+
+- [x] `ZINTERSTORE` (0.53.0): store the intersection of several
+      sorted sets at a destination key, `ZINTERSTORE destination
+      numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX]`,
+      and return the number of members stored, as in real Redis.
+      Only the members present in every input set are stored, each
+      score weighted per key and then aggregated (`SUM` by default,
+      or `MIN`/`MAX`), with the options in any order and the same
+      float/syntax errors as `ZINTER`. The destination is
+      overwritten whatever it held, its TTL is cleared, it may be
+      one of the input keys (the intersection is computed before
+      the destination is touched), and an empty result deletes it
+      instead of leaving an empty set. A missing key counts as an
+      empty set and a non-sorted-set input key is a `WRONGTYPE`
+      error; the handler checks the type of every input key
+      before reading any set. It reuses `store_zrange` for the
+      first set and `store_zscore` for membership in the others
+      and `store_zadd` for the write, so it needs no new store
+      code. Only a real change is written: a `ZINTERSTORE` that
+      reproduces the destination exactly is a no-op, so it is
+      not logged to the AOF, not replicated, and does not
       invalidate `WATCH`, like a no-op `ZADD`; a real write is
       all three, and it is listed by `COMMAND`.

@@ -1624,6 +1624,98 @@ def main():
         check("ZUNIONSTORE dest is input range", c.cmd("ZRANGE", "stzset1", "0", "-1", "WITHSCORES"),
               ["a", "1", "c", "3", "d", "4", "b", "12"])
         check("ZUNIONSTORE cleanup", c.cmd("DEL", "stzset1", "stzset2", "stdest", "strdest", "wtestkey"), 5)
+        # ZINTERSTORE. itzset1 holds a=1, b=2, c=3; itzset2 holds
+        # b=10, c=30, d=4, so the intersection is b=12, c=33.
+        check("ZADD itzset1", c.cmd("ZADD", "itzset1", "1", "a", "2", "b", "3", "c"), 3)
+        check("ZADD itzset2", c.cmd("ZADD", "itzset2", "10", "b", "30", "c", "4", "d"), 3)
+        check("ZINTERSTORE one", c.cmd("ZINTERSTORE", "itdest", "1", "itzset1"), 3)
+        check("ZINTERSTORE one range", c.cmd("ZRANGE", "itdest", "0", "-1", "WITHSCORES"),
+              ["a", "1", "b", "2", "c", "3"])
+        check("ZINTERSTORE two", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2"), 2)
+        check("ZINTERSTORE two range", c.cmd("ZRANGE", "itdest", "0", "-1", "WITHSCORES"),
+              ["b", "12", "c", "33"])
+        check("ZINTERSTORE weights", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2",
+                                           "WEIGHTS", "2", "3"), 2)
+        check("ZINTERSTORE weights range", c.cmd("ZRANGE", "itdest", "0", "-1", "WITHSCORES"),
+              ["b", "34", "c", "96"])
+        check("ZINTERSTORE aggregate min", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2",
+                                                 "AGGREGATE", "MIN"), 2)
+        check("ZINTERSTORE aggregate min range", c.cmd("ZRANGE", "itdest", "0", "-1", "WITHSCORES"),
+              ["b", "2", "c", "3"])
+        check("ZINTERSTORE aggregate max", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2",
+                                                 "AGGREGATE", "MAX"), 2)
+        check("ZINTERSTORE aggregate max range", c.cmd("ZRANGE", "itdest", "0", "-1", "WITHSCORES"),
+              ["b", "10", "c", "30"])
+        check("ZINTERSTORE weights min", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2",
+                                               "WEIGHTS", "2", "1", "AGGREGATE", "MIN"), 2)
+        check("ZINTERSTORE weights min range", c.cmd("ZRANGE", "itdest", "0", "-1", "WITHSCORES"),
+              ["b", "4", "c", "6"])
+        # Overwriting a string destination replaces it, and the
+        # destination's TTL is cleared by the overwrite.
+        check("ZINTERSTORE string dest setup", c.cmd("SET", "strdest2", "old"), "OK")
+        check("ZINTERSTORE overwrites string", c.cmd("ZINTERSTORE", "strdest2", "2", "itzset1", "itzset2"), 2)
+        check("ZINTERSTORE string dest is zset", c.cmd("ZSCORE", "strdest2", "b"), "12")
+        check("ZINTERSTORE TTL setup", c.cmd("EXPIRE", "itdest", "100"), 1)
+        check("ZINTERSTORE overwrites TTL", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2"), 2)
+        check("ZINTERSTORE TTL cleared", c.cmd("TTL", "itdest"), -1)
+        # An empty result deletes the destination instead of leaving
+        # an empty set; a missing first input set is empty too.
+        check("ZINTERSTORE empty deletes", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "ghostzset"), 0)
+        check("ZINTERSTORE empty dest gone", c.cmd("EXISTS", "itdest"), 0)
+        check("ZINTERSTORE missing first", c.cmd("ZINTERSTORE", "itdest", "2", "ghostzset", "itzset2"), 0)
+        check("ZINTERSTORE wrongtype", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "after"), wrongtype)
+        check("ZINTERSTORE wrong args", c.cmd("ZINTERSTORE", "itdest"),
+              ("error", "ERR wrong number of arguments for 'zinterstore' command"))
+        check("ZINTERSTORE too few keys", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1"),
+              ("error", "ERR wrong number of arguments for 'zinterstore' command"))
+        check("ZINTERSTORE zero keys", c.cmd("ZINTERSTORE", "itdest", "0", "itzset1"),
+              ("error", "ERR at least 1 input key is needed for 'zinterstore' command"))
+        check("ZINTERSTORE bad weight", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2",
+                                              "WEIGHTS", "x", "1"),
+              ("error", "ERR value is not a valid float"))
+        check("ZINTERSTORE weights short", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2",
+                                                 "WEIGHTS", "1"),
+              ("error", "ERR syntax error"))
+        check("ZINTERSTORE bad aggregate", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2",
+                                                 "AGGREGATE", "MEAN"),
+              ("error", "ERR syntax error"))
+        check("ZINTERSTORE duplicate weights", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2",
+                                                     "WEIGHTS", "1", "1",
+                                                     "WEIGHTS", "1", "1"),
+              ("error", "ERR syntax error"))
+        check("ZINTERSTORE duplicate aggregate", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2",
+                                                       "AGGREGATE", "SUM",
+                                                       "AGGREGATE", "MIN"),
+              ("error", "ERR syntax error"))
+        check("ZINTERSTORE withscores rejected", c.cmd("ZINTERSTORE", "itdest", "1", "itzset1",
+                                                       "WITHSCORES"),
+              ("error", "ERR syntax error"))
+        check("ZINTERSTORE bad option", c.cmd("ZINTERSTORE", "itdest", "1", "itzset1", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("COMMAND lists ZINTERSTORE", "ZINTERSTORE" in c.cmd("COMMAND"), True)
+        # A ZINTERSTORE that reproduces the destination exactly is a
+        # no-op and does not invalidate a WATCH; one that changes it
+        # does. Restore the plain intersection into itdest first.
+        check("ZINTERSTORE restore intersection", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2"), 2)
+        check("WATCH zinterstore noop", c.cmd("WATCH", "itdest"), "OK")
+        check("ZINTERSTORE noop", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2"), 2)
+        check("MULTI zinterstore noop watch", c.cmd("MULTI"), "OK")
+        check("MULTI zinterstore noop SET queued", c.cmd("SET", "wtestkey", "v1"), "QUEUED")
+        check("EXEC zinterstore noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("wtestkey after zinterstore noop EXEC", c.cmd("GET", "wtestkey"), "v1")
+        check("WATCH zinterstore change", c.cmd("WATCH", "itdest"), "OK")
+        check("ZINTERSTORE change", c.cmd("ZINTERSTORE", "itdest", "2", "itzset1", "itzset2",
+                                          "WEIGHTS", "2", "1"), 2)
+        check("MULTI zinterstore change watch", c.cmd("MULTI"), "OK")
+        check("MULTI zinterstore change SET queued", c.cmd("SET", "wtestkey", "v2"), "QUEUED")
+        check("EXEC zinterstore change watch aborts", c.cmd("EXEC"), None)
+        check("wtestkey unchanged after zinterstore abort", c.cmd("GET", "wtestkey"), "v1")
+        # The destination may be one of the inputs: the intersection
+        # is computed before the destination is overwritten.
+        check("ZINTERSTORE dest is input", c.cmd("ZINTERSTORE", "itzset1", "2", "itzset1", "itzset2"), 2)
+        check("ZINTERSTORE dest is input range", c.cmd("ZRANGE", "itzset1", "0", "-1", "WITHSCORES"),
+              ["b", "12", "c", "33"])
+        check("ZINTERSTORE cleanup", c.cmd("DEL", "itzset1", "itzset2", "itdest", "strdest2", "wtestkey"), 5)
         # Deleted again: the AOF restart below counts exactly 7 keys.
         check("ZMSCORE cleanup", c.cmd("DEL", "mszset"), 1)
         check("ZREMRANGEBYLEX wrongtype", c.cmd("ZREMRANGEBYLEX", "after", "-", "+"),
@@ -2339,7 +2431,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.52.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.53.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
