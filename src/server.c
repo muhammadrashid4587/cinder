@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.57.0"
+#define CINDER_VERSION "0.58.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1333,6 +1333,61 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         char buf[64];
         snprintf(buf, sizeof(buf), "%.4f", dist * factor);
         dbuf_bulk(reply, buf, strlen(buf));
+        return 0;
+    }
+    if (strcasecmp(cmd, "GEOPOS") == 0) {
+        if (argc < 3)
+            return dbuf_error(reply, "wrong number of arguments for 'geopos' command"), 0;
+        int t = store_type(g_store, argv[1]);
+        if (t != 0 && t != 5)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_array_header(reply, (long long)(argc - 2));
+        for (int i = 2; i < argc; i++) {
+            double lon, lat;
+            int rc = store_geopos(g_store, argv[1], argv[i], &lon, &lat);
+            if (rc == -1)
+                /* Unreachable: the type check above already rejected
+                   non-sorted-set keys, and the loop is single-threaded. */
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == 0) {
+                /* A missing member — or one whose score does not
+                   decode as a geohash — answers a null array, not a
+                   null bulk string, as in Redis. */
+                dbuf_null_array(reply);
+                continue;
+            }
+            /* Each coordinate is a bulk string, %.17g: the decoded
+               cell centre is a double, so that prints the same
+               digits as Redis's %.17Lg. */
+            dbuf_array_header(reply, 2);
+            char buf[32];
+            format_score(buf, sizeof(buf), lon);
+            dbuf_bulk(reply, buf, strlen(buf));
+            format_score(buf, sizeof(buf), lat);
+            dbuf_bulk(reply, buf, strlen(buf));
+        }
+        return 0;
+    }
+    if (strcasecmp(cmd, "GEOHASH") == 0) {
+        if (argc < 3)
+            return dbuf_error(reply, "wrong number of arguments for 'geohash' command"), 0;
+        int t = store_type(g_store, argv[1]);
+        if (t != 0 && t != 5)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_array_header(reply, (long long)(argc - 2));
+        for (int i = 2; i < argc; i++) {
+            char hash[12];
+            int rc = store_geohash(g_store, argv[1], argv[i], hash);
+            if (rc == -1)
+                /* Unreachable: the type check above already rejected
+                   non-sorted-set keys, and the loop is single-threaded. */
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == 0) {
+                dbuf_null(reply);
+                continue;
+            }
+            dbuf_bulk(reply, hash, strlen(hash));
+        }
         return 0;
     }
     if (strcasecmp(cmd, "HSET") == 0) {
@@ -3134,7 +3189,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "LMOVE",
             "SADD", "SREM", "SMEMBERS", "SSCAN", "SISMEMBER", "SCARD",
             "PFADD", "PFCOUNT", "PFMERGE",
-            "GEOADD", "GEODIST",
+            "GEOADD", "GEODIST", "GEOPOS", "GEOHASH",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",

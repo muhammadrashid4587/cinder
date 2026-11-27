@@ -1914,6 +1914,45 @@ def main():
         check("GEOADD ZSCORE Palermo", c.cmd("ZSCORE", "geo", "Palermo"), "3479099956230698")
         check("GEOADD ZSCORE Catania", c.cmd("ZSCORE", "geo", "Catania"), "3479447370796909")
         check("GEOADD ZCARD", c.cmd("ZCARD", "geo"), 2)
+        # GEOPOS answers the decoded cell centres, as in real Redis
+        # (longitude first, then latitude, each a bulk string).
+        check("GEOPOS Palermo Catania", c.cmd("GEOPOS", "geo", "Palermo", "Catania"),
+              [["13.361389338970184", "38.115556395496299"],
+               ["15.087267458438873", "37.502668423331613"]])
+        check("GEOPOS single", c.cmd("GEOPOS", "geo", "Palermo"),
+              [["13.361389338970184", "38.115556395496299"]])
+        check("GEOPOS missing member", c.cmd("GEOPOS", "geo", "Palermo", "Rome"),
+              [["13.361389338970184", "38.115556395496299"], None])
+        check("GEOPOS missing key", c.cmd("GEOPOS", "ghostgeo", "Palermo", "Catania"),
+              [None, None])
+        check("GEOPOS no members", c.cmd("GEOPOS", "geo"),
+              ("error", "ERR wrong number of arguments for 'geopos' command"))
+        check("GEOPOS list wrongtype", c.cmd("GEOPOS", "plist", "x"), wrongtype)
+        # GEOHASH answers the 11-character base32 geohash, as in
+        # real Redis — Palermo/Catania are Redis's own example
+        # values, and the last character is always '0' (52 bits
+        # cannot fill the 55 an 11-character string holds).
+        check("GEOHASH Palermo Catania", c.cmd("GEOHASH", "geo", "Palermo", "Catania"),
+              ["sqc8b49rny0", "sqdtr74hyu0"])
+        check("GEOHASH single", c.cmd("GEOHASH", "geo", "Palermo"), ["sqc8b49rny0"])
+        check("GEOHASH missing member", c.cmd("GEOHASH", "geo", "Palermo", "Rome"),
+              ["sqc8b49rny0", None])
+        check("GEOHASH missing key", c.cmd("GEOHASH", "ghostgeo", "Palermo"), [None])
+        check("GEOHASH no members", c.cmd("GEOHASH", "geo"),
+              ("error", "ERR wrong number of arguments for 'geohash' command"))
+        check("GEOHASH list wrongtype", c.cmd("GEOHASH", "plist", "x"), wrongtype)
+        # A member of a plain sorted set decodes whatever score it
+        # holds, as in Redis — but a score that is not a geohash
+        # (0, or negative) has no position.
+        check("GEOPOS plain zset setup", c.cmd("ZADD", "geoz", "3479099956230698", "Palermo", "0", "zero", "-5", "neg"), 3)
+        check("GEOPOS plain zset", c.cmd("GEOPOS", "geoz", "Palermo"),
+              [["13.361389338970184", "38.115556395496299"]])
+        check("GEOHASH plain zset", c.cmd("GEOHASH", "geoz", "Palermo"), ["sqc8b49rny0"])
+        check("GEOPOS zero score", c.cmd("GEOPOS", "geoz", "zero"), [None])
+        check("GEOHASH zero score", c.cmd("GEOHASH", "geoz", "zero"), [None])
+        check("GEOPOS negative score", c.cmd("GEOPOS", "geoz", "neg"), [None])
+        check("GEOHASH negative score", c.cmd("GEOHASH", "geoz", "neg"), [None])
+        check("GEOPOS plain zset cleanup", c.cmd("DEL", "geoz"), 1)
         # Re-adding a member at its current coordinates is a no-op
         # (0 added, no WATCH invalidation); moving it updates the
         # score and answers 0 too, since it was not newly added.
@@ -1958,6 +1997,8 @@ def main():
         check("wtestkey4 unchanged after geo abort", c.cmd("GET", "wtestkey4"), "v1")
         check("COMMAND lists GEOADD", "GEOADD" in c.cmd("COMMAND"), True)
         check("COMMAND lists GEODIST", "GEODIST" in c.cmd("COMMAND"), True)
+        check("COMMAND lists GEOPOS", "GEOPOS" in c.cmd("COMMAND"), True)
+        check("COMMAND lists GEOHASH", "GEOHASH" in c.cmd("COMMAND"), True)
         check("GEO cleanup", c.cmd("DEL", "geo", "geo2", "wtestkey4"), 2)
         # phll stays: the AOF restart below proves a HyperLogLog
         # survives a SHUTDOWN and reload — and phll is itself the
@@ -2700,7 +2741,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.57.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.58.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

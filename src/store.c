@@ -3736,15 +3736,21 @@ static uint64_t geo_deinterleave64(uint64_t interleaved) {
     return x | (y << 32);
 }
 
-/* The 52-bit geohash of a coordinate pair: each axis is scaled to
-   a 26-bit fixed-point value over its range (truncated, as in
-   Redis), then interleaved with latitude in the even positions. */
-static uint64_t geo_encode(double lon, double lat) {
-    double lat_offset = (lat - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN);
+/* The 52-bit geohash of a coordinate pair over a given latitude
+   range: each axis is scaled to a 26-bit fixed-point value over its
+   range (truncated, as in Redis), then interleaved with latitude in
+   the even positions. */
+static uint64_t geo_encode_range(double lon, double lat,
+                                 double lat_min, double lat_max) {
+    double lat_offset = (lat - lat_min) / (lat_max - lat_min);
     double lon_offset = (lon - GEO_LON_MIN) / (GEO_LON_MAX - GEO_LON_MIN);
     uint32_t ilat = (uint32_t)(lat_offset * (double)(1ULL << GEO_STEP));
     uint32_t ilon = (uint32_t)(lon_offset * (double)(1ULL << GEO_STEP));
     return geo_interleave64(ilat, ilon);
+}
+
+static uint64_t geo_encode(double lon, double lat) {
+    return geo_encode_range(lon, lat, GEO_LAT_MIN, GEO_LAT_MAX);
 }
 
 /* The centre of the geohash cell a hash names, as in Redis's
@@ -3768,6 +3774,18 @@ static uint64_t geo_score_to_hash(double score) {
     if (!(score >= 0.0)) return 0;
     if (score >= 4503599627370496.0) return 4503599627370495ULL;
     return (uint64_t)score;
+}
+
+/* Decode a sorted-set score as a geohash, as in Redis's
+   decodeGeohash: NaN, a negative score, a score of 2^64 or more,
+   and a score of exactly 0 (an all-zero hash) all fail to decode,
+   so a member holding such a score has no position. Returns 1 on
+   success, 0 when the score does not decode. */
+static int geo_decode_score(double score, double *lon_out, double *lat_out) {
+    if (!(score >= 0.0) || score >= 18446744073709551616.0 || score == 0.0)
+        return 0;
+    geo_decode((uint64_t)score, lon_out, lat_out);
+    return 1;
 }
 
 /* Haversine distance in metres, as in Redis's geohashGetDistance.
@@ -3810,5 +3828,40 @@ int store_geodist(Store *s, const char *key, const char *m1, const char *m2,
     geo_decode(geo_score_to_hash(s1), &lon1, &lat1);
     geo_decode(geo_score_to_hash(s2), &lon2, &lat2);
     *out = geo_distance_m(lon1, lat1, lon2, lat2);
+    return 1;
+}
+
+int store_geopos(Store *s, const char *key, const char *member,
+                 double *lon_out, double *lat_out) {
+    double score;
+    int rc = store_zscore(s, key, member, &score);
+    if (rc == -1) return -1;
+    if (rc == 0) return 0;
+    if (!geo_decode_score(score, lon_out, lat_out)) return 0;
+    return 1;
+}
+
+/* The 11-character base32 geohash string of a 52-bit hash, as in
+   Redis's GEOHASH: the first ten characters take five bits each
+   from the top of the hash, and the eleventh is always '0' — 52
+   bits cannot fill 55, so Redis assumes zero for the last five. */
+static void geo_hash_string(uint64_t hash, char out[12]) {
+    static const char *alphabet = "0123456789bcdefghjkmnpqrstuvwxyz";
+    for (int i = 0; i < 10; i++)
+        out[i] = alphabet[(hash >> (52 - (i + 1) * 5)) & 0x1f];
+    out[10] = '0';
+    out[11] = '\0';
+}
+
+int store_geohash(Store *s, const char *key, const char *member,
+                  char out[12]) {
+    /* The stored hash uses latitude [-85.05112878, 85.05112878],
+       while the standard geohash string uses [-90, 90], so the
+       score is decoded back to the centre of its geohash cell and
+       re-encoded over the standard ranges first, as in Redis. */
+    double lon, lat;
+    int rc = store_geopos(s, key, member, &lon, &lat);
+    if (rc != 1) return rc;
+    geo_hash_string(geo_encode_range(lon, lat, -90.0, 90.0), out);
     return 1;
 }

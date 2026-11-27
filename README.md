@@ -3,7 +3,7 @@
 A Redis-compatible in-memory key-value store, written in C from scratch.
 Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, lists,
 sets, hashes, sorted sets, HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`) and geo
-(`GEOADD`/`GEODIST`) with TTLs, approximate LRU eviction, and an append-only file for
+(`GEOADD`/`GEODIST`/`GEOPOS`/`GEOHASH`) with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
 flush thread that does the once-a-second AOF sync under `everysec`,
@@ -11,7 +11,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.57.0.
+Version 0.58.0.
 
 ## Why
 
@@ -95,6 +95,8 @@ OK
 | `PFMERGE destkey sourcekey [sourcekey ...]` | Merge the HyperLogLogs at `sourcekey` into `destkey` (registers merged by maximum), creating it when missing and overwriting it when it exists (its TTL is cleared); a missing source counts as empty, so merging only missing sources creates an empty HyperLogLog; sources are never modified, and the destination may itself be a source; a plain string or non-string key at either end is an error, as for `PFADD`; a merge that reproduces the destination exactly changes nothing, so it is not logged, not replicated, and does not invalidate a `WATCH` |
 | `GEOADD key longitude latitude member [longitude latitude member ...]` | Add members at coordinates, stored as a sorted set whose scores are 52-bit geohashes (longitude in [-180, 180], latitude in [-85.05112878, 85.05112878]); returns the number of newly added members (moving an existing member answers `0`); every coordinate is parsed and range-checked before any member is added, so a bad triple adds nothing; a re-add at the same coordinates is a no-op, so it is not logged, not replicated, and does not invalidate a `WATCH`; preserves the TTL |
 | `GEODIST key member1 member2 [m \| km \| ft \| mi]` | Haversine distance between two members in metres by default (or the named unit), as a bulk string with four decimals (`166274.1516` for Palermo/Catania, as in real Redis); the members' geohash scores are decoded back to the centres of their geohash cells, as in Redis; `nil` when the key or a member is missing; a member of a plain sorted set decodes whatever score it holds, as in Redis |
+| `GEOPOS key member [member ...]` | The position of each member as a `[longitude, latitude]` array, each coordinate a bulk string with `%.17g` precision (the centres of their geohash cells, as in Redis); a missing member — or one whose score does not decode as a geohash (NaN, negative, 2^64 or more, or exactly 0) — answers a null array, and a missing key answers one null array per member; a member of a plain sorted set decodes whatever score it holds, as in Redis |
+| `GEOHASH key member [member ...]` | The 11-character base32 geohash string of each member's position (`sqc8b49rny0` for Palermo, `sqdtr74hyu0` for Catania, as in real Redis); the score is decoded to the centre of its geohash cell and re-encoded over the standard ranges (longitude [-180, 180], latitude [-90, 90]), because the stored hash uses latitude [-85.05112878, 85.05112878] instead, and the last character is always `0` (52 bits cannot fill the 55 an 11-character string holds); `nil` for a missing member or one whose score does not decode, and a missing key answers one `nil` per member |
 | `HSET key field value [field value ...]` | Set fields; returns number of new fields (updates return `0` for that field) |
 | `MULTI`, `EXEC`, `DISCARD` | Transactions: `MULTI` queues commands (`+QUEUED` per command, nested `MULTI` is an error), `EXEC` runs the queue in order and returns one reply per command (an error inside the transaction takes its place in the array and the rest still run), `DISCARD` drops the queue; `EXEC`/`DISCARD` without `MULTI` are errors. Queued writes are invisible to other clients until `EXEC` runs, and the commands `EXEC` runs are AOF-logged and replicated individually, never `MULTI`/`EXEC` themselves |
 | `WATCH key [key ...]`, `UNWATCH` | Optimistic locking for `MULTI`/`EXEC`: `WATCH` records the version each key has right now (0 when it does not exist); if any watched key is created, modified, deleted, expired, or flushed away before `EXEC`, `EXEC` aborts with a nil array and the queue never runs. `UNWATCH` clears the watch set, as do `EXEC` and `DISCARD`; `WATCH` inside `MULTI` is an error, while `UNWATCH` inside `MULTI` queues and runs at `EXEC`, as in real Redis. A write that changes nothing (SADD of a member already present, HSET of an identical value) does not invalidate a watch. Limitation: a watched key that did not exist, was created and deleted again before `EXEC`, reads as version 0 again, so the abort is not detected — the version scheme cannot see a create-plus-delete round trip |
@@ -424,7 +426,18 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # `GEOADD`, a no-op `GEOADD` not invalidating a `WATCH`
             # while a move does, `COMMAND` listing both, and the
             # geo set that survives the AOF restart answering the
-            # exact distance again), and
+            # exact distance again), and `GEOPOS` / `GEOHASH` checks
+            # (`GEOPOS` answering the decoded cell centres as
+            # `[longitude, latitude]` bulk-string pairs, a null
+            # array for a missing member and one null array per
+            # member for a missing key; `GEOHASH` answering
+            # `sqc8b49rny0` / `sqdtr74hyu0` for Palermo/Catania,
+            # as in real Redis, with the last character always
+            # `0`, and `nil` for a missing member or key; both
+            # decoding whatever score a member of a plain sorted
+            # set holds, while a member with a `0` or negative
+            # score answers `nil`; wrong-type and wrong-argument
+            # errors, and `COMMAND` listing both), and
             # an AOF
             # restart test (data, a list, a set, a hash, a sorted set,
             # a HyperLogLog and a geo set survive a SHUTDOWN and reload),
@@ -1239,7 +1252,27 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       answering a bulk string with four decimals in metres by
       default or `km` / `ft` / `mi` — Palermo/Catania answers
       166274.1516 m, exactly as real Redis does — and `nil` for a
-      missing key or member. Limitation: no `GEOPOS` / `GEOHASH` /
-      `GEORADIUS` / `GEOSEARCH` yet, and `GEOADD` takes no `NX` /
-      `XX` / `CH` options (those come with the next slice, as
-      `ZADD`'s options did after its first slice).
+      missing key or member. Limitation: no `GEORADIUS` /
+      `GEOSEARCH` yet, and `GEOADD` takes no `NX` / `XX` / `CH`
+      options (those come with a later slice, as `ZADD`'s options
+      did after its first slice).
+
+- [x] Geo, second slice (0.58.0): `GEOPOS` / `GEOHASH`, as in real
+      Redis. `GEOPOS` decodes each member's geohash score back to
+      the centre of its geohash cell and answers a `[longitude,
+      latitude]` array of bulk strings (`%.17g`, the same digits
+      Redis's `%.17Lg` prints); a missing member — or one whose
+      score does not decode as a geohash (NaN, negative, 2^64 or
+      more, or exactly 0) — answers a null array, and a missing
+      key answers one null array per member. `GEOHASH` decodes the
+      score to the cell centre and re-encodes it over the standard
+      ranges (longitude [-180, 180], latitude [-90, 90]), because
+      the stored hash uses latitude [-85.05112878, 85.05112878]
+      instead — Palermo answers `sqc8b49rny0` and Catania
+      `sqdtr74hyu0`, exactly as real Redis does — and the eleventh
+      character is always `0`, since 52 bits cannot fill the 55 an
+      11-character string holds. Both are read-only (nothing
+      logged, nothing replicated), both decode whatever score a
+      member of a plain sorted set holds, and both are listed by
+      `COMMAND`. Limitation: no `GEORADIUS` / `GEOSEARCH` yet,
+      and `GEOADD` takes no `NX` / `XX` / `CH` options.

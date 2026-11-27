@@ -658,5 +658,25 @@ long long store_geoadd(Store *s, const char *key, double lon, double lat,
    it holds, as in Redis. */
 int store_geodist(Store *s, const char *key, const char *m1, const char *m2,
                   double *out);
+/* The position of one member, decoded from its geohash score (the
+   centre of its geohash cell, as in Redis). Returns 1 when the
+   member is present (lon_out and lat_out set), 0 when the key or the
+   member is missing or the member's score does not decode as a
+   geohash (NaN, negative, 2^64 or more, or exactly 0), -1 = wrong
+   type. A member of a plain sorted set decodes whatever score it
+   holds, as in Redis. */
+int store_geopos(Store *s, const char *key, const char *member,
+                 double *lon_out, double *lat_out);
+/* The 11-character base32 geohash string of one member's position,
+   as in Redis: the score is decoded to the centre of its geohash
+   cell and re-encoded over the standard ranges (longitude
+   [-180, 180], latitude [-90, 90]), because the stored hash uses
+   latitude [-85.05112878, 85.05112878] instead; the last character
+   is always '0', since 52 bits cannot fill the 55 an 11-character
+   string holds. Returns 1 when the member is present (out holds
+   the NUL-terminated string), 0 when the key or the member is
+   missing or the member's score does not decode, -1 = wrong type. */
+int store_geohash(Store *s, const char *key, const char *member,
+                  char out[12]);
 
 #endif
