@@ -2081,6 +2081,34 @@ def main():
         check("COMMAND lists GEOSEARCH", "GEOSEARCH" in c.cmd("COMMAND"), True)
         check("COMMAND lists GEORADIUS", "GEORADIUS" in c.cmd("COMMAND"), True)
         check("COMMAND lists GEORADIUSBYMEMBER", "GEORADIUSBYMEMBER" in c.cmd("COMMAND"), True)
+        # GEORADIUS_RO / GEORADIUSBYMEMBER_RO are the same search
+        # but read-only: WITH* / COUNT / ASC / DESC all work, while
+        # STORE and STOREDIST are refused and write nothing.
+        check("GEORADIUS_RO", c.cmd("GEORADIUS_RO", "geos", "15", "37", "200", "km", "ASC"), ["Catania", "Palermo"])
+        check("GEORADIUS_RO DESC", c.cmd("GEORADIUS_RO", "geos", "15", "37", "200", "km", "DESC"), ["Palermo", "Catania"])
+        check("GEORADIUS_RO withdist", c.cmd("GEORADIUS_RO", "geos", "15", "37", "200", "km", "ASC", "WITHDIST"), [["Catania", "56.4413"], ["Palermo", "190.4424"]])
+        check("GEORADIUS_RO withdist withhash withcoord", c.cmd("GEORADIUS_RO", "geos", "15", "37", "200", "km", "ASC", "WITHDIST", "WITHHASH", "WITHCOORD"),
+              [["Catania", "56.4413", 3479447370796909, ["15.087267458438873", "37.502668423331613"]],
+               ["Palermo", "190.4424", 3479099956230698, ["13.361389338970184", "38.115556395496299"]]])
+        check("GEORADIUS_RO COUNT 1", c.cmd("GEORADIUS_RO", "geos", "15", "37", "200", "km", "ASC", "COUNT", "1"), ["Catania"])
+        check("GEORADIUS_RO COUNT 1 ANY", c.cmd("GEORADIUS_RO", "geos", "15", "37", "200", "km", "COUNT", "1", "ANY"), ["Palermo"])
+        check("GEORADIUS_RO missing key", c.cmd("GEORADIUS_RO", "ghostgeo", "15", "37", "200", "km"), [])
+        check("GEORADIUS_RO list wrongtype", c.cmd("GEORADIUS_RO", "plist", "15", "37", "200", "km"), wrongtype)
+        check("GEORADIUS_RO STORE refused", c.cmd("GEORADIUS_RO", "geos", "15", "37", "200", "km", "STORE", "rodest"),
+              ("error", "ERR STORE and STOREDIST are not compatible with the read-only variant"))
+        check("GEORADIUS_RO STORE wrote nothing", c.cmd("EXISTS", "rodest"), 0)
+        check("GEORADIUS_RO STOREDIST refused", c.cmd("GEORADIUS_RO", "geos", "15", "37", "200", "km", "STOREDIST", "rodist"),
+              ("error", "ERR STORE and STOREDIST are not compatible with the read-only variant"))
+        check("GEORADIUS_RO STOREDIST wrote nothing", c.cmd("EXISTS", "rodist"), 0)
+        check("GEORADIUSBYMEMBER_RO", c.cmd("GEORADIUSBYMEMBER_RO", "geos", "Palermo", "200", "km", "ASC"), ["Palermo", "Catania"])
+        check("GEORADIUSBYMEMBER_RO withdist", c.cmd("GEORADIUSBYMEMBER_RO", "geos", "Palermo", "200", "km", "ASC", "WITHDIST"), [["Palermo", "0.0000"], ["Catania", "166.2742"]])
+        check("GEORADIUSBYMEMBER_RO missing", c.cmd("GEORADIUSBYMEMBER_RO", "geos", "Ghost", "200", "km"),
+              ("error", "ERR could not decode requested zset member"))
+        check("GEORADIUSBYMEMBER_RO STORE refused", c.cmd("GEORADIUSBYMEMBER_RO", "geos", "Palermo", "200", "km", "STORE", "rodest"),
+              ("error", "ERR STORE and STOREDIST are not compatible with the read-only variant"))
+        check("GEORADIUSBYMEMBER_RO STORE wrote nothing", c.cmd("EXISTS", "rodest"), 0)
+        check("COMMAND lists GEORADIUS_RO", "GEORADIUS_RO" in c.cmd("COMMAND"), True)
+        check("COMMAND lists GEORADIUSBYMEMBER_RO", "GEORADIUSBYMEMBER_RO" in c.cmd("COMMAND"), True)
         check("GEOSEARCH cleanup", c.cmd("DEL", "geos", "geodest", "geodist", "gsdest", "gsdist", "gsself"), 6)
         check("GEO cleanup", c.cmd("DEL", "geo", "geo2", "wtestkey4"), 2)
         # phll stays: the AOF restart below proves a HyperLogLog
@@ -2824,7 +2852,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.60.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.61.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

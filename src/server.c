@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.60.0"
+#define CINDER_VERSION "0.61.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1400,10 +1400,15 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
      * storing the distances rather than the geohash scores, and
      * no WITH* options; GEORADIUS and GEORADIUSBYMEMBER take the
      * centre positionally and may also STORE / STOREDIST the
-     * result, as in Redis. Results are nearest-first by default —
-     * Redis leaves the order unspecified without ASC / DESC — and
-     * COUNT without ANY sorts first, while COUNT ... ANY takes
-     * the first N hits in (score, member) order without sorting. */
+     * result, as in Redis. GEORADIUS_RO and
+     * GEORADIUSBYMEMBER_RO are the same searches but read-only:
+     * they refuse STORE / STOREDIST, so they never write, never
+     * log to the AOF, and never replicate — the reason Redis
+     * added them is that the plain forms count as write commands.
+     * Results are nearest-first by default — Redis leaves the
+     * order unspecified without ASC / DESC — and COUNT without
+     * ANY sorts first, while COUNT ... ANY takes the first N hits
+     * in (score, member) order without sorting. */
     /* Options shared by the three search commands: the centre, the
        shape, the sort and limit, the WITH* flags, and (GEORADIUS
        only) where to store the result. */
@@ -1658,12 +1663,25 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(hits);
         return 0;
     }
-    if (strcasecmp(cmd, "GEORADIUS") == 0 || strcasecmp(cmd, "GEORADIUSBYMEMBER") == 0) {
-        int by_member = strcasecmp(cmd, "GEORADIUSBYMEMBER") == 0;
+    if (strcasecmp(cmd, "GEORADIUS") == 0 || strcasecmp(cmd, "GEORADIUSBYMEMBER") == 0 ||
+        strcasecmp(cmd, "GEORADIUS_RO") == 0 || strcasecmp(cmd, "GEORADIUSBYMEMBER_RO") == 0) {
+        int by_member = strcasecmp(cmd, "GEORADIUSBYMEMBER") == 0 ||
+                        strcasecmp(cmd, "GEORADIUSBYMEMBER_RO") == 0;
+        /* The _RO variants are the same search but read-only: they
+           refuse STORE / STOREDIST, as in Redis. */
+        int read_only = strcasecmp(cmd, "GEORADIUS_RO") == 0 ||
+                        strcasecmp(cmd, "GEORADIUSBYMEMBER_RO") == 0;
         /* GEORADIUS needs key lon lat radius unit (6); the member
            form needs key member radius unit (5). */
-        if (argc < (by_member ? 5 : 6))
-            return dbuf_error(reply, "wrong number of arguments for 'georadius' command"), 0;
+        if (argc < (by_member ? 5 : 6)) {
+            char msg[64];
+            snprintf(msg, sizeof(msg),
+                     "wrong number of arguments for '%s' command",
+                     read_only
+                         ? (by_member ? "georadiusbymember_ro" : "georadius_ro")
+                         : (by_member ? "georadiusbymember" : "georadius"));
+            return dbuf_error(reply, msg), 0;
+        }
         struct geo_search_opts o;
         memset(&o, 0, sizeof(o));
         o.count = -1;
@@ -1758,12 +1776,19 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
                 o.sort_desc = 1;
                 i += 1;
             } else if (strcasecmp(argv[i], "STORE") == 0) {
+                /* The _RO variants refuse STORE / STOREDIST, as in
+                   Redis: they are read-only, so there is no
+                   destination to write to. */
+                if (read_only)
+                    return dbuf_error(reply, "STORE and STOREDIST are not compatible with the read-only variant"), 0;
                 if (o.store_key || i + 1 >= argc)
                     return dbuf_error(reply, "syntax error"), 0;
                 o.store_key = argv[i + 1];
                 o.store_dist = 0;
                 i += 2;
             } else if (strcasecmp(argv[i], "STOREDIST") == 0) {
+                if (read_only)
+                    return dbuf_error(reply, "STORE and STOREDIST are not compatible with the read-only variant"), 0;
                 if (o.store_key || i + 1 >= argc)
                     return dbuf_error(reply, "syntax error"), 0;
                 o.store_key = argv[i + 1];
@@ -3668,6 +3693,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "PFADD", "PFCOUNT", "PFMERGE",
             "GEOADD", "GEODIST", "GEOPOS", "GEOHASH",
             "GEOSEARCH", "GEOSEARCHSTORE", "GEORADIUS", "GEORADIUSBYMEMBER",
+            "GEORADIUS_RO", "GEORADIUSBYMEMBER_RO",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",
