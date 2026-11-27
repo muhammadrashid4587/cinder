@@ -5,7 +5,7 @@ Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, 
 sets, hashes, sorted sets, HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`), geo
 (`GEOADD`/`GEODIST`/`GEOPOS`/`GEOHASH`/`GEOSEARCH`/`GEOSEARCHSTORE`/`GEORADIUS`/
 `GEORADIUSBYMEMBER`/`GEORADIUS_RO`/`GEORADIUSBYMEMBER_RO`) and streams
-(`XADD` only, for now) with TTLs, approximate LRU eviction, and an append-only file for
+(`XADD` / `XRANGE` / `XLEN`) with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
 flush thread that does the once-a-second AOF sync under `everysec`,
@@ -13,7 +13,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.64.0.
+Version 0.65.0.
 
 ## Why
 
@@ -122,7 +122,9 @@ OK
 | `HEXPIREAT key seconds [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]`, `HPEXPIREAT key ms [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]` | The same per-field expiry, as an absolute Unix time (seconds / milliseconds); an absolute time already past deletes the field at once and answers `2` per field, with the same per-field replies and conditions as `HEXPIRE` |
 | `HTTL key FIELDS numfields field [field ...]`, `HPTTL key FIELDS numfields field [field ...]` | Remaining TTL of one or more hash fields, in seconds / milliseconds; one integer reply per field: `-1` the field has no expiry, `-2` the key or the field does not exist |
 | `HPERSIST key FIELDS numfields field [field ...]` | Remove the expiry from one or more hash fields; one integer reply per field: `1` an expiry was removed, `-1` the field had none, `-2` the key or the field does not exist |
-| `XADD key [MAXLEN [~] threshold] id field value [field value ...]` | Append one entry to a stream, creating it when missing; the ID is `*` (auto: the current ms, sequence 0, or one past the top ID when the ms is not ahead of it), `ms-seq` (explicit), or `ms-*` / `ms-` (partial: the ms given, the sequence auto-filled); answers the new ID as a bulk string. An ID equal to or smaller than the top ID is an error, as is `0-0` and a malformed ID; `MAXLEN` trims the oldest entries until at most `threshold` remain (`~` trims exactly the same way), and trimming the last entry deletes the key. Preserves the TTL, invalidates a `WATCH`, and is AOF-logged with the resolved ID (so a replay reproduces the exact entries) and replicated; a replica re-resolves `*` itself, so the entry order and contents match there but the ms part of an auto ID can differ. There is no read command yet (`XREAD` / `XRANGE` / `XLEN` are next), so the top ID is only observable through the errors a smaller ID produces |
+| `XADD key [MAXLEN [~] threshold] id field value [field value ...]` | Append one entry to a stream, creating it when missing; the ID is `*` (auto: the current ms, sequence 0, or one past the top ID when the ms is not ahead of it), `ms-seq` (explicit), or `ms-*` / `ms-` (partial: the ms given, the sequence auto-filled); answers the new ID as a bulk string. An ID equal to or smaller than the top ID is an error, as is `0-0` and a malformed ID; `MAXLEN` trims the oldest entries until at most `threshold` remain (`~` trims exactly the same way), and trimming the last entry deletes the key. Preserves the TTL, invalidates a `WATCH`, and is AOF-logged with the resolved ID (so a replay reproduces the exact entries) and replicated; a replica re-resolves `*` itself, so the entry order and contents match there but the ms part of an auto ID can differ. The entries are read back with `XRANGE` / `XLEN` below; `XREAD` is next |
+| `XRANGE key start end [COUNT count]` | The entries whose IDs fall in `[start, end]` inclusive, in ID order, each as `[id, [field, value, ...]]`; bounds are `-` (the minimum ID), `+` (the maximum ID), `ms` (the whole millisecond: `ms-0` as a start bound, `ms-MAX` as an end bound) or `ms-seq`; `COUNT` limits the entries returned (`0` returns none, a negative count is an error). An empty array when the key is missing or the range is empty, including a start above the end. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
+| `XLEN key` | Number of entries in a stream (`0` when missing); read-only |
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZMSCORE key member [member ...]` | Scores of several members at once, in order (`nil` for a missing member, an array of `nil`s when the key is missing) |
@@ -673,7 +675,12 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # a `WATCH`, `COMMAND` listing it, and an AOF restart,
             # an RDB snapshot and a replication full sync each
             # carrying a stream's entries and top ID, plus a live
-            # streamed `XADD` landing on the replica)
+            # streamed `XADD` landing on the replica), and `XRANGE` /
+            # `XLEN` checks (the full range, a sub-range, bare-ms
+            # start and end bounds, an empty and a reversed range,
+            # `COUNT` and `COUNT 0`, a missing key reading as empty,
+            # wrong-type, bad-bound, bad-count and bad-option errors,
+            # and `COMMAND` listing both)
 ```
 
 ## Roadmap
@@ -1485,5 +1492,11 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       per entry, with live `XADD`s streamed after the sync. A
       replica re-resolves `*` from the raw bytes it receives, so
       the entry order and contents match but the ms part of an auto
-      ID can differ there. There is no read command yet: `XREAD` /
-      `XRANGE` / `XLEN` are next.
+      ID can differ there.
+- [x] Stream reads, `XRANGE` / `XLEN` (0.65.0): `XRANGE key start end
+      [COUNT count]` returns the entries in `[start, end]` as
+      `[id, [field, value, ...]]` pairs, with `-` / `+` / `ms` /
+      `ms-seq` bounds (a bare ms covers the whole millisecond) and an
+      optional `COUNT`; `XLEN key` counts the entries. Both are
+      read-only, so no AOF, RDB, or replication change was needed,
+      and they are safe on a replica. `XREAD` is next.

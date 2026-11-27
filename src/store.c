@@ -4346,3 +4346,136 @@ int stream_foreach(const Stream *st, stream_foreach_fn fn, void *arg) {
     }
     return 0;
 }
+
+long long store_xlen(Store *s, const char *key) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_STREAM) return -1;
+    e->last_access = ++s->clock;
+    return (long long)e->stream->len;
+}
+
+int stream_parse_bound(const char *s, int is_end, uint64_t *ms_out,
+                       uint64_t *seq_out) {
+    if (strcmp(s, "-") == 0) {
+        *ms_out = 0;
+        *seq_out = 0;
+        return 0;
+    }
+    if (strcmp(s, "+") == 0) {
+        *ms_out = UINT64_MAX;
+        *seq_out = UINT64_MAX;
+        return 0;
+    }
+    const char *dash = strchr(s, '-');
+    if (!dash) {
+        /* A bare ms: the whole millisecond. A start bound takes the
+           first sequence in it, an end bound the last. */
+        uint64_t ms;
+        if (!stream_parse_u64(s, strlen(s), &ms)) return -1;
+        *ms_out = ms;
+        *seq_out = is_end ? UINT64_MAX : 0;
+        return 0;
+    }
+    uint64_t ms, seq;
+    if (!stream_parse_u64(s, (size_t)(dash - s), &ms)) return -1;
+    if (!stream_parse_u64(dash + 1, strlen(dash + 1), &seq)) return -1;
+    *ms_out = ms;
+    *seq_out = seq;
+    return 0;
+}
+
+/* One stream entry being collected for an XRANGE reply: a copy of
+   the entry, so the reply can be built after the scan. */
+struct xrange_collect_arg {
+    uint64_t start_ms, start_seq, end_ms, end_seq;
+    long long count; /* < 0 means no limit */
+    StreamEntry *entries;
+    size_t n, cap;
+    int oom;
+};
+
+static int xrange_collect_cb(uint64_t ms, uint64_t seq, char *const *fields,
+                             char *const *values, size_t nfields,
+                             void *arg) {
+    struct xrange_collect_arg *a = arg;
+    if (ms < a->start_ms ||
+        (ms == a->start_ms && seq < a->start_seq))
+        return 0; /* before the range: skip */
+    if (ms > a->end_ms || (ms == a->end_ms && seq > a->end_seq))
+        return 1; /* past the range: entries are in ID order, stop */
+    if (a->count >= 0 && (long long)a->n >= a->count) return 1;
+    if (a->n == a->cap) {
+        size_t ncap = a->cap ? a->cap * 2 : 8;
+        StreamEntry *nen = realloc(a->entries, ncap * sizeof(*nen));
+        if (!nen) {
+            a->oom = 1;
+            return -1;
+        }
+        a->entries = nen;
+        a->cap = ncap;
+    }
+    StreamEntry *en = &a->entries[a->n];
+    memset(en, 0, sizeof(*en));
+    en->ms = ms;
+    en->seq = seq;
+    en->cap = nfields > 0 ? nfields : 1;
+    en->fields = malloc(en->cap * sizeof(char *));
+    en->values = malloc(en->cap * sizeof(char *));
+    if (!en->fields || !en->values) {
+        free(en->fields);
+        free(en->values);
+        a->oom = 1;
+        return -1;
+    }
+    for (size_t i = 0; i < nfields; i++) {
+        en->fields[i] = strdup(fields[i]);
+        en->values[i] = strdup(values[i]);
+        if (!en->fields[i] || !en->values[i]) {
+            for (size_t j = 0; j <= i; j++) {
+                free(en->fields[j]);
+                free(en->values[j]);
+            }
+            free(en->fields);
+            free(en->values);
+            a->oom = 1;
+            return -1;
+        }
+        en->nfields++;
+    }
+    a->n++;
+    return 0;
+}
+
+int store_xrange(Store *s, const char *key, uint64_t start_ms,
+                 uint64_t start_seq, uint64_t end_ms, uint64_t end_seq,
+                 long long count, StreamEntry **entries_out,
+                 size_t *n_out) {
+    *entries_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_STREAM) return -1;
+    e->last_access = ++s->clock;
+    struct xrange_collect_arg arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.start_ms = start_ms;
+    arg.start_seq = start_seq;
+    arg.end_ms = end_ms;
+    arg.end_seq = end_seq;
+    arg.count = count;
+    int rc = stream_foreach(e->stream, xrange_collect_cb, &arg);
+    if (arg.oom || rc == -1) {
+        stream_entries_free(arg.entries, arg.n);
+        return -2;
+    }
+    *entries_out = arg.entries;
+    *n_out = arg.n;
+    return 0;
+}
+
+void stream_entries_free(StreamEntry *entries, size_t n) {
+    if (!entries) return;
+    for (size_t i = 0; i < n; i++) stream_entry_free(&entries[i]);
+    free(entries);
+}

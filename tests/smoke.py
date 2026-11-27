@@ -1179,6 +1179,42 @@ def main():
         cx.close()
         check("COMMAND lists XADD", "XADD" in c.cmd("COMMAND"), True)
         check("XADD cleanup", c.cmd("DEL", "xstream", "xstream2", "xlen", "xlen0", "xttl", "xwatchkey"), 4)
+        # XRANGE / XLEN: read a stream back, by ID range, by bare-ms
+        # bound, and with COUNT; wrong-type, bad-bound and bad-option
+        # errors. A missing key reads as empty.
+        check("XRANGE setup 1", c.cmd("XADD", "xrstream", "1000-1", "a", "1", "b", "2"), "1000-1")
+        check("XRANGE setup 2", c.cmd("XADD", "xrstream", "1000-2", "a", "3"), "1000-2")
+        check("XRANGE setup 3", c.cmd("XADD", "xrstream", "2000-0", "a", "4"), "2000-0")
+        check("XLEN", c.cmd("XLEN", "xrstream"), 3)
+        check("XLEN missing", c.cmd("XLEN", "nope"), 0)
+        check("XLEN wrongtype", c.cmd("XLEN", "after"), wrongtype)
+        check("XRANGE all", c.cmd("XRANGE", "xrstream", "-", "+"),
+              [["1000-1", ["a", "1", "b", "2"]], ["1000-2", ["a", "3"]],
+               ["2000-0", ["a", "4"]]])
+        check("XRANGE range", c.cmd("XRANGE", "xrstream", "1000-2", "2000-0"),
+              [["1000-2", ["a", "3"]], ["2000-0", ["a", "4"]]])
+        check("XRANGE bare ms start", c.cmd("XRANGE", "xrstream", "1000", "1000"),
+              [["1000-1", ["a", "1", "b", "2"]], ["1000-2", ["a", "3"]]])
+        check("XRANGE bare ms end", c.cmd("XRANGE", "xrstream", "-", "1000"),
+              [["1000-1", ["a", "1", "b", "2"]], ["1000-2", ["a", "3"]]])
+        check("XRANGE empty range", c.cmd("XRANGE", "xrstream", "3000", "+"), [])
+        check("XRANGE reversed", c.cmd("XRANGE", "xrstream", "+", "-"), [])
+        check("XRANGE count", c.cmd("XRANGE", "xrstream", "-", "+", "COUNT", "2"),
+              [["1000-1", ["a", "1", "b", "2"]], ["1000-2", ["a", "3"]]])
+        check("XRANGE count 0", c.cmd("XRANGE", "xrstream", "-", "+", "COUNT", "0"), [])
+        check("XRANGE missing key", c.cmd("XRANGE", "nope", "-", "+"), [])
+        check("XRANGE wrongtype", c.cmd("XRANGE", "after", "-", "+"), wrongtype)
+        check("XRANGE bad bound", c.cmd("XRANGE", "xrstream", "abc", "+"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XRANGE bad count", c.cmd("XRANGE", "xrstream", "-", "+", "COUNT", "-1"),
+              ("error", "ERR COUNT must be a positive integer"))
+        check("XRANGE bad option", c.cmd("XRANGE", "xrstream", "-", "+", "FOO", "1"),
+              ("error", "ERR syntax error"))
+        check("XRANGE no args", c.cmd("XRANGE", "xrstream"),
+              ("error", "ERR wrong number of arguments for 'xrange' command"))
+        check("COMMAND lists XRANGE XLEN",
+              "XRANGE" in c.cmd("COMMAND") and "XLEN" in c.cmd("COMMAND"), True)
+        check("XRANGE cleanup", c.cmd("DEL", "xrstream"), 1)
         # Sorted sets: add/update, scores, wrong type, TTL, AOF
         # persistence. Members are ordered by (score, member); range
         # commands are not implemented yet.

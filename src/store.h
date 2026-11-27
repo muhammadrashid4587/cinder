@@ -776,7 +776,7 @@ int store_geosearch(Store *s, const char *key, double clon, double clat,
                     double height_m, int sort_desc, long long count,
                     int count_any, GeoSearchHit **hits_out, size_t *n_out);
 
-/* Streams (XADD only for now): a stream is an append-only log of
+/* Streams: a stream is an append-only log of
    entries, each with an ID "ms-seq" (milliseconds since epoch, then
    a sequence number within that millisecond) and field/value pairs.
    The ID argument is "*" (auto: the current ms, sequence 0, or one
@@ -795,6 +795,27 @@ int store_geosearch(Store *s, const char *key, double clon, double clat,
 int store_xadd(Store *s, const char *key, const char *id,
                char *const *pairs, int nfields, long long maxlen,
                char *id_out);
+/* XLEN: the number of entries in a stream (0 when the key is
+   missing), -1 = the key holds a non-stream value. A read, so it
+   changes nothing and bumps only the key's last-access clock. */
+long long store_xlen(Store *s, const char *key);
+/* Parse an XRANGE bound: "-" (the minimum ID, 0-0), "+" (the
+   maximum ID), "ms" (ms-0 for a start bound, ms-MAX for an end
+   bound, so a bare ms covers every sequence in that millisecond)
+   or "ms-seq". Returns 0 on success, -1 = not a valid bound. */
+int stream_parse_bound(const char *s, int is_end, uint64_t *ms_out,
+                       uint64_t *seq_out);
+/* XRANGE: the entries whose IDs fall in [start, end] inclusive, in
+   ID order, at most count of them (count < 0 means no limit). The
+   returned entries are copies owned by the caller; free them with
+   stream_entries_free. Returns 0 on success (a missing key answers
+   no entries), -1 = the key holds a non-stream value,
+   -2 = out of memory. */
+int store_xrange(Store *s, const char *key, uint64_t start_ms,
+                 uint64_t start_seq, uint64_t end_ms, uint64_t end_seq,
+                 long long count, StreamEntry **entries_out,
+                 size_t *n_out);
+void stream_entries_free(StreamEntry *entries, size_t n);
 /* Visit every entry of a stream in ID order. Returns 0 on success,
    -1 = wrong type (or no such key, which the caller can treat the
    same way: no entries are visited). The callback receives each
