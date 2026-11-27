@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 PORT = 7777
@@ -1215,6 +1216,117 @@ def main():
         check("COMMAND lists XRANGE XLEN",
               "XRANGE" in c.cmd("COMMAND") and "XLEN" in c.cmd("COMMAND"), True)
         check("XRANGE cleanup", c.cmd("DEL", "xrstream"), 1)
+        # XREAD: multi-stream reads, exclusive IDs, "$" resolved once
+        # per call, per-stream COUNT, wrong-type and argument errors,
+        # and BLOCK: a timeout answers nil, an XADD from another
+        # client wakes a blocked reader (BLOCK 0 too), and BLOCK is
+        # refused inside MULTI while a plain XREAD queues and runs
+        # at EXEC.
+        check("XREAD setup 1", c.cmd("XADD", "xr1", "1000-1", "a", "1", "b", "2"), "1000-1")
+        check("XREAD setup 2", c.cmd("XADD", "xr1", "1000-2", "a", "3"), "1000-2")
+        check("XREAD setup 3", c.cmd("XADD", "xr1", "2000-0", "a", "4"), "2000-0")
+        check("XREAD setup 4", c.cmd("XADD", "xr2", "3000-0", "x", "9"), "3000-0")
+        check("XREAD multi", c.cmd("XREAD", "STREAMS", "xr1", "xr2", "0", "0"),
+              [["xr1", [["1000-1", ["a", "1", "b", "2"]], ["1000-2", ["a", "3"]],
+                        ["2000-0", ["a", "4"]]]],
+               ["xr2", [["3000-0", ["x", "9"]]]]])
+        check("XREAD after id", c.cmd("XREAD", "STREAMS", "xr1", "1000-1"),
+              [["xr1", [["1000-2", ["a", "3"]], ["2000-0", ["a", "4"]]]]])
+        check("XREAD bare ms", c.cmd("XREAD", "STREAMS", "xr1", "1000"),
+              [["xr1", [["1000-1", ["a", "1", "b", "2"]], ["1000-2", ["a", "3"]],
+                        ["2000-0", ["a", "4"]]]]])
+        check("XREAD dollar empty", c.cmd("XREAD", "STREAMS", "xr1", "$"), [])
+        check("XREAD dollar then add", c.cmd("XADD", "xr1", "2000-1", "a", "5"), "2000-1")
+        check("XREAD dollar sees new", c.cmd("XREAD", "STREAMS", "xr1", "$"), [])
+        check("XREAD from before dollar", c.cmd("XREAD", "STREAMS", "xr1", "2000-0"),
+              [["xr1", [["2000-1", ["a", "5"]]]]])
+        check("XREAD count per stream",
+              c.cmd("XREAD", "COUNT", "1", "STREAMS", "xr1", "xr2", "0", "0"),
+              [["xr1", [["1000-1", ["a", "1", "b", "2"]]]],
+               ["xr2", [["3000-0", ["x", "9"]]]]])
+        check("XREAD missing key", c.cmd("XREAD", "STREAMS", "nope", "0"), [])
+        check("XREAD skips empty stream",
+              c.cmd("XREAD", "STREAMS", "xr1", "nope", "1000-1", "0"),
+              [["xr1", [["1000-2", ["a", "3"]], ["2000-0", ["a", "4"]],
+                        ["2000-1", ["a", "5"]]]]])
+        check("XREAD wrongtype", c.cmd("XREAD", "STREAMS", "after", "0"), wrongtype)
+        check("XREAD unbalanced", c.cmd("XREAD", "STREAMS", "xr1", "xr2", "0"),
+              ("error", "ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified."))
+        check("XREAD gt", c.cmd("XREAD", "STREAMS", "xr1", ">"),
+              ("error", "ERR The > ID can be specified only when calling XREADGROUP"))
+        check("XREAD bad id", c.cmd("XREAD", "STREAMS", "xr1", "abc"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XREAD bad count", c.cmd("XREAD", "COUNT", "0", "STREAMS", "xr1", "0"),
+              ("error", "ERR COUNT must be a positive integer"))
+        check("XREAD bad block", c.cmd("XREAD", "BLOCK", "-5", "STREAMS", "xr1", "0"),
+              ("error", "ERR BLOCK must be a non-negative integer"))
+        check("XREAD dup count", c.cmd("XREAD", "COUNT", "1", "COUNT", "2", "STREAMS", "xr1", "0"),
+              ("error", "ERR syntax error"))
+        check("XREAD bad option", c.cmd("XREAD", "FOO", "1", "STREAMS", "xr1", "0"),
+              ("error", "ERR syntax error"))
+        check("XREAD no streams", c.cmd("XREAD", "xr1", "0"),
+              ("error", "ERR syntax error"))
+        check("XREAD no args", c.cmd("XREAD"),
+              ("error", "ERR wrong number of arguments for 'xread' command"))
+        # BLOCK with data already there answers at once, without waiting.
+        check("XREAD block data ready",
+              c.cmd("XREAD", "BLOCK", "5000", "STREAMS", "xr1", "0"),
+              [["xr1", [["1000-1", ["a", "1", "b", "2"]], ["1000-2", ["a", "3"]],
+                        ["2000-0", ["a", "4"]], ["2000-1", ["a", "5"]]]]])
+        # BLOCK with nothing new times out with a nil array.
+        t0 = time.time()
+        check("XREAD block timeout",
+              c.cmd("XREAD", "BLOCK", "300", "STREAMS", "xr1", "9999999-0"), None)
+        check("XREAD block timeout took ~300ms", 0.25 <= time.time() - t0 < 5, True)
+        # BLOCK wakes when another client adds an entry after the "$"
+        # was resolved; the woken client keeps working afterwards.
+        cb = Client(PORT)
+        wake = {}
+        def blocked_read():
+            wake["r"] = cb.cmd("XREAD", "BLOCK", "5000", "STREAMS", "xr1", "$")
+        bt = threading.Thread(target=blocked_read)
+        bt.start()
+        time.sleep(0.3)
+        check("XREAD block wake add", c.cmd("XADD", "xr1", "2000-2", "a", "6"), "2000-2")
+        bt.join(timeout=6)
+        check("XREAD block woken", bt.is_alive(), False)
+        check("XREAD block wake result", wake.get("r"),
+              [["xr1", [["2000-2", ["a", "6"]]]]])
+        check("XREAD blocked client alive", cb.cmd("PING"), "PONG")
+        # BLOCK 0 waits forever until an entry arrives.
+        wake0 = {}
+        def blocked_read0():
+            wake0["r"] = cb.cmd("XREAD", "BLOCK", "0", "STREAMS", "xr2", "$")
+        bt0 = threading.Thread(target=blocked_read0)
+        bt0.start()
+        time.sleep(0.3)
+        check("XREAD block 0 wake add", c.cmd("XADD", "xr2", "3000-1", "x", "10"), "3000-1")
+        bt0.join(timeout=6)
+        check("XREAD block 0 woken", bt0.is_alive(), False)
+        check("XREAD block 0 wake result", wake0.get("r"),
+              [["xr2", [["3000-1", ["x", "10"]]]]])
+        cb.close()
+        # A client that disconnects while parked on BLOCK 0 does not
+        # wedge the server: the parked request is dropped with it.
+        raw = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+        raw.sendall(b"*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n$7\r\nSTREAMS\r\n$3\r\nxr1\r\n$1\r\n$\r\n")
+        time.sleep(0.3)
+        raw.close()
+        time.sleep(0.3)
+        check("server alive after blocked disconnect", c.cmd("PING"), "PONG")
+        check("server process alive after blocked disconnect", proc.poll() is None, True)
+        # BLOCK is refused inside MULTI; a plain XREAD queues and
+        # runs at EXEC.
+        check("MULTI xread", c.cmd("MULTI"), "OK")
+        check("MULTI xread block refused",
+              c.cmd("XREAD", "BLOCK", "100", "STREAMS", "xr1", "0"),
+              ("error", "ERR BLOCK is not allowed in MULTI/EXEC"))
+        check("MULTI xread queued", c.cmd("XREAD", "STREAMS", "xr1", "1000-1"), "QUEUED")
+        check("EXEC xread", c.cmd("EXEC"),
+              [[["xr1", [["1000-2", ["a", "3"]], ["2000-0", ["a", "4"]],
+                         ["2000-1", ["a", "5"]], ["2000-2", ["a", "6"]]]]]])
+        check("COMMAND lists XREAD", "XREAD" in c.cmd("COMMAND"), True)
+        check("XREAD cleanup", c.cmd("DEL", "xr1", "xr2"), 2)
         # Sorted sets: add/update, scores, wrong type, TTL, AOF
         # persistence. Members are ordered by (score, member); range
         # commands are not implemented yet.
@@ -3137,7 +3249,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.64.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.66.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

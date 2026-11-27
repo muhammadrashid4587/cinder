@@ -4355,6 +4355,28 @@ long long store_xlen(Store *s, const char *key) {
     return (long long)e->stream->len;
 }
 
+int store_stream_top(Store *s, const char *key, uint64_t *ms_out,
+                     uint64_t *seq_out) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) {
+        *ms_out = 0;
+        *seq_out = 0;
+        return 0;
+    }
+    if (e->type != ENTRY_STREAM) return -1;
+    e->last_access = ++s->clock;
+    if (e->stream->len == 0) {
+        /* A stream with no entries, which the store never keeps
+           around, has top ID 0-0, so every later entry qualifies. */
+        *ms_out = 0;
+        *seq_out = 0;
+        return 0;
+    }
+    *ms_out = e->stream->last_ms;
+    *seq_out = e->stream->last_seq;
+    return 0;
+}
+
 int stream_parse_bound(const char *s, int is_end, uint64_t *ms_out,
                        uint64_t *seq_out) {
     if (strcmp(s, "-") == 0) {

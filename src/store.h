@@ -799,6 +799,13 @@ int store_xadd(Store *s, const char *key, const char *id,
    missing), -1 = the key holds a non-stream value. A read, so it
    changes nothing and bumps only the key's last-access clock. */
 long long store_xlen(Store *s, const char *key);
+/* The top ID of a stream (0-0 when the key is missing), for
+   resolving "$" in XREAD: the entries XREAD returns are the ones
+   after this ID. Returns 0 on success, -1 = the key holds a
+   non-stream value. A read, so it changes nothing and bumps only
+   the key's last-access clock. */
+int store_stream_top(Store *s, const char *key, uint64_t *ms_out,
+                     uint64_t *seq_out);
 /* Parse an XRANGE bound: "-" (the minimum ID, 0-0), "+" (the
    maximum ID), "ms" (ms-0 for a start bound, ms-MAX for an end
    bound, so a bare ms covers every sequence in that millisecond)

@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.64.0"
+#define CINDER_VERSION "0.66.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -349,6 +349,202 @@ static int parse_fields_tail(char **argv, int argc, int i, int *first_out) {
     if (argc - i != n) return -2;
     *first_out = i;
     return (int)n;
+}
+
+/* ---------- XREAD ----------
+ * XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...]
+ * id [id ...]: read the entries after each given ID, one reply
+ * element per stream that has any: [key, [[id, [field, value,
+ * ...]], ...]]. A "$" ID resolves once, to the stream's top ID at
+ * read time, so only entries added after the read qualify. ">" is
+ * only for XREADGROUP, which does not exist yet, so it is an error.
+ * A read, so nothing is logged or replicated. With BLOCK and no
+ * data yet, the client parks (see handle_xread) until an entry
+ * arrives or the timeout passes; the parked request keeps the
+ * parsed XReadArgs below, with the "$" already resolved. */
+
+typedef struct {
+    char **keys;         /* owned copies, one per stream */
+    uint64_t *start_ms;  /* exclusive lower bound per stream */
+    uint64_t *start_seq;
+    size_t nstreams;
+    long long count;     /* per stream, -1 = no limit */
+    long long block_ms;  /* -1 = no BLOCK; 0 = wait forever */
+    long long deadline_ms; /* -1 = no deadline, else now_ms() to stop at */
+} XReadArgs;
+
+/* Free the arrays inside an XReadArgs (not the struct itself, which
+   may live on the stack). */
+static void xread_args_free(XReadArgs *a) {
+    if (!a) return;
+    for (size_t i = 0; i < a->nstreams; i++) free(a->keys[i]);
+    free(a->keys);
+    free(a->start_ms);
+    free(a->start_seq);
+    a->keys = NULL;
+    a->start_ms = NULL;
+    a->start_seq = NULL;
+    a->nstreams = 0;
+}
+
+/* Parse an XREAD's argv into *a (keys and bound arrays allocated;
+   the caller frees them with xread_args_free). On an error the
+   reply is filled and -1 is returned. */
+static int xread_parse(char **argv, int argc, XReadArgs *a, Dbuf *reply) {
+    memset(a, 0, sizeof(*a));
+    a->count = -1;
+    a->block_ms = -1;
+    a->deadline_ms = -1;
+    int i = 1;
+    int seen_count = 0, seen_block = 0;
+    while (i < argc && strcasecmp(argv[i], "STREAMS") != 0) {
+        if (strcasecmp(argv[i], "COUNT") == 0) {
+            if (seen_count || i + 1 >= argc)
+                return dbuf_error(reply, "syntax error"), -1;
+            if (!parse_ll(argv[i + 1], &a->count) || a->count < 1)
+                return dbuf_error(reply, "COUNT must be a positive integer"), -1;
+            seen_count = 1;
+            i += 2;
+        } else if (strcasecmp(argv[i], "BLOCK") == 0) {
+            if (seen_block || i + 1 >= argc)
+                return dbuf_error(reply, "syntax error"), -1;
+            if (!parse_ll(argv[i + 1], &a->block_ms) || a->block_ms < 0)
+                return dbuf_error(reply, "BLOCK must be a non-negative integer"), -1;
+            seen_block = 1;
+            i += 2;
+        } else {
+            return dbuf_error(reply, "syntax error"), -1;
+        }
+    }
+    if (i >= argc)
+        return dbuf_error(reply, "wrong number of arguments for 'xread' command"), -1;
+    i++; /* past STREAMS */
+    /* What follows is keys then the same number of IDs. */
+    if (argc - i < 2 || ((argc - i) % 2) != 0)
+        return dbuf_error(reply, "Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified."), -1;
+    size_t n = (size_t)(argc - i) / 2;
+    a->keys = calloc(n, sizeof(char *));
+    a->start_ms = malloc(n * sizeof(uint64_t));
+    a->start_seq = malloc(n * sizeof(uint64_t));
+    if (!a->keys || !a->start_ms || !a->start_seq) {
+        xread_args_free(a);
+        return dbuf_error(reply, "out of memory"), -1;
+    }
+    a->nstreams = n;
+    for (size_t k = 0; k < n; k++) {
+        a->keys[k] = strdup(argv[i + (int)k]);
+        if (!a->keys[k]) {
+            xread_args_free(a);
+            return dbuf_error(reply, "out of memory"), -1;
+        }
+        const char *id = argv[i + (int)n + (int)k];
+        if (strcmp(id, ">") == 0) {
+            xread_args_free(a);
+            return dbuf_error(reply, "The > ID can be specified only when calling XREADGROUP"), -1;
+        }
+        if (strcmp(id, "$") == 0) {
+            if (store_stream_top(g_store, a->keys[k],
+                                 &a->start_ms[k], &a->start_seq[k]) != 0) {
+                xread_args_free(a);
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), -1;
+            }
+        } else if (stream_parse_bound(id, 0, &a->start_ms[k],
+                                      &a->start_seq[k]) != 0) {
+            xread_args_free(a);
+            return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), -1;
+        }
+    }
+    return 0;
+}
+
+/* The ID just after (ms, seq), for the exclusive lower bound an
+   XREAD reads from. Returns 0 when there is no later ID (the bound
+   was already the maximum). */
+static int stream_next_id(uint64_t ms, uint64_t seq, uint64_t *ms_out,
+                          uint64_t *seq_out) {
+    if (seq < UINT64_MAX) {
+        *ms_out = ms;
+        *seq_out = seq + 1;
+        return 1;
+    }
+    if (ms < UINT64_MAX) {
+        *ms_out = ms + 1;
+        *seq_out = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Build an XREAD reply for the parsed request: one [key, entries]
+   element per stream with entries after its bound, up to COUNT per
+   stream, in ID order. Returns 1 when at least one stream had
+   entries, 0 when the reply holds an empty array, -1 = a key holds
+   a non-stream value, -2 = out of memory. */
+static int xread_collect(Dbuf *reply, XReadArgs *a) {
+    StreamEntry **all = calloc(a->nstreams, sizeof(StreamEntry *));
+    size_t *counts = calloc(a->nstreams, sizeof(size_t));
+    if (!all || !counts) {
+        free(all);
+        free(counts);
+        return -2;
+    }
+    size_t with_data = 0;
+    int rc = 0;
+    for (size_t k = 0; k < a->nstreams; k++) {
+        uint64_t from_ms, from_seq;
+        if (!stream_next_id(a->start_ms[k], a->start_seq[k],
+                            &from_ms, &from_seq))
+            continue; /* bound is already the maximum ID: no entries */
+        size_t n = 0;
+        int xrc = store_xrange(g_store, a->keys[k], from_ms, from_seq,
+                               UINT64_MAX, UINT64_MAX, a->count,
+                               &all[k], &n);
+        if (xrc == -1) { rc = -1; break; }
+        if (xrc == -2) { rc = -2; break; }
+        counts[k] = n;
+        if (n > 0) with_data++;
+    }
+    if (rc == 0) {
+        dbuf_array_header(reply, (long long)with_data);
+        for (size_t k = 0; k < a->nstreams; k++) {
+            if (counts[k] == 0) continue;
+            dbuf_array_header(reply, 2);
+            dbuf_bulk(reply, a->keys[k], strlen(a->keys[k]));
+            dbuf_array_header(reply, (long long)counts[k]);
+            for (size_t e = 0; e < counts[k]; e++) {
+                char idbuf[48];
+                snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                         (unsigned long long)all[k][e].ms,
+                         (unsigned long long)all[k][e].seq);
+                dbuf_array_header(reply, 2);
+                dbuf_bulk(reply, idbuf, strlen(idbuf));
+                dbuf_array_header(reply, (long long)(all[k][e].nfields * 2));
+                for (size_t f = 0; f < all[k][e].nfields; f++) {
+                    dbuf_bulk(reply, all[k][e].fields[f],
+                              strlen(all[k][e].fields[f]));
+                    dbuf_bulk(reply, all[k][e].values[f],
+                              strlen(all[k][e].values[f]));
+                }
+            }
+        }
+        rc = with_data > 0 ? 1 : 0;
+    }
+    for (size_t k = 0; k < a->nstreams; k++)
+        stream_entries_free(all[k], counts[k]);
+    free(all);
+    free(counts);
+    return rc;
+}
+
+/* Does this XREAD argv carry a BLOCK option (scanned only up to
+   STREAMS, so a key literally named BLOCK is not mistaken for
+   one)? Used to refuse BLOCK inside MULTI at queue time. */
+static int xread_has_block(char **argv, int argc) {
+    for (int i = 1; i < argc; i++) {
+        if (strcasecmp(argv[i], "STREAMS") == 0) return 0;
+        if (strcasecmp(argv[i], "BLOCK") == 0) return 1;
+    }
+    return 0;
 }
 
 static int dispatch(char **argv, int argc, Dbuf *reply) {
@@ -2058,6 +2254,31 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (len < 0)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         dbuf_int(reply, len);
+        return 0;
+    }
+    if (strcasecmp(cmd, "XREAD") == 0) {
+        /* XREAD [COUNT count] [BLOCK ms] STREAMS key ... id ...:
+           the entries after each ID, one [key, entries] element
+           per stream that has any. A read, so nothing is logged or
+           replicated, and it is safe to run on a replica. BLOCK
+           cannot run here: dispatch has no client to park, so a
+           BLOCK that reaches it (only via a queued MULTI command,
+           which the caller refuses at queue time) is an error, and
+           the live path handles BLOCK in handle_xread instead. */
+        if (argc < 2)
+            return dbuf_error(reply, "wrong number of arguments for 'xread' command"), 0;
+        XReadArgs a;
+        if (xread_parse(argv, argc, &a, reply) != 0) return 0;
+        if (a.block_ms >= 0) {
+            xread_args_free(&a);
+            return dbuf_error(reply, "BLOCK is not allowed in MULTI/EXEC"), 0;
+        }
+        int rc = xread_collect(reply, &a);
+        xread_args_free(&a);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
         return 0;
     }
     if (strcasecmp(cmd, "HSET") == 0) {
@@ -4043,7 +4264,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HINCRBYFLOAT", "HSCAN",
             "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT",
             "HTTL", "HPTTL", "HPERSIST",
-            "XADD", "XRANGE", "XLEN",
+            "XADD", "XRANGE", "XLEN", "XREAD",
             "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZINTER", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",
@@ -4151,6 +4372,13 @@ typedef struct Client {
     unsigned long long deferred_last_target; /* append seq of this
         client's most recent deferred reply (0 = none pending) */
     size_t deferred_count; /* replies of this client still queued */
+    XReadArgs *xread_block; /* non-NULL while parked on an XREAD
+        BLOCK: the parsed request, with "$" already resolved and a
+        deadline in deadline_ms (-1 = BLOCK 0, wait forever). While
+        parked the client sends nothing more, so its EPOLLIN
+        interest is dropped until the read is answered. */
+    int epoll_registered; /* this fd is registered with epoll (its
+        interest may currently be 0 events while blocked) */
     int is_replica;     /* primary side: this client is a replica (SYNC'd);
                            only PING is accepted from it, writes are
                            streamed to it */
@@ -4196,9 +4424,10 @@ static void client_add(int fd) {
         memset(&ev, 0, sizeof(ev));
         ev.events = EPOLLIN;
         ev.data.fd = fd;
-        if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, fd, &ev) == 0)
+        if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
             c->epoll_events = EPOLLIN;
-        else
+            c->epoll_registered = 1;
+        } else
             perror("epoll_ctl ADD");
     }
 }
@@ -4308,8 +4537,14 @@ static int watch_dirty(Client *c) {
    by another client's command (forward_to_replicas) or by a full sync
    (send_full_sync / backlog_send). */
 static void client_sync_interest(Client *c) {
-    if (g_epollfd < 0 || c->epoll_events == 0) return;
-    uint32_t want = EPOLLIN;
+    if (g_epollfd < 0 || !c->epoll_registered) return;
+    /* A client parked on XREAD BLOCK sends nothing more until its
+       read is answered, so drop EPOLLIN while it waits: with
+       level-triggered epoll a pipelined byte behind the block would
+       otherwise wake the loop forever. EPOLLRDHUP stays, so a peer
+       that goes away while blocked is noticed and dropped instead
+       of parked until its deadline. */
+    uint32_t want = c->xread_block ? EPOLLRDHUP : EPOLLIN;
     if (c->out.len > 0 || c->repl_connecting) want |= EPOLLOUT;
     if (want == c->epoll_events) return;
     struct epoll_event ev;
@@ -4331,6 +4566,13 @@ static void client_remove(size_t idx) {
        it: nothing queued ever executes. */
     multi_clear(&g_clients[idx]);
     watch_clear(&g_clients[idx]);
+    /* ... and a client that disconnects while parked on XREAD BLOCK
+       drops its parked request with it. */
+    if (g_clients[idx].xread_block) {
+        xread_args_free(g_clients[idx].xread_block);
+        free(g_clients[idx].xread_block);
+        g_clients[idx].xread_block = NULL;
+    }
     g_clients[idx] = g_clients[--g_nclients];
 }
 
@@ -5147,6 +5389,107 @@ static void handle_exec(Client *c, int *shutdown_out) {
     }
 }
 
+/* XREAD on a live client: parse, answer at once when data is
+   already there (even with BLOCK), and otherwise park the client
+   on the request until an entry arrives or the timeout passes.
+   BLOCK 0 waits forever. A read, so nothing is logged or
+   replicated. */
+static void handle_xread(Client *c, char **argv, int argc) {
+    Dbuf reply = {0};
+    if (argc < 2) {
+        dbuf_error(&reply, "wrong number of arguments for 'xread' command");
+        client_reply(c, &reply, 0);
+        free(reply.data);
+        return;
+    }
+    XReadArgs a;
+    if (xread_parse(argv, argc, &a, &reply) != 0) {
+        client_reply(c, &reply, 0);
+        free(reply.data);
+        return;
+    }
+    /* With or without BLOCK, data already there answers at once, as
+       in Redis, so a waiting client never misses entries that
+       arrived before the read. */
+    int rc = xread_collect(&reply, &a);
+    if (a.block_ms < 0 || rc != 0) {
+        xread_args_free(&a);
+        if (rc == -1)
+            dbuf_error(&reply, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        else if (rc == -2)
+            dbuf_error(&reply, "out of memory");
+        client_reply(c, &reply, 0);
+        free(reply.data);
+        return;
+    }
+    /* Nothing yet: park. "$" was resolved at parse time, so entries
+       added from here on qualify; the deadline is absolute, and
+       BLOCK 0 has none. No lock is held while waiting — the store
+       is single-threaded and the parked request is just data; the
+       loop re-checks it every iteration. */
+    free(reply.data);
+    if (a.block_ms == 0) {
+        a.deadline_ms = -1;
+    } else {
+        long long now = now_ms();
+        a.deadline_ms = a.block_ms > LLONG_MAX - now ? -1 : now + a.block_ms;
+    }
+    XReadArgs *parked = malloc(sizeof(*parked));
+    if (!parked) {
+        xread_args_free(&a);
+        Dbuf err = {0};
+        dbuf_error(&err, "out of memory");
+        client_reply(c, &err, 0);
+        free(err.data);
+        return;
+    }
+    *parked = a;
+    c->xread_block = parked;
+    /* Interest drops EPOLLIN at the next sync, so a pipelined byte
+       behind the block cannot spin the loop. */
+}
+
+/* Re-check every client parked on XREAD BLOCK: answer the ones with
+   new entries, time out the ones past their deadline (a nil array,
+   as in Redis), and error the ones whose key stopped being a stream
+   while they waited. Runs once per loop iteration, next to
+   deferred_drain, so a wake-up costs at most one iteration after
+   the XADD that should release it (the epoll_wait timeout is
+   100 ms, so a timeout lands within 100 ms of its deadline). */
+static void xread_blocked_check(void) {
+    long long now = now_ms();
+    for (size_t i = 0; i < g_nclients; i++) {
+        Client *c = &g_clients[i];
+        if (!c->xread_block) continue;
+        XReadArgs *a = c->xread_block;
+        Dbuf reply = {0};
+        if (a->deadline_ms >= 0 && now >= a->deadline_ms) {
+            dbuf_null_array(&reply);
+            client_reply(c, &reply, 0);
+            free(reply.data);
+            xread_args_free(a);
+            free(a);
+            c->xread_block = NULL;
+            continue;
+        }
+        int rc = xread_collect(&reply, a);
+        if (rc == 0) {
+            /* Still nothing: stay parked. */
+            free(reply.data);
+            continue;
+        }
+        if (rc == -1)
+            dbuf_error(&reply, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        else if (rc == -2)
+            dbuf_error(&reply, "out of memory");
+        client_reply(c, &reply, 0);
+        free(reply.data);
+        xread_args_free(a);
+        free(a);
+        c->xread_block = NULL;
+    }
+}
+
 /* ---------- main ---------- */
 
 static void usage(const char *prog) {
@@ -5348,6 +5691,11 @@ int main(int argc, char **argv) {
            released here is registered for EPOLLOUT in the same
            iteration and written without waiting out a timeout. */
         deferred_drain();
+        /* Answer or time out clients parked on XREAD BLOCK. This runs
+           before the interest sync, so a client released here is
+           registered for EPOLLIN again in the same iteration and
+           can send its next command without waiting out a timeout. */
+        xread_blocked_check();
         for (size_t i = 0; i < g_nclients; i++)
             client_sync_interest(&g_clients[i]);
         struct epoll_event events[128];
@@ -5387,6 +5735,15 @@ int main(int argc, char **argv) {
             if (idx == g_nclients) continue;
             Client *c = &g_clients[idx];
             if (re & (EPOLLERR | EPOLLHUP)) { c->dead = 1; continue; }
+            if (c->xread_block && (re & EPOLLRDHUP)) {
+                /* A client parked on XREAD BLOCK went away: drop the
+                   parked request with it instead of waiting out its
+                   deadline (its EPOLLIN is suppressed while blocked,
+                   so without this the half-close would not be
+                   noticed until the read timed out). */
+                c->dead = 1;
+                continue;
+            }
             if (c->is_repl_link && c->repl_connecting && (re & EPOLLOUT)) {
                 /* Non-blocking connect finished: check for an error,
                    then ask the primary for a full sync. */
@@ -5538,9 +5895,15 @@ int main(int argc, char **argv) {
                            order, atomically with the rest. WATCH is
                            not queued: it runs at once and errors
                            inside MULTI, as in Redis. UNWATCH does
-                           queue, as in Redis, and runs at EXEC. */
+                           queue, as in Redis, and runs at EXEC. An
+                           XREAD with BLOCK cannot queue: there is no
+                           client to park at EXEC time, so it errors
+                           at once, as in Redis. */
                         Dbuf reply = {0};
-                        if (multi_queue(c, cargv, cargc) < 0)
+                        if (strcasecmp(cargv[0], "XREAD") == 0 &&
+                            xread_has_block(cargv, cargc))
+                            dbuf_error(&reply, "BLOCK is not allowed in MULTI/EXEC");
+                        else if (multi_queue(c, cargv, cargc) < 0)
                             dbuf_error(&reply, "ERR out of memory");
                         else
                             dbuf_simple(&reply, "QUEUED");
@@ -5667,6 +6030,13 @@ int main(int argc, char **argv) {
                             }
                             client_reply(c, &reply, 0);
                             free(reply.data);
+                        } else if (strcasecmp(cargv[0], "XREAD") == 0) {
+                            /* XREAD needs the client itself for BLOCK
+                               (it parks the client until data arrives),
+                               so it is handled here rather than in
+                               dispatch; the non-blocking form still
+                               runs through dispatch at EXEC. */
+                            handle_xread(c, cargv, cargc);
                         } else {
                             Dbuf reply = {0};
                             int drc = dispatch(cargv, cargc, &reply);
