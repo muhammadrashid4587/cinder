@@ -40,10 +40,13 @@ typedef struct Set {
    store.c. HGETALL / HKEYS / HVALS / HSCAN still walk the arrays
    in insertion order; deleting a field memmoves the tail of the
    arrays (preserving order) and re-indexes the fields that moved,
-   so HDEL stays O(n). */
+   so HDEL stays O(n). field_expire is a third parallel array, one
+   ms-since-epoch expiry per field (-1 = no expiry), for the
+   Redis 7.4 style per-field TTLs (HEXPIRE and friends). */
 typedef struct Hash {
     char **fields;
     char **values;
+    long long *field_expire;
     size_t cap;
     size_t len;
     struct hdict *dict;
@@ -426,6 +429,44 @@ int store_hincrbyfloat(Store *s, const char *key, const char *field,
 int store_hscan(Store *s, const char *key, unsigned long long cursor,
                 const char *pattern, size_t count, char ***out,
                 size_t *n_out, unsigned long long *next_out);
+
+/* Hash field TTLs (HEXPIRE / HPEXPIRE / HEXPIREAT / HPEXPIREAT,
+   HTTL / HPTTL, HPERSIST), Redis 7.4 style: each field of a hash
+   may carry its own expiry (ms since epoch, -1 = none). A field
+   whose expiry passes is deleted lazily on the next access to its
+   key and by the periodic expiry sweep; when the last field goes
+   the key goes with it, as in Redis. A key-level TTL still bounds
+   every field: when the key expires, all its fields go. Overwriting
+   a field with HSET clears that field's expiry, as in Redis, while
+   HINCRBY / HINCRBYFLOAT leave it alone. */
+#define HFIELD_EXPIRE_NONE 0
+#define HFIELD_EXPIRE_NX 1
+#define HFIELD_EXPIRE_XX 2
+#define HFIELD_EXPIRE_GT 3
+#define HFIELD_EXPIRE_LT 4
+/* Set one field's expiry to the absolute ms time expire_at, under
+   the condition cond (NONE always sets; NX only when the field has
+   no expiry; XX only when it has one; GT only when the new time is
+   later than the current one, a field with no expiry counting as
+   infinite; LT only when the new time is earlier, a field with no
+   expiry counting as infinite). Returns 1 when the expiry was set,
+   0 when the condition was not met, 2 when expire_at had already
+   passed and the field was deleted instead, -1 = wrong type,
+   -2 = the key or the field does not exist. Setting an expiry the
+   field already has answers 1 and changes nothing, so it does not
+   invalidate a WATCH; any other real change does. */
+int store_hexpire_field(Store *s, const char *key, const char *field,
+                        long long expire_at, int cond);
+/* Remaining TTL of one field in ms: -2 = the key or the field does
+   not exist, -1 = the field has no expiry, otherwise ms left.
+   Returns -1 for a wrong-type key too; the caller checks the type
+   first, as the TTL is only meaningful for a hash. */
+long long store_hfield_ttl_ms(Store *s, const char *key, const char *field);
+/* Remove one field's expiry. Returns 1 when an expiry was removed,
+   -1 when the field had none, -2 = the key or the field does not
+   exist. Returns -1 for a wrong-type key too; the caller checks the
+   type first, as the reply code is only meaningful for a hash. */
+int store_hfield_persist(Store *s, const char *key, const char *field);
 
 /* Add or update one member's score. Returns 1 when the member is
    new, 0 when it overwrote an existing member's score, 2 when the

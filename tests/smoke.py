@@ -934,6 +934,130 @@ def main():
               ("error", "ERR wrong number of arguments for 'hscan' command"))
         check("HSCAN bad option", c.cmd("HSCAN", "scanhash", "0", "NOPE"),
               ("error", "ERR syntax error"))
+        # Hash field TTLs (HEXPIRE / HPEXPIRE / HEXPIREAT / HPEXPIREAT /
+        # HTTL / HPTTL / HPERSIST): per-field expiry, lazy on access,
+        # HSET clearing a field's TTL, HINCRBY keeping it, and the
+        # NX/XX/GT/LT conditions.
+        check("HSET ftexp", c.cmd("HSET", "ftexp", "perm", "p", "short", "s", "mid", "m"), 3)
+        check("HEXPIRE", c.cmd("HEXPIRE", "ftexp", "60", "FIELDS", "2", "short", "mid"), [1, 1])
+        check("HTTL perm no expiry", c.cmd("HTTL", "ftexp", "FIELDS", "1", "perm"), [-1])
+        check("HTTL short ~60", 59 <= c.cmd("HTTL", "ftexp", "FIELDS", "1", "short")[0] <= 60, True)
+        check("HTTL ghost field", c.cmd("HTTL", "ftexp", "FIELDS", "1", "ghost"), [-2])
+        check("HTTL missing key", c.cmd("HTTL", "ghosthash", "FIELDS", "1", "f"), [-2])
+        check("HPTTL short ms", 59000 <= c.cmd("HPTTL", "ftexp", "FIELDS", "1", "short")[0] <= 60000, True)
+        check("HEXPIRE missing key", c.cmd("HEXPIRE", "ghosthash", "60", "FIELDS", "1", "f"), [-2])
+        check("HEXPIRE missing field", c.cmd("HEXPIRE", "ftexp", "60", "FIELDS", "1", "ghost"), [-2])
+        check("HEXPIRE wrongtype", c.cmd("HEXPIRE", "after", "60", "FIELDS", "1", "f"), wrongtype)
+        check("HTTL wrongtype", c.cmd("HTTL", "after", "FIELDS", "1", "f"), wrongtype)
+        check("HPERSIST wrongtype", c.cmd("HPERSIST", "after", "FIELDS", "1", "f"), wrongtype)
+        check("HEXPIRE bad time", c.cmd("HEXPIRE", "ftexp", "xx", "FIELDS", "1", "short"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("HEXPIRE negative", c.cmd("HEXPIRE", "ftexp", "-5", "FIELDS", "1", "short"),
+              ("error", "ERR invalid expire time in 'hexpire' command"))
+        check("HEXPIRE no FIELDS", c.cmd("HEXPIRE", "ftexp", "60", "short"),
+              ("error", "ERR wrong number of arguments for 'hexpire' command"))
+        check("HEXPIRE count mismatch", c.cmd("HEXPIRE", "ftexp", "60", "FIELDS", "2", "short"),
+              ("error", "ERR wrong number of arguments for 'hexpire' command"))
+        check("HEXPIRE bad option", c.cmd("HEXPIRE", "ftexp", "60", "NOPE", "FIELDS", "1", "short"),
+              ("error", "ERR syntax error"))
+        check("HEXPIRE conflicting options", c.cmd("HEXPIRE", "ftexp", "60", "NX", "XX", "FIELDS", "1", "short"),
+              ("error", "ERR syntax error"))
+        check("HPEXPIRE", c.cmd("HPEXPIRE", "ftexp", "5000", "FIELDS", "1", "mid"), [1])
+        check("HPTTL mid ms", 4000 <= c.cmd("HPTTL", "ftexp", "FIELDS", "1", "mid")[0] <= 5000, True)
+        check("HEXPIREAT", c.cmd("HEXPIREAT", "ftexp", str(int(time.time()) + 3600), "FIELDS", "1", "perm"), [1])
+        check("HTTL expireat", 3599 <= c.cmd("HTTL", "ftexp", "FIELDS", "1", "perm")[0] <= 3600, True)
+        check("HPEXPIREAT", c.cmd("HPEXPIREAT", "ftexp", str(int(time.time() * 1000) + 3600000), "FIELDS", "1", "short"), [1])
+        check("HPTTL expireat ms", 3599000 <= c.cmd("HPTTL", "ftexp", "FIELDS", "1", "short")[0] <= 3600000, True)
+        # NX / XX / GT / LT conditions: a field with no expiry counts
+        # as an infinite TTL, so GT never accepts it and LT always does.
+        check("HSET condhash", c.cmd("HSET", "condhash", "a", "1", "b", "2", "c", "3"), 3)
+        check("HEXPIRE cond base", c.cmd("HEXPIRE", "condhash", "100", "FIELDS", "1", "a"), [1])
+        check("HEXPIRE NX has expiry", c.cmd("HEXPIRE", "condhash", "50", "NX", "FIELDS", "1", "a"), [0])
+        check("HEXPIRE NX no expiry", c.cmd("HEXPIRE", "condhash", "50", "NX", "FIELDS", "1", "b"), [1])
+        check("HEXPIRE XX no expiry", c.cmd("HEXPIRE", "condhash", "50", "XX", "FIELDS", "1", "c"), [0])
+        check("HEXPIRE XX has expiry", c.cmd("HEXPIRE", "condhash", "50", "XX", "FIELDS", "1", "a"), [1])
+        check("HEXPIRE GT shorter", c.cmd("HEXPIRE", "condhash", "10", "GT", "FIELDS", "1", "a"), [0])
+        check("HEXPIRE GT longer", c.cmd("HEXPIRE", "condhash", "500", "GT", "FIELDS", "1", "a"), [1])
+        check("HEXPIRE GT no expiry", c.cmd("HEXPIRE", "condhash", "500", "GT", "FIELDS", "1", "c"), [0])
+        check("HEXPIRE LT longer", c.cmd("HEXPIRE", "condhash", "900", "LT", "FIELDS", "1", "a"), [0])
+        check("HEXPIRE LT shorter", c.cmd("HEXPIRE", "condhash", "10", "LT", "FIELDS", "1", "a"), [1])
+        check("HEXPIRE LT no expiry", c.cmd("HEXPIRE", "condhash", "10", "LT", "FIELDS", "1", "c"), [1])
+        check("HTTL cond a", 9 <= c.cmd("HTTL", "condhash", "FIELDS", "1", "a")[0] <= 10, True)
+        check("HTTL cond b", 49 <= c.cmd("HTTL", "condhash", "FIELDS", "1", "b")[0] <= 50, True)
+        check("HTTL cond c", 9 <= c.cmd("HTTL", "condhash", "FIELDS", "1", "c")[0] <= 10, True)
+        # A zero relative TTL, or an absolute time already past,
+        # deletes the field at once and answers 2.
+        check("HSET zerohash", c.cmd("HSET", "zerohash", "a", "1", "b", "2"), 2)
+        check("HEXPIRE zero deletes", c.cmd("HEXPIRE", "zerohash", "0", "FIELDS", "1", "a"), [2])
+        check("HGET zero gone", c.cmd("HGET", "zerohash", "a"), None)
+        check("HLEN zerohash", c.cmd("HLEN", "zerohash"), 1)
+        check("HEXPIREAT past deletes", c.cmd("HEXPIREAT", "zerohash", "1", "FIELDS", "1", "b"), [2])
+        check("EXISTS zerohash gone", c.cmd("EXISTS", "zerohash"), 0)
+        # Lazy expiry: expired fields are invisible to every read,
+        # and expiring the last field deletes the key.
+        check("HSET lazyhash", c.cmd("HSET", "lazyhash", "fast", "1", "slow", "2", "keep", "3"), 3)
+        check("HPEXPIRE lazy", c.cmd("HPEXPIRE", "lazyhash", "120", "FIELDS", "2", "fast", "slow"), [1, 1])
+        time.sleep(0.2)
+        check("HGET expired field", c.cmd("HGET", "lazyhash", "fast"), None)
+        check("HLEN after field expiry", c.cmd("HLEN", "lazyhash"), 1)
+        check("HGETALL after field expiry", c.cmd("HGETALL", "lazyhash"), ["keep", "3"])
+        check("HTTL expired field", c.cmd("HTTL", "lazyhash", "FIELDS", "1", "fast"), [-2])
+        check("HEXISTS expired field", c.cmd("HEXISTS", "lazyhash", "fast"), 0)
+        check("HKEYS after field expiry", c.cmd("HKEYS", "lazyhash"), ["keep"])
+        check("HPEXPIRE last field", c.cmd("HPEXPIRE", "lazyhash", "120", "FIELDS", "1", "keep"), [1])
+        time.sleep(0.2)
+        check("EXISTS after last field expires", c.cmd("EXISTS", "lazyhash"), 0)
+        # HPERSIST removes the expiry; the field then outlives it.
+        check("HSET pershash", c.cmd("HSET", "pershash", "a", "1", "b", "2"), 2)
+        check("HEXPIRE pershash", c.cmd("HEXPIRE", "pershash", "120", "FIELDS", "1", "a"), [1])
+        check("HPERSIST removes", c.cmd("HPERSIST", "pershash", "FIELDS", "1", "a"), [1])
+        check("HPERSIST again", c.cmd("HPERSIST", "pershash", "FIELDS", "1", "a"), [-1])
+        check("HPERSIST never had one", c.cmd("HPERSIST", "pershash", "FIELDS", "1", "b"), [-1])
+        check("HPERSIST missing field", c.cmd("HPERSIST", "pershash", "FIELDS", "1", "ghost"), [-2])
+        check("HPERSIST missing key", c.cmd("HPERSIST", "ghosthash", "FIELDS", "1", "a"), [-2])
+        time.sleep(0.2)
+        check("HGET persisted field survives", c.cmd("HGET", "pershash", "a"), "1")
+        # HSET overwriting a field clears that field's TTL, even when
+        # the value is unchanged; HINCRBY / HINCRBYFLOAT keep it.
+        check("HSET clearhash", c.cmd("HSET", "clearhash", "a", "1", "n", "5", "f", "1.5"), 3)
+        check("HEXPIRE clearhash", c.cmd("HEXPIRE", "clearhash", "3600", "FIELDS", "3", "a", "n", "f"), [1, 1, 1])
+        check("HSET same value clears TTL", c.cmd("HSET", "clearhash", "a", "1"), 0)
+        check("HTTL a cleared by HSET", c.cmd("HTTL", "clearhash", "FIELDS", "1", "a"), [-1])
+        check("HTTL n kept after HSET", 3599 <= c.cmd("HTTL", "clearhash", "FIELDS", "1", "n")[0] <= 3600, True)
+        check("HINCRBY keeps field TTL", c.cmd("HINCRBY", "clearhash", "n", "1"), 6)
+        check("HTTL n kept after HINCRBY", 3599 <= c.cmd("HTTL", "clearhash", "FIELDS", "1", "n")[0] <= 3600, True)
+        check("HINCRBYFLOAT keeps field TTL", c.cmd("HINCRBYFLOAT", "clearhash", "f", "0.5"), "2")
+        check("HTTL f kept after HINCRBYFLOAT", 3599 <= c.cmd("HTTL", "clearhash", "FIELDS", "1", "f")[0] <= 3600, True)
+        # A field expiry invalidates a WATCH: setting the TTL is a
+        # write, and the lazy purge on expiry is one too; a HEXPIRE
+        # whose condition is not met changes nothing and does not.
+        cw = Client(PORT)
+        check("HSET watchhash", c.cmd("HSET", "watchhash", "a", "1", "b", "2"), 2)
+        check("WATCH watchhash", cw.cmd("WATCH", "watchhash"), "OK")
+        check("MULTI watchhash", cw.cmd("MULTI"), "OK")
+        check("queued watchhash", cw.cmd("SET", "watchhash", "x"), "QUEUED")
+        check("HEXPIRE watch write", c.cmd("HEXPIRE", "watchhash", "3600", "FIELDS", "1", "a"), [1])
+        check("EXEC watchhash aborts", cw.cmd("EXEC"), None)
+        check("WATCH watchhash noop", cw.cmd("WATCH", "watchhash"), "OK")
+        check("MULTI watchhash noop", cw.cmd("MULTI"), "OK")
+        check("queued watchhash noop", cw.cmd("SET", "watchhash", "x"), "QUEUED")
+        check("HEXPIRE watch noop", c.cmd("HEXPIRE", "watchhash", "3600", "NX", "FIELDS", "1", "a"), [0])
+        check("EXEC watchhash noop runs", cw.cmd("EXEC"), ["OK"])
+        check("HSET watchhash2", c.cmd("HSET", "watchhash2", "a", "1", "b", "2"), 2)
+        check("HPEXPIRE watchhash2", c.cmd("HPEXPIRE", "watchhash2", "150", "FIELDS", "1", "b"), [1])
+        check("WATCH watchhash2", cw.cmd("WATCH", "watchhash2"), "OK")
+        check("MULTI watchhash2", cw.cmd("MULTI"), "OK")
+        check("queued watchhash2", cw.cmd("SET", "watchhash2", "x"), "QUEUED")
+        time.sleep(0.2)
+        check("EXEC watchhash2 aborts on expiry", cw.cmd("EXEC"), None)
+        cw.close()
+        check("COMMAND lists HEXPIRE", "HEXPIRE" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HPEXPIRE", "HPEXPIRE" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HEXPIREAT", "HEXPIREAT" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HPEXPIREAT", "HPEXPIREAT" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HTTL", "HTTL" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HPTTL", "HPTTL" in c.cmd("COMMAND"), True)
+        check("COMMAND lists HPERSIST", "HPERSIST" in c.cmd("COMMAND"), True)
         # SSCAN: full iteration, MATCH, COUNT pagination, errors.
         check("SADD scanset", c.cmd("SADD", "scanset", "m1", "m2", "m3", "m4", "m5"), 5)
         check("SSCAN all", c.cmd("SSCAN", "scanset", "0"),
@@ -2752,6 +2876,9 @@ def main():
         check("rdb SET ttl", c.cmd("SET", "snapttl", "v", "EX", "100"), "OK")
         check("rdb SET expiring", c.cmd("SET", "snapgone", "v", "PX", "50"), "OK")
         check("rdb SETRANGE pad", c.cmd("SETRANGE", "snappad", "3", "pad"), 6)
+        check("rdb HSET fexp", c.cmd("HSET", "snapfexp", "f1", "v1", "f2", "v2", "f3", "v3"), 3)
+        check("rdb HPEXPIRE fexp gone", c.cmd("HPEXPIRE", "snapfexp", "50", "FIELDS", "1", "f2"), [1])
+        check("rdb HEXPIREAT fexp", c.cmd("HEXPIREAT", "snapfexp", str(int(time.time()) + 3600), "FIELDS", "1", "f3"), [1])
         time.sleep(0.1)
         check("rdb SAVE", c.cmd("SAVE"), "OK")
         with open(os.path.join(rdb_dir, "dump.rdb"), "rb") as f:
@@ -2775,6 +2902,8 @@ def main():
         check("rdb reload list", c.cmd("LRANGE", "snaplist", "0", "-1"), ["x", "y", "z"])
         check("rdb reload set", sorted(c.cmd("SMEMBERS", "snapset")), ["a", "b"])
         check("rdb reload hash", c.cmd("HGETALL", "snaphash"), ["f1", "v1", "f2", "v2"])
+        check("rdb reload hash field TTL", c.cmd("HGETALL", "snapfexp"), ["f1", "v1", "f3", "v3"])
+        check("rdb reload hash field TTL value", 3595000 <= c.cmd("HPTTL", "snapfexp", "FIELDS", "1", "f3")[0] <= 3600000, True)
         check("rdb reload zset card", c.cmd("ZCARD", "snapzset"), 2)
         check("rdb reload zset score", c.cmd("ZSCORE", "snapzset", "a"), "1.5")
         check("rdb reload hll", c.cmd("PFCOUNT", "snaphll"), 4)
@@ -2782,7 +2911,7 @@ def main():
         check("rdb reload expired gone", c.cmd("GET", "snapgone"), None)
         check("rdb reload padded GET", c.cmd("GET", "snappad"), "\x00" * 3 + "pad")
         check("rdb reload padded STRLEN", c.cmd("STRLEN", "snappad"), 6)
-        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 8)
+        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 9)
         check("rdb reload SET still works", c.cmd("SET", "afterload", "1"), "OK")
         check("rdb SAVE again", c.cmd("SAVE"), "OK")
         c.cmd("SHUTDOWN")
@@ -2897,7 +3026,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.62.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.63.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -2922,6 +3051,9 @@ def main():
         check("repl PFADD", p.cmd("PFADD", "rephll", "a", "b", "c"), 1)
         check("repl SET ttl", p.cmd("SET", "repttl", "v", "EX", "100"), "OK")
         check("repl SET gone soon", p.cmd("SET", "repgone", "v", "PX", "50"), "OK")
+        check("repl HSET fexp", p.cmd("HSET", "repfieldttl", "keep", "k", "gone", "g", "timed", "t"), 3)
+        check("repl HPEXPIREAT fexp", p.cmd("HPEXPIREAT", "repfieldttl", str(int(time.time() * 1000) + 3600000), "FIELDS", "1", "timed"), [1])
+        check("repl HPEXPIRE fexp short", p.cmd("HPEXPIRE", "repfieldttl", "50", "FIELDS", "1", "gone"), [1])
         # Bit keys, including values ending in a zero byte, which the
         # full sync rebuilds with a trailing SETBIT.
         check("repl SETBIT trailing NUL", p.cmd("SETBIT", "repbits", "7", "0"), 0)
@@ -2954,6 +3086,9 @@ def main():
         check("repl sync hll", r.cmd("PFCOUNT", "rephll"), 3)
         check("repl sync TTL survives", 90000 <= r.cmd("PTTL", "repttl") <= 100000, True)
         check("repl sync skips expired key", r.cmd("GET", "repgone"), None)
+        check("repl sync hash field TTL", r.cmd("HGETALL", "repfieldttl"), ["keep", "k", "timed", "t"])
+        check("repl sync hash field TTL value", 3500000 <= r.cmd("HPTTL", "repfieldttl", "FIELDS", "1", "timed")[0] <= 3600000, True)
+        check("repl sync skips expired field", r.cmd("HGET", "repfieldttl", "gone"), None)
         check("repl sync bit key trailing NUL", r.cmd("STRLEN", "repbits"), 1)
         check("repl sync bit key bit", r.cmd("GETBIT", "repbits", "7"), 0)
         check("repl sync bit key mixed len", r.cmd("STRLEN", "repbits2"), 2)
@@ -2968,6 +3103,7 @@ def main():
         check("repl live LPUSH", p.cmd("LPUSH", "replist", "front"), 4)
         check("repl live ZADD zset2", p.cmd("ZADD", "repz2", "10", "a", "1", "c"), 2)
         check("repl live PFADD", p.cmd("PFADD", "rephll", "d"), 1)
+        check("repl live HEXPIRE", p.cmd("HEXPIRE", "rephash", "60", "FIELDS", "1", "f1"), [1])
         check("repl live ZUNIONSTORE", p.cmd("ZUNIONSTORE", "repunion", "2", "repzset", "repz2"), 3)
         check("repl live ZDIFFSTORE", p.cmd("ZDIFFSTORE", "repdiff", "2", "repzset", "repz2"), 1)
         check("repl live ZREMRANGEBYSCORE", p.cmd("ZREMRANGEBYSCORE", "repzset", "1", "2"), 2)
@@ -2991,6 +3127,7 @@ def main():
         check("repl streamed zdiffstore", r.cmd("ZSCORE", "repdiff", "b"), "2")
         check("repl streamed list", r.cmd("LRANGE", "replist", "0", "-1"),
               ["front", "x", "y", "z"])
+        check("repl streamed HEXPIRE", 55 <= r.cmd("HTTL", "rephash", "FIELDS", "1", "f1")[0] <= 60, True)
         # Replication offsets: the primary counts forwarded stream bytes,
         # the replica tracks the same position, and PSYNC answers
         # FULLRESYNC (no backlog yet) then a full sync.

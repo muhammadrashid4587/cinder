@@ -9,7 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define RDB_VERSION 1
+#define RDB_VERSION 2
 #define RDB_MAGIC "CINDER"
 #define RDB_MAGIC_LEN 6
 #define RDB_END 0xFF
@@ -93,6 +93,19 @@ static int save_entry(const Entry *e, void *arg) {
     SaveCtx *ctx = arg;
     if (ctx->err) return 1;
     FILE *f = ctx->f;
+    /* A hash whose fields have all expired saves nothing at all:
+       the record would reload as a key that never comes into being,
+       and counting it as loaded would be wrong. The expiry instant
+       is read once so the live count and the written fields agree. */
+    long long now = now_ms();
+    size_t hash_alive = 0;
+    if (e->type == ENTRY_HASH) {
+        Hash *h = e->hash;
+        for (size_t i = 0; i < h->len; i++)
+            if (h->field_expire[i] == -1 || h->field_expire[i] > now)
+                hash_alive++;
+        if (hash_alive == 0) return 0;
+    }
     if (w_u8(f, (unsigned char)e->type) < 0 || w_i64(f, e->expire_at) < 0 ||
         w_str(f, e->key) < 0) {
         ctx->err = 1;
@@ -117,9 +130,15 @@ static int save_entry(const Entry *e, void *arg) {
         }
     } else if (e->type == ENTRY_HASH) {
         Hash *h = e->hash;
-        if (w_u32(f, (uint32_t)h->len) < 0) { ctx->err = 1; return 1; }
+        /* Version 2 writes one absolute expiry per field alongside
+           the pair, so a field TTL survives the snapshot; expired
+           fields are left out, as with a key whose TTL passed. */
+        if (w_u32(f, (uint32_t)hash_alive) < 0) { ctx->err = 1; return 1; }
         for (size_t i = 0; i < h->len; i++) {
-            if (w_str(f, h->fields[i]) < 0 || w_str(f, h->values[i]) < 0) {
+            if (h->field_expire[i] != -1 && h->field_expire[i] <= now)
+                continue;
+            if (w_str(f, h->fields[i]) < 0 || w_str(f, h->values[i]) < 0 ||
+                w_i64(f, h->field_expire[i]) < 0) {
                 ctx->err = 1;
                 return 1;
             }
@@ -322,7 +341,9 @@ long long rdb_load(Store *s, const char *path) {
     }
     r.off = RDB_MAGIC_LEN;
     uint32_t version;
-    if (r_u32(&r, &version) < 0 || version != RDB_VERSION) {
+    /* Version 1 snapshots (no per-field expiry) still load: their
+       hash fields simply come back without a TTL. */
+    if (r_u32(&r, &version) < 0 || (version != 1 && version != 2)) {
         free(data);
         errno = EINVAL;
         return -1;
@@ -369,9 +390,23 @@ long long rdb_load(Store *s, const char *path) {
                     free(key);
                     goto malformed;
                 }
+                /* Version 2 hash records carry one absolute field
+                   expiry per pair, after the value. */
+                int64_t field_expire = -1;
+                if (type == ENTRY_HASH && version == 2) {
+                    if (r_i64(&r, &field_expire) < 0) {
+                        free(field);
+                        free(val);
+                        free(key);
+                        goto malformed;
+                    }
+                }
                 if (!expired) {
                     if (type == ENTRY_HASH) {
                         store_hset(s, key, field, val);
+                        if (field_expire != -1)
+                            store_hexpire_field(s, key, field, field_expire,
+                                                HFIELD_EXPIRE_NONE);
                     } else {
                         /* The score string is %.17g from the writer,
                            so it parses back to the exact double. */
@@ -383,8 +418,13 @@ long long rdb_load(Store *s, const char *path) {
             }
             if (!expired && expire_at != -1) store_expire(s, key, expire_at);
         }
+        /* Every field's expiry had already passed while loading, so
+           the key never came into being: do not count it. The check
+           runs before key is freed. */
+        int key_gone = !expired && type == ENTRY_HASH &&
+                       store_type(s, key) == 0;
         free(key);
-        if (!expired) loaded++;
+        if (!expired && !key_gone) loaded++;
     }
     if (r.off != r.len) goto malformed;
     free(data);

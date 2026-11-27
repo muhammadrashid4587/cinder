@@ -32,6 +32,11 @@ static int entry_expired(const Entry *e) {
     return e->expire_at != -1 && now_ms() >= e->expire_at;
 }
 
+/* Forward declarations: the lazy field-expiry purge below runs from
+   store_find, which sits above the definitions of both. */
+static void entry_touch(Store *s, Entry *e);
+static int entry_purge_expired_fields(Store *s, Entry *e, Entry **pp);
+
 Store *store_new(void) {
     Store *s = calloc(1, sizeof(Store));
     if (!s) return NULL;
@@ -304,6 +309,7 @@ static void hash_free(Hash *h) {
     }
     free(h->fields);
     free(h->values);
+    free(h->field_expire);
     hdict_free(h->dict);
     free(h);
 }
@@ -736,11 +742,13 @@ static Hash *hash_new(void) {
     h->cap = 8;
     h->fields = calloc(h->cap, sizeof(char *));
     h->values = calloc(h->cap, sizeof(char *));
+    h->field_expire = malloc(h->cap * sizeof(long long));
     h->dict = hdict_new();
-    if (!h->fields || !h->values || !h->dict) {
+    if (!h->fields || !h->values || !h->field_expire || !h->dict) {
         hash_free(h);
         return NULL;
     }
+    for (size_t i = 0; i < h->cap; i++) h->field_expire[i] = -1;
     return h;
 }
 
@@ -750,14 +758,18 @@ static long long hash_find(Hash *h, const char *field) {
 }
 
 /* Set field to value, adding it if absent. Returns 1 new, 0 updated,
-   -1 = OOM. */
-static int hash_put(Hash *h, const char *field, const char *value) {
+   -1 = OOM. clear_ttl mirrors Redis: an HSET that overwrites a field
+   clears that field's expiry, while an increment (HINCRBY and
+   friends) leaves it alone. A new field never has an expiry. */
+static int hash_put(Hash *h, const char *field, const char *value,
+                    int clear_ttl) {
     long long idx = hash_find(h, field);
     if (idx >= 0) {
         char *v = strdup(value);
         if (!v) return -1;
         free(h->values[idx]);
         h->values[idx] = v;
+        if (clear_ttl) h->field_expire[idx] = -1;
         return 0;
     }
     char *f = strdup(field);
@@ -771,17 +783,20 @@ static int hash_put(Hash *h, const char *field, const char *value) {
         size_t ncap = h->cap * 2;
         char **nf = realloc(h->fields, ncap * sizeof(char *));
         char **nv = realloc(h->values, ncap * sizeof(char *));
-        if (!nf || !nv) {
+        long long *ne = realloc(h->field_expire, ncap * sizeof(long long));
+        if (!nf || !nv || !ne) {
             free(f);
             free(v);
             return -1;
         }
         h->fields = nf;
         h->values = nv;
+        h->field_expire = ne;
         h->cap = ncap;
     }
     h->fields[h->len] = f;
     h->values[h->len] = v;
+    h->field_expire[h->len] = -1;
     h->len++;
     if (!hdict_set(h->dict, f, h->len - 1)) {
         /* The field is appended but unindexed; roll the append back
@@ -791,6 +806,7 @@ static int hash_put(Hash *h, const char *field, const char *value) {
         free(h->values[h->len]);
         h->fields[h->len] = NULL;
         h->values[h->len] = NULL;
+        h->field_expire[h->len] = -1;
         return -1;
     }
     return 1;
@@ -807,15 +823,50 @@ static int hash_remove(Hash *h, const char *field) {
     for (size_t i = (size_t)idx + 1; i < h->len; i++) {
         h->fields[i - 1] = h->fields[i];
         h->values[i - 1] = h->values[i];
+        h->field_expire[i - 1] = h->field_expire[i];
     }
     h->len--;
     h->fields[h->len] = NULL;
     h->values[h->len] = NULL;
+    h->field_expire[h->len] = -1;
     /* The fields that moved down one slot need their dict indexes
        moved with them; re-indexing an existing field cannot fail. */
     for (size_t i = (size_t)idx; i < h->len; i++)
         hdict_set(h->dict, h->fields[i], i);
     return 1;
+}
+
+/* Remove every field whose expiry has passed. Returns the number
+   removed. Walked from the end so a removal never shifts the
+   indexes of the fields still to visit. */
+static int hash_purge_expired(Hash *h, long long now) {
+    int removed = 0;
+    for (long long i = (long long)h->len - 1; i >= 0; i--) {
+        if (h->field_expire[i] != -1 && now >= h->field_expire[i]) {
+            hash_remove(h, h->fields[i]);
+            removed++;
+        }
+    }
+    return removed;
+}
+
+/* Lazy field expiry for one hash entry: drop the fields whose time
+   is up, and delete the entry itself when its last field goes, as
+   in Redis. pp is the bucket link pointing at e. Returns 1 when
+   the entry was deleted, 0 otherwise. A purge that removes fields
+   is a real change, so it bumps the version and invalidates a
+   WATCH, exactly as a key expiring does. */
+static int entry_purge_expired_fields(Store *s, Entry *e, Entry **pp) {
+    if (e->type != ENTRY_HASH) return 0;
+    if (hash_purge_expired(e->hash, now_ms()) == 0) return 0;
+    if (e->hash->len == 0) {
+        *pp = e->next;
+        entry_free(e);
+        s->count--;
+        return 1;
+    }
+    entry_touch(s, e);
+    return 0;
 }
 
 static Set *set_new(void) {
@@ -979,7 +1030,11 @@ static void store_resize(Store *s) {
     s->cap = ncap;
 }
 
-/* Find entry; if found but expired, delete it and return NULL. */
+/* Find entry; if found but expired, delete it and return NULL.
+   A hash found here also has its expired fields purged first, so
+   every access — read, write, EXISTS, TYPE, TTL, WATCH — sees
+   only live fields, and a hash emptied by field expiry reads as
+   a missing key. */
 static Entry *store_find(Store *s, const char *key, Entry ***prev_out) {
     size_t idx = hash_key(key) % s->cap;
     Entry **prev = &s->buckets[idx];
@@ -992,6 +1047,9 @@ static Entry *store_find(Store *s, const char *key, Entry ***prev_out) {
                 s->count--;
                 return NULL;
             }
+            if (e->type == ENTRY_HASH &&
+                entry_purge_expired_fields(s, e, prev))
+                return NULL;
             if (prev_out) *prev_out = prev;
             return e;
         }
@@ -1831,6 +1889,12 @@ size_t store_expire_scan(Store *s, size_t sample_buckets) {
                 entry_free(e);
                 s->count--;
                 removed++;
+            } else if (e->type == ENTRY_HASH &&
+                       entry_purge_expired_fields(s, e, pp)) {
+                /* The hash lost its last field to expiry: the key
+                   is gone, so it counts as removed too. A purge
+                   that leaves fields behind only bumps the version. */
+                removed++;
             } else {
                 pp = &e->next;
             }
@@ -1878,6 +1942,10 @@ size_t store_keys_matching(Store *s, const char *pattern, char ***keys_out) {
                 *pp = next;
                 entry_free(e);
                 s->count--;
+            } else if (e->type == ENTRY_HASH &&
+                       entry_purge_expired_fields(s, e, pp)) {
+                /* The hash lost its last field to expiry, so the
+                   key is gone and matches nothing. */
             } else {
                 if (glob_match(pattern, e->key)) {
                     if (n >= cap) {
@@ -2456,11 +2524,14 @@ long long store_hset(Store *s, const char *key, const char *field,
     if (e) {
         if (e->type != ENTRY_HASH) return -1;
         /* A field set to the value it already holds changes nothing,
-           so it does not touch the version; a new field or a changed
-           value does. */
+           so it does not touch the version; a new field, a changed
+           value, or an overwritten field whose expiry is cleared by
+           the write does. */
         long long idx = hash_find(e->hash, field);
-        int changed = idx < 0 || strcmp(e->hash->values[idx], value) != 0;
-        int rc = hash_put(e->hash, field, value);
+        int had_expire = idx >= 0 && e->hash->field_expire[idx] != -1;
+        int changed = idx < 0 || strcmp(e->hash->values[idx], value) != 0 ||
+                      had_expire;
+        int rc = hash_put(e->hash, field, value, 1);
         if (rc < 0) return -2;
         if (changed) {
             e->last_access = ++s->clock;
@@ -2482,7 +2553,7 @@ long long store_hset(Store *s, const char *key, const char *field,
     e->expire_at = -1;
     e->last_access = ++s->clock;
     e->version = ++s->mod_seq;
-    if (hash_put(e->hash, field, value) < 0) {
+    if (hash_put(e->hash, field, value, 1) < 0) {
         entry_free(e);
         return -2;
     }
@@ -2594,7 +2665,7 @@ int store_hincrby(Store *s, const char *key, const char *field,
         *out = v;
         return 1;
     }
-    if (hash_put(e->hash, field, vbuf) < 0) return -4;
+    if (hash_put(e->hash, field, vbuf, 0) < 0) return -4;
     e->last_access = ++s->clock;
     entry_touch(s, e);
     *out = v;
@@ -2639,7 +2710,7 @@ int store_hincrbyfloat(Store *s, const char *key, const char *field,
         *out = v;
         return 1;
     }
-    if (hash_put(e->hash, field, vbuf) < 0) return -4;
+    if (hash_put(e->hash, field, vbuf, 0) < 0) return -4;
     e->last_access = ++s->clock;
     entry_touch(s, e);
     *out = v;
@@ -2695,6 +2766,87 @@ int store_hscan(Store *s, const char *key, unsigned long long cursor,
     *n_out = n;
     *next_out = (i >= h->len) ? 0 : (unsigned long long)i;
     return 0;
+}
+
+/* ---------- hash field TTLs ---------- */
+
+int store_hexpire_field(Store *s, const char *key, const char *field,
+                        long long expire_at, int cond) {
+    Entry **pp = NULL;
+    Entry *e = store_find(s, key, &pp);
+    if (!e) return -2;
+    if (e->type != ENTRY_HASH) return -1;
+    long long idx = hash_find(e->hash, field);
+    if (idx < 0) return -2;
+    long long cur = e->hash->field_expire[idx];
+    /* The NX / XX / GT / LT condition is checked first, against the
+       current expiry: a field with no expiry counts as an infinite
+       TTL, so GT never accepts it and LT always does. */
+    switch (cond) {
+    case HFIELD_EXPIRE_NX:
+        if (cur != -1) return 0;
+        break;
+    case HFIELD_EXPIRE_XX:
+        if (cur == -1) return 0;
+        break;
+    case HFIELD_EXPIRE_GT:
+        if (cur == -1 || expire_at <= cur) return 0;
+        break;
+    case HFIELD_EXPIRE_LT:
+        if (cur != -1 && expire_at >= cur) return 0;
+        break;
+    default:
+        break;
+    }
+    if (expire_at <= now_ms()) {
+        /* An expiry in the past deletes the field at once, as in
+           Redis (HEXPIRE with 0, HEXPIREAT with a past time). */
+        hash_remove(e->hash, field);
+        if (e->hash->len == 0) {
+            *pp = e->next;
+            entry_free(e);
+            s->count--;
+        } else {
+            e->last_access = ++s->clock;
+            entry_touch(s, e);
+        }
+        return 2;
+    }
+    if (cur == expire_at) {
+        /* The field already has exactly this expiry: nothing
+           changes, so no WATCH invalidation, but the command still
+           answers 1, as in Redis. */
+        return 1;
+    }
+    e->hash->field_expire[idx] = expire_at;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return 1;
+}
+
+long long store_hfield_ttl_ms(Store *s, const char *key, const char *field) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -2;
+    if (e->type != ENTRY_HASH) return -1;
+    long long idx = hash_find(e->hash, field);
+    if (idx < 0) return -2;
+    long long exp = e->hash->field_expire[idx];
+    if (exp == -1) return -1;
+    long long rem = exp - now_ms();
+    return rem < 0 ? -2 : rem;
+}
+
+int store_hfield_persist(Store *s, const char *key, const char *field) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -2;
+    if (e->type != ENTRY_HASH) return -1;
+    long long idx = hash_find(e->hash, field);
+    if (idx < 0) return -2;
+    if (e->hash->field_expire[idx] == -1) return -1;
+    e->hash->field_expire[idx] = -1;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return 1;
 }
 
 /* ---------- sorted sets ---------- */

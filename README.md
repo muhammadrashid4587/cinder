@@ -12,7 +12,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.62.0.
+Version 0.63.0.
 
 ## Why
 
@@ -117,6 +117,10 @@ OK
 | `HVALS key` | All field values (insertion order; empty array when missing) |
 | `HINCRBYFLOAT key field increment` | Add to a field's float value, creating the field and the key when missing; returns the new value; preserves the TTL; a non-float field is an error, an increment that would produce a non-finite result is an error, and a zero increment on an existing field changes nothing and is not logged |
 | `HSCAN key cursor [MATCH pattern] [COUNT n]` | Cursor-based iteration over a hash's fields: start at cursor `0`, repeat with the returned cursor until it comes back `0`; each call returns the next cursor and a flat `[field, value, ...]` array of matching pairs; `MATCH` filters field names with the same glob as `KEYS`, `COUNT` (default 10) is a hint for how many matching pairs to return per call |
+| `HEXPIRE key seconds [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]`, `HPEXPIRE key ms [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]` | Set a per-field expiry on one or more hash fields (seconds / milliseconds from now), with the `NX` / `XX` / `GT` / `LT` conditions (a field with no expiry counts as an infinite TTL for `GT` / `LT`); one integer reply per field: `1` the expiry was set, `0` the condition was not met, `-2` the key or the field does not exist, `2` the field was deleted at once (a zero TTL); a negative TTL is an error; overwriting a field with `HSET` clears its expiry, while `HINCRBY` / `HINCRBYFLOAT` keep it |
+| `HEXPIREAT key seconds [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]`, `HPEXPIREAT key ms [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]` | The same per-field expiry, as an absolute Unix time (seconds / milliseconds); an absolute time already past deletes the field at once and answers `2` per field, with the same per-field replies and conditions as `HEXPIRE` |
+| `HTTL key FIELDS numfields field [field ...]`, `HPTTL key FIELDS numfields field [field ...]` | Remaining TTL of one or more hash fields, in seconds / milliseconds; one integer reply per field: `-1` the field has no expiry, `-2` the key or the field does not exist |
+| `HPERSIST key FIELDS numfields field [field ...]` | Remove the expiry from one or more hash fields; one integer reply per field: `1` an expiry was removed, `-1` the field had none, `-2` the key or the field does not exist |
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZMSCORE key member [member ...]` | Scores of several members at once, in order (`nil` for a missing member, an array of `nil`s when the key is missing) |
@@ -162,7 +166,8 @@ src/
              sets (unordered member arrays, plus a member-to-index
              hash table for O(1) membership),
              hashes (parallel field/value arrays, insertion order,
-             plus a field-to-index hash table for O(1) lookup)
+             plus a field-to-index hash table for O(1) lookup and a
+             per-field expiry array for hash field TTLs)
              and sorted sets (skip list ordered by score then
              member, plus a member-to-node hash table for O(1)
              lookup), and HyperLogLogs (a string value with a
@@ -190,9 +195,12 @@ src/
              `INFO` reports `aof_pending_appends` and
              `aof_deferred_replies`
   rdb.c      RDB-style snapshots: `SAVE` writes the whole dataset (all
-             types, TTLs as absolute expiries) to `dump.rdb` in a compact
+             types, TTLs as absolute expiries, hash field TTLs as one
+             absolute expiry per field) to `dump.rdb` in a compact
              binary format, atomically via `dump.rdb.tmp` + rename; the
              snapshot is loaded on startup before the AOF is replayed;
+             format version 2, which a version 1 snapshot still loads
+             from (its hash fields just come back without a TTL);
              `rdb_serialize` renders the same bytes to memory so a
              worker thread can write them for `BGSAVE`
   threadpool.c FIFO job queue with N worker threads (`--threads`); jobs
@@ -201,6 +209,9 @@ src/
 
 - **Store**: chained hash table, doubling resize, lazy expiry on access plus
   a periodic scan of 20 random buckets per 100 event-loop iterations.
+  The same laziness covers hash field TTLs: a field whose expiry
+  passed is dropped on the next access to its key (and by the same
+  periodic scan), and the key goes when its last field does.
 - **Eviction**: Redis-style approximate LRU. When `--max-entries` is set, the
   server samples 5 entries and evicts the least recently used of the sample.
 - **Durability**: every mutating command is appended to `appendonly.aof` as a
@@ -250,7 +261,9 @@ src/
   connect, `PSYNC` sent when it completes) and the primary streams a full
   sync — `FLUSHALL` plus one rebuild command per key (`SET` with `PX` for
   TTL'd strings, `RPUSH`/`SADD`/`HSET` for the other types, `PEXPIRE` after
-  the rebuild; keys whose TTL already passed are left out) — followed by
+  the rebuild; keys whose TTL already passed are left out, and a hash
+  rebuild carries only its live fields, each with an absolute
+  `HPEXPIREAT` when it has a field TTL) — followed by
   a `+FULLSYNC` marker. After that, every mutating command the primary
   executes is forwarded verbatim (the raw RESP bytes) to all connected
   replicas. The replica applies streamed commands through the same
@@ -364,7 +377,28 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # errors, the TTL surviving an `HINCRBY`, `COMMAND`
             # listing all three, a real `HINCRBY` invalidating a
             # `WATCH` while a zero increment does not, and an
-            # `HINCRBY` surviving an AOF restart), sorted-set
+            # `HINCRBY` surviving an AOF restart), hash field TTL
+            # checks (`HEXPIRE` / `HPEXPIRE` / `HEXPIREAT` /
+            # `HPEXPIREAT` setting expiries and `HTTL` / `HPTTL`
+            # reading them back, `-2` for a missing key or field
+            # and `-1` for no expiry, wrong-type and wrong-argument
+            # errors, the `NX` / `XX` / `GT` / `LT` conditions
+            # including a field with no expiry counting as infinite
+            # for `GT` / `LT`, a zero TTL and a past absolute time
+            # deleting the field at once with reply `2`, lazy
+            # expiry hiding expired fields from `HGET` / `HLEN` /
+            # `HGETALL` / `HKEYS` / `HEXISTS` / `HTTL` and deleting
+            # the key when its last field goes, `HPERSIST` removing
+            # an expiry and `-1` when there was none, `HSET`
+            # clearing a field's TTL even for an identical value
+            # while `HINCRBY` / `HINCRBYFLOAT` keep it, a real
+            # `HEXPIRE` invalidating a `WATCH` while a condition
+            # not met does not, a field expiring after the `WATCH`
+            # aborting the `EXEC`, `COMMAND` listing all seven,
+            # an RDB snapshot carrying a field TTL and skipping an
+            # expired field, and a replication full sync carrying
+            # a field TTL while skipping an expired field, plus a
+            # streamed `HEXPIRE` landing on the replica), sorted-set
             # checks (multi-member add, score update, re-add with the
             # same score is a no-op, duplicate member in one call
             # takes the last score, bad-score error applies nothing,
@@ -1392,9 +1426,33 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       the logged command, so AOF replay and replication
       reproduce the same result.
 
-- [ ] Hash field TTLs (Redis 7.2): `HEXPIRE` / `HPEXPIRE` /
-      `HEXPIREAT` / `HPTTL` / `HTTL` / `HPERSIST` — per-field
-      expiries inside a hash, with the same lazy-expiry and
-      AOF/RDB/replication treatment as key TTLs, so a field whose
-      TTL passed reads as missing and an emptied hash deletes
-      its key
+- [x] Hash field TTLs (0.63.0): `HEXPIRE` / `HPEXPIRE` /
+      `HEXPIREAT` / `HPEXPIREAT` / `HTTL` / `HPTTL` / `HPERSIST` —
+      per-field expiries inside a hash, Redis 7.4 style, with the
+      same lazy-expiry and AOF/RDB/replication treatment as key
+      TTLs, so a field whose TTL passed reads as missing and an
+      emptied hash deletes its key. Each field carries its own
+      absolute expiry (ms); `HEXPIRE` / `HPEXPIRE` take a relative
+      TTL, `HEXPIREAT` / `HPEXPIREAT` an absolute Unix time, all
+      four accept the `NX` / `XX` / `GT` / `LT` conditions (a field
+      with no expiry counts as an infinite TTL for `GT` / `LT`),
+      and each answers one integer per field: `-2` the key or the
+      field does not exist, `0` the condition was not met, `1` the
+      expiry was set, `2` the field was deleted at once (a zero
+      relative TTL, or an absolute time already past). `HTTL` /
+      `HPTTL` answer the remaining TTL per field (`-1` no expiry,
+      `-2` missing), `HPERSIST` removes it (`1` removed, `-1` had
+      none, `-2` missing). Fields expire lazily on access and in
+      the periodic sweep, and either expiry invalidates a `WATCH`;
+      a set that changes nothing (a condition not met, a field
+      already holding exactly that expiry) neither logs nor
+      invalidates one. Overwriting a field with `HSET` clears that
+      field's expiry, as in Redis, while `HINCRBY` /
+      `HINCRBYFLOAT` keep it. Expiries are AOF-logged verbatim (so
+      a relative `HEXPIRE` / `HPEXPIRE` re-arms from replay time
+      after a restart, exactly as `EXPIRE` does — `HEXPIREAT` /
+      `HPEXPIREAT` replay exactly), carried in RDB snapshots
+      (format version 2; version 1 snapshots still load, their
+      fields just come back without a TTL), and streamed in the
+      replication full sync as absolute `HPEXPIREAT`s. All seven
+      are listed by `COMMAND`.

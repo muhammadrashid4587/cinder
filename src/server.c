@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -39,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.62.0"
+#define CINDER_VERSION "0.63.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -331,6 +332,24 @@ static size_t g_deferred_count; /* replies parked across all clients;
 static int repl_is_replica(void);
 static size_t repl_connected_replicas(void);
 static void repl_info_replicas(Dbuf *info);
+
+/* Parse the "FIELDS numfields field ..." tail of a hash-field TTL
+   command, starting at argv[i]. On success returns the number of
+   fields (>= 1) and *first_out is the index of the first field.
+   Returns -1 on a syntax error (no FIELDS keyword, or a count that
+   is not a positive integer) and -2 when the declared count does
+   not match the number of field arguments that follow. */
+static int parse_fields_tail(char **argv, int argc, int i, int *first_out) {
+    if (i >= argc || strcasecmp(argv[i], "FIELDS") != 0) return -1;
+    i++;
+    if (i >= argc) return -1;
+    long long n;
+    if (!parse_ll(argv[i], &n) || n < 1) return -1;
+    i++;
+    if (argc - i != n) return -2;
+    *first_out = i;
+    return (int)n;
+}
 
 static int dispatch(char **argv, int argc, Dbuf *reply) {
     const char *cmd = argv[0];
@@ -2156,6 +2175,182 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         free(pairs);
         return 0;
     }
+    if (strcasecmp(cmd, "HEXPIRE") == 0 || strcasecmp(cmd, "HPEXPIRE") == 0 ||
+        strcasecmp(cmd, "HEXPIREAT") == 0 || strcasecmp(cmd, "HPEXPIREAT") == 0) {
+        /* HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields field ...
+           HPEXPIRE is the same in milliseconds, HEXPIREAT /
+           HPEXPIREAT take an absolute Unix time instead of a
+           relative one. One integer reply per field, as in Redis:
+           -2 the key or the field does not exist, 0 the NX/XX/GT/LT
+           condition was not met, 1 the expiry was set, 2 the field
+           was deleted at once (a zero relative TTL, or an absolute
+           time already past). */
+        int is_ms = strcasecmp(cmd, "HPEXPIRE") == 0 ||
+                    strcasecmp(cmd, "HPEXPIREAT") == 0;
+        int is_abs = strcasecmp(cmd, "HEXPIREAT") == 0 ||
+                     strcasecmp(cmd, "HPEXPIREAT") == 0;
+        const char *lname = is_abs
+            ? (is_ms ? "hpexpireat" : "hexpireat")
+            : (is_ms ? "hpexpire" : "hexpire");
+        if (argc < 6) {
+            char msg[64];
+            snprintf(msg, sizeof(msg),
+                     "wrong number of arguments for '%s' command", lname);
+            return dbuf_error(reply, msg), 0;
+        }
+        long long t;
+        if (!parse_ll(argv[2], &t))
+            return dbuf_error(reply, "value is not an integer or out of range"), 0;
+        long long at;
+        if (is_abs) {
+            /* Absolute Unix time: seconds need the ms conversion,
+               which must not overflow. A past time is allowed — it
+               deletes the fields, as in Redis. */
+            if (!is_ms) {
+                if (t > LLONG_MAX / 1000) {
+                    char msg[64];
+                    snprintf(msg, sizeof(msg),
+                             "invalid expire time in '%s' command", lname);
+                    return dbuf_error(reply, msg), 0;
+                }
+                at = t * 1000;
+            } else {
+                at = t;
+            }
+        } else {
+            /* Relative: a negative TTL is an error, 0 deletes the
+               field. The addition must not overflow. */
+            if (t < 0) {
+                char msg[64];
+                snprintf(msg, sizeof(msg),
+                         "invalid expire time in '%s' command", lname);
+                return dbuf_error(reply, msg), 0;
+            }
+            long long delta;
+            if (!is_ms) {
+                if (t > LLONG_MAX / 1000) {
+                    char msg[64];
+                    snprintf(msg, sizeof(msg),
+                             "invalid expire time in '%s' command", lname);
+                    return dbuf_error(reply, msg), 0;
+                }
+                delta = t * 1000;
+            } else {
+                delta = t;
+            }
+            if (delta > LLONG_MAX - now_ms()) {
+                char msg[64];
+                snprintf(msg, sizeof(msg),
+                         "invalid expire time in '%s' command", lname);
+                return dbuf_error(reply, msg), 0;
+            }
+            at = now_ms() + delta;
+        }
+        /* At most one condition option, between the time and FIELDS;
+           a second one, or an unknown one, is a syntax error. */
+        int cond = HFIELD_EXPIRE_NONE;
+        int i = 3;
+        if (i < argc && (strcasecmp(argv[i], "NX") == 0 ||
+                         strcasecmp(argv[i], "XX") == 0 ||
+                         strcasecmp(argv[i], "GT") == 0 ||
+                         strcasecmp(argv[i], "LT") == 0)) {
+            if (strcasecmp(argv[i], "NX") == 0) cond = HFIELD_EXPIRE_NX;
+            else if (strcasecmp(argv[i], "XX") == 0) cond = HFIELD_EXPIRE_XX;
+            else if (strcasecmp(argv[i], "GT") == 0) cond = HFIELD_EXPIRE_GT;
+            else cond = HFIELD_EXPIRE_LT;
+            i++;
+            if (i < argc && (strcasecmp(argv[i], "NX") == 0 ||
+                             strcasecmp(argv[i], "XX") == 0 ||
+                             strcasecmp(argv[i], "GT") == 0 ||
+                             strcasecmp(argv[i], "LT") == 0))
+                return dbuf_error(reply, "syntax error"), 0;
+        }
+        int first = 0;
+        int nf = parse_fields_tail(argv, argc, i, &first);
+        if (nf == -1)
+            return dbuf_error(reply, "syntax error"), 0;
+        if (nf == -2) {
+            char msg[64];
+            snprintf(msg, sizeof(msg),
+                     "wrong number of arguments for '%s' command", lname);
+            return dbuf_error(reply, msg), 0;
+        }
+        /* Wrong type is an error before any field is considered,
+           even when every field is missing, as in Redis. */
+        int ht = store_type(g_store, argv[1]);
+        if (ht != 0 && ht != 4)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_array_header(reply, (long long)nf);
+        int changed = 0;
+        for (int k = 0; k < nf; k++) {
+            int rc = store_hexpire_field(g_store, argv[1], argv[first + k],
+                                         at, cond);
+            dbuf_int(reply, rc);
+            if (rc == 1 || rc == 2) changed = 1;
+        }
+        /* Only a real change is logged and replicated: a condition
+           that was not met, or a missing field, changes nothing. */
+        return changed ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "HTTL") == 0 || strcasecmp(cmd, "HPTTL") == 0) {
+        /* HTTL key FIELDS numfields field ... — one integer reply
+           per field: the remaining TTL (seconds for HTTL,
+           milliseconds for HPTTL), -1 when the field has no expiry,
+           -2 when the key or the field does not exist. */
+        int is_ms = strcasecmp(cmd, "HPTTL") == 0;
+        const char *lname = is_ms ? "hpttl" : "httl";
+        if (argc < 4) {
+            char msg[64];
+            snprintf(msg, sizeof(msg),
+                     "wrong number of arguments for '%s' command", lname);
+            return dbuf_error(reply, msg), 0;
+        }
+        int first = 0;
+        int nf = parse_fields_tail(argv, argc, 2, &first);
+        if (nf == -1)
+            return dbuf_error(reply, "syntax error"), 0;
+        if (nf == -2) {
+            char msg[64];
+            snprintf(msg, sizeof(msg),
+                     "wrong number of arguments for '%s' command", lname);
+            return dbuf_error(reply, msg), 0;
+        }
+        int ht = store_type(g_store, argv[1]);
+        if (ht != 0 && ht != 4)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_array_header(reply, (long long)nf);
+        for (int k = 0; k < nf; k++) {
+            long long ms = store_hfield_ttl_ms(g_store, argv[1],
+                                               argv[first + k]);
+            if (ms >= 0 && !is_ms) ms = ms / 1000;
+            dbuf_int(reply, ms);
+        }
+        return 0;
+    }
+    if (strcasecmp(cmd, "HPERSIST") == 0) {
+        /* HPERSIST key FIELDS numfields field ... — one integer reply
+           per field: 1 an expiry was removed, -1 the field had none,
+           -2 the key or the field does not exist. */
+        if (argc < 4)
+            return dbuf_error(reply, "wrong number of arguments for 'hpersist' command"), 0;
+        int first = 0;
+        int nf = parse_fields_tail(argv, argc, 2, &first);
+        if (nf == -1)
+            return dbuf_error(reply, "syntax error"), 0;
+        if (nf == -2)
+            return dbuf_error(reply, "wrong number of arguments for 'hpersist' command"), 0;
+        int ht = store_type(g_store, argv[1]);
+        if (ht != 0 && ht != 4)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        dbuf_array_header(reply, (long long)nf);
+        int changed = 0;
+        for (int k = 0; k < nf; k++) {
+            int rc = store_hfield_persist(g_store, argv[1], argv[first + k]);
+            dbuf_int(reply, rc);
+            if (rc == 1) changed = 1;
+        }
+        return changed ? 1 : 0;
+    }
     if (strcasecmp(cmd, "ZADD") == 0) {
         if (argc < 4)
             return dbuf_error(reply, "wrong number of arguments for 'zadd' command"), 0;
@@ -3727,6 +3922,8 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",
+            "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT",
+            "HTTL", "HPTTL", "HPERSIST",
             "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZINTER", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",
@@ -4488,17 +4685,40 @@ static int sync_emit_entry(const Entry *e, void *arg) {
         free(av);
     } else if (e->type == ENTRY_HASH) {
         Hash *h = e->hash;
-        if (h->len == 0) return 0;
-        char **av = malloc((2 + 2 * h->len) * sizeof(char *));
+        long long now = now_ms();
+        /* Only the fields still alive ride the rebuild: an expired
+           field is left out, as with a key whose TTL passed. A hash
+           with no live field left rebuilds nothing at all. */
+        size_t alive = 0;
+        for (size_t i = 0; i < h->len; i++)
+            if (h->field_expire[i] == -1 || h->field_expire[i] > now)
+                alive++;
+        if (alive == 0) return 0;
+        char **av = malloc((2 + 2 * alive) * sizeof(char *));
         if (!av) return 0;
         av[0] = "HSET";
         av[1] = (char *)e->key;
+        size_t j = 0;
         for (size_t i = 0; i < h->len; i++) {
-            av[2 + 2 * i] = h->fields[i];
-            av[3 + 2 * i] = h->values[i];
+            if (h->field_expire[i] != -1 && h->field_expire[i] <= now)
+                continue;
+            av[2 + 2 * j] = h->fields[i];
+            av[3 + 2 * j] = h->values[i];
+            j++;
         }
-        emit_resp_cmd(out, av, 2 + (int)(2 * h->len));
+        emit_resp_cmd(out, av, 2 + (int)(2 * alive));
         free(av);
+        /* Field TTLs ride as absolute HPEXPIREATs, so the replica's
+           fields die at the same instant as the primary's. */
+        for (size_t i = 0; i < h->len; i++) {
+            if (h->field_expire[i] == -1 || h->field_expire[i] <= now)
+                continue;
+            char msbuf[32];
+            snprintf(msbuf, sizeof(msbuf), "%lld", h->field_expire[i]);
+            char *av2[] = {"HPEXPIREAT", (char *)e->key, msbuf,
+                           "FIELDS", "1", h->fields[i]};
+            emit_resp_cmd(out, av2, 6);
+        }
     } else if (e->type == ENTRY_ZSET) {
         ZSet *z = e->zset;
         if (z->len == 0) return 0;
