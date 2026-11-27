@@ -889,6 +889,50 @@ int store_xreadgroup(Store *s, const char *key, const char *group,
    memory, -3 = no such key or consumer group. */
 long long store_xack(Store *s, const char *key, const char *group,
                      const uint64_t *ms, const uint64_t *seq, size_t n);
+/* One pending entry as XPENDING reports it: the entry ID, the
+   consumer it was last delivered to, how long (ms) since it was
+   last delivered, and how many times it has been delivered. */
+typedef struct StreamPendingInfo {
+    uint64_t ms, seq;
+    char *consumer; /* owned */
+    long long idle_ms;
+    long long delivery_count;
+} StreamPendingInfo;
+void stream_pending_info_free(StreamPendingInfo *infos, size_t n);
+/* One consumer's share of a group's pending entries, as the
+   XPENDING summary reports it. */
+typedef struct StreamConsumerCount {
+    char *consumer; /* owned */
+    long long count;
+} StreamConsumerCount;
+void stream_consumer_counts_free(StreamConsumerCount *counts, size_t n);
+/* XPENDING summary: the group's pending entries at a glance. On
+   success *total_out is the PEL size, (min_ms, min_seq) and
+   (max_ms, max_seq) are the lowest and highest pending IDs (0-0
+   when the PEL is empty), and *counts_out is an array of
+   per-consumer counts, in the order the consumers first read,
+   leaving out consumers with nothing pending; free it with
+   stream_consumer_counts_free. Returns 0 on success, -1 = the key
+   holds a non-stream value, -2 = out of memory, -3 = no such key
+   or consumer group. A read, so it changes nothing but the key's
+   last-access clock. */
+int store_xpending_summary(Store *s, const char *key, const char *group,
+                           long long *total_out, uint64_t *min_ms,
+                           uint64_t *min_seq, uint64_t *max_ms,
+                           uint64_t *max_seq,
+                           StreamConsumerCount **counts_out,
+                           size_t *ncounts_out);
+/* XPENDING range: the pending entries with IDs in [start, end]
+   inclusive, in ID order, at most count of them (count < 0 means
+   no limit), optionally only those delivered to `consumer` (NULL
+   means all). The returned entries are copies owned by the
+   caller; free them with stream_pending_info_free. Same return
+   codes as store_xpending_summary, and likewise a read. */
+int store_xpending_range(Store *s, const char *key, const char *group,
+                         uint64_t start_ms, uint64_t start_seq,
+                         uint64_t end_ms, uint64_t end_seq,
+                         long long count, const char *consumer,
+                         StreamPendingInfo **infos_out, size_t *n_out);
 /* Visit every entry of a stream in ID order. Returns 0 on success,
    -1 = wrong type (or no such key, which the caller can treat the
    same way: no entries are visited). The callback receives each

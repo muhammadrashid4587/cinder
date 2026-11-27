@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.68.0"
+#define CINDER_VERSION "0.69.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2534,6 +2534,96 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         dbuf_int(reply, removed);
         return removed > 0 ? 1 : 0;
     }
+    if (strcasecmp(cmd, "XPENDING") == 0) {
+        /* XPENDING key group: the summary — how many entries are
+           pending, the lowest and highest pending IDs, and a
+           per-consumer count. XPENDING key group start end count
+           [consumer]: the pending entries in that ID range, each
+           as [id, consumer, idle-ms, deliveries], optionally only
+           the ones delivered to one consumer. Read-only, so
+           nothing is logged or replicated, and it is safe to run
+           on a replica. */
+        if (argc != 3 && argc != 6 && argc != 7)
+            return dbuf_error(reply, "wrong number of arguments for 'xpending' command"), 0;
+        if (argc == 3) {
+            long long total = 0;
+            uint64_t min_ms = 0, min_seq = 0, max_ms = 0, max_seq = 0;
+            StreamConsumerCount *counts = NULL;
+            size_t ncounts = 0;
+            int rc = store_xpending_summary(g_store, argv[1], argv[2],
+                                            &total, &min_ms, &min_seq,
+                                            &max_ms, &max_seq,
+                                            &counts, &ncounts);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == -2)
+                return dbuf_error(reply, "out of memory"), 0;
+            if (rc == -3) {
+                dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", argv[1], argv[2]);
+                return 0;
+            }
+            dbuf_array_header(reply, 4);
+            dbuf_int(reply, total);
+            if (total > 0) {
+                char idbuf[48];
+                snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                         (unsigned long long)min_ms,
+                         (unsigned long long)min_seq);
+                dbuf_bulk(reply, idbuf, strlen(idbuf));
+                snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                         (unsigned long long)max_ms,
+                         (unsigned long long)max_seq);
+                dbuf_bulk(reply, idbuf, strlen(idbuf));
+            } else {
+                dbuf_null(reply);
+                dbuf_null(reply);
+            }
+            dbuf_array_header(reply, (long long)ncounts);
+            for (size_t k = 0; k < ncounts; k++) {
+                dbuf_array_header(reply, 2);
+                dbuf_bulk(reply, counts[k].consumer,
+                          strlen(counts[k].consumer));
+                dbuf_int(reply, counts[k].count);
+            }
+            stream_consumer_counts_free(counts, ncounts);
+            return 0;
+        }
+        uint64_t start_ms, start_seq, end_ms, end_seq;
+        if (stream_parse_bound(argv[3], 0, &start_ms, &start_seq) != 0 ||
+            stream_parse_bound(argv[4], 1, &end_ms, &end_seq) != 0)
+            return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
+        long long count = 0;
+        if (!parse_ll(argv[5], &count) || count < 1)
+            return dbuf_error(reply, "COUNT must be a positive integer"), 0;
+        const char *consumer = argc == 7 ? argv[6] : NULL;
+        StreamPendingInfo *infos = NULL;
+        size_t n = 0;
+        int rc = store_xpending_range(g_store, argv[1], argv[2],
+                                      start_ms, start_seq, end_ms, end_seq,
+                                      count, consumer, &infos, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == -3) {
+            dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", argv[1], argv[2]);
+            return 0;
+        }
+        dbuf_array_header(reply, (long long)n);
+        for (size_t k = 0; k < n; k++) {
+            char idbuf[48];
+            snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                     (unsigned long long)infos[k].ms,
+                     (unsigned long long)infos[k].seq);
+            dbuf_array_header(reply, 4);
+            dbuf_bulk(reply, idbuf, strlen(idbuf));
+            dbuf_bulk(reply, infos[k].consumer, strlen(infos[k].consumer));
+            dbuf_int(reply, infos[k].idle_ms);
+            dbuf_int(reply, infos[k].delivery_count);
+        }
+        stream_pending_info_free(infos, n);
+        return 0;
+    }
     if (strcasecmp(cmd, "HSET") == 0) {
         if (argc < 4 || (argc % 2) != 0)
             return dbuf_error(reply, "wrong number of arguments for 'hset' command"), 0;
@@ -4518,7 +4608,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT",
             "HTTL", "HPTTL", "HPERSIST",
             "XADD", "XRANGE", "XREVRANGE", "XLEN", "XREAD",
-            "XGROUP", "XREADGROUP", "XACK",
+            "XGROUP", "XREADGROUP", "XACK", "XPENDING",
             "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZINTER", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",

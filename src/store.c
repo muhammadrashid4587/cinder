@@ -4794,6 +4794,132 @@ long long store_xack(Store *s, const char *key, const char *group,
     return removed;
 }
 
+void stream_pending_info_free(StreamPendingInfo *infos, size_t n) {
+    if (!infos) return;
+    for (size_t i = 0; i < n; i++) free(infos[i].consumer);
+    free(infos);
+}
+
+void stream_consumer_counts_free(StreamConsumerCount *counts, size_t n) {
+    if (!counts) return;
+    for (size_t i = 0; i < n; i++) free(counts[i].consumer);
+    free(counts);
+}
+
+int store_xpending_summary(Store *s, const char *key, const char *group,
+                           long long *total_out, uint64_t *min_ms,
+                           uint64_t *min_seq, uint64_t *max_ms,
+                           uint64_t *max_seq,
+                           StreamConsumerCount **counts_out,
+                           size_t *ncounts_out) {
+    *counts_out = NULL;
+    *ncounts_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    Stream *st = e->stream;
+    StreamGroup *g = stream_group_find(st, group);
+    if (!g) return -3;
+    e->last_access = ++s->clock;
+    *total_out = (long long)g->npel;
+    /* The PEL is kept in ID order, so the first and last entries
+       are the lowest and highest pending IDs. */
+    if (g->npel > 0) {
+        *min_ms = g->pel[0].ms;
+        *min_seq = g->pel[0].seq;
+        *max_ms = g->pel[g->npel - 1].ms;
+        *max_seq = g->pel[g->npel - 1].seq;
+    } else {
+        *min_ms = *min_seq = *max_ms = *max_seq = 0;
+    }
+    /* Per-consumer counts, in the order the consumers first read,
+       leaving out consumers with nothing pending. */
+    StreamConsumerCount *counts = NULL;
+    size_t n = 0, cap = 0;
+    for (size_t ci = 0; ci < g->nconsumers; ci++) {
+        long long c = 0;
+        for (size_t i = 0; i < g->npel; i++)
+            if (strcmp(g->pel[i].consumer, g->consumers[ci]) == 0) c++;
+        if (c == 0) continue;
+        if (n == cap) {
+            size_t ncap = cap ? cap * 2 : 4;
+            StreamConsumerCount *nc =
+                realloc(counts, ncap * sizeof(*nc));
+            if (!nc) {
+                stream_consumer_counts_free(counts, n);
+                return -2;
+            }
+            counts = nc;
+            cap = ncap;
+        }
+        counts[n].consumer = strdup(g->consumers[ci]);
+        if (!counts[n].consumer) {
+            stream_consumer_counts_free(counts, n);
+            return -2;
+        }
+        counts[n].count = c;
+        n++;
+    }
+    *counts_out = counts;
+    *ncounts_out = n;
+    return 0;
+}
+
+int store_xpending_range(Store *s, const char *key, const char *group,
+                         uint64_t start_ms, uint64_t start_seq,
+                         uint64_t end_ms, uint64_t end_seq,
+                         long long count, const char *consumer,
+                         StreamPendingInfo **infos_out, size_t *n_out) {
+    *infos_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    Stream *st = e->stream;
+    StreamGroup *g = stream_group_find(st, group);
+    if (!g) return -3;
+    e->last_access = ++s->clock;
+    long long now = now_ms();
+    StreamPendingInfo *infos = NULL;
+    size_t n = 0, cap = 0;
+    /* The PEL is in ID order, so the scan can stop at the first
+       entry past the end bound. */
+    for (size_t i = 0; i < g->npel; i++) {
+        StreamPending *p = &g->pel[i];
+        if (p->ms < start_ms ||
+            (p->ms == start_ms && p->seq < start_seq))
+            continue;
+        if (p->ms > end_ms || (p->ms == end_ms && p->seq > end_seq))
+            break;
+        if (consumer && strcmp(p->consumer, consumer) != 0) continue;
+        if (count >= 0 && (long long)n >= count) break;
+        if (n == cap) {
+            size_t ncap = cap ? cap * 2 : 8;
+            StreamPendingInfo *ni = realloc(infos, ncap * sizeof(*ni));
+            if (!ni) {
+                stream_pending_info_free(infos, n);
+                return -2;
+            }
+            infos = ni;
+            cap = ncap;
+        }
+        infos[n].ms = p->ms;
+        infos[n].seq = p->seq;
+        infos[n].consumer = strdup(p->consumer);
+        if (!infos[n].consumer) {
+            stream_pending_info_free(infos, n);
+            return -2;
+        }
+        long long idle = now - p->delivery_time;
+        infos[n].idle_ms = idle < 0 ? 0 : idle;
+        infos[n].delivery_count = p->delivery_count;
+        n++;
+    }
+    *infos_out = infos;
+    *n_out = n;
+    return 0;
+}
+
 void stream_entries_free(StreamEntry *entries, size_t n) {
     if (!entries) return;
     for (size_t i = 0; i < n; i++) stream_entry_free(&entries[i]);

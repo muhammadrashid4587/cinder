@@ -1451,9 +1451,51 @@ def main():
               ("error", "ERR NOGROUP No such key 'nope' or consumer group 'g1'"))
         check("XACK bad id", c.cmd("XACK", "xg", "g1", "abc"),
               ("error", "ERR Invalid stream ID specified as stream command argument"))
-        check("COMMAND lists XGROUP XREADGROUP XACK",
+        # XPENDING: the summary and the extended per-entry form.
+        # At this point g1 has one pending entry (2000-1, delivered
+        # once to c1) and so does g2; the idle time is
+        # timing-dependent, so the extended reply is checked field
+        # by field instead of by exact equality.
+        check("XPENDING summary", c.cmd("XPENDING", "xg", "g1"),
+              [1, "2000-1", "2000-1", [["c1", 1]]])
+        check("XPENDING summary other group", c.cmd("XPENDING", "xg", "g2"),
+              [1, "2000-1", "2000-1", [["c1", 1]]])
+        pend = c.cmd("XPENDING", "xg", "g1", "-", "+", "10")
+        check("XPENDING extended one entry", len(pend), 1)
+        check("XPENDING extended id", pend[0][0], "2000-1")
+        check("XPENDING extended consumer", pend[0][1], "c1")
+        check("XPENDING extended idle non-negative",
+              isinstance(pend[0][2], int) and pend[0][2] >= 0, True)
+        check("XPENDING extended deliveries", pend[0][3], 1)
+        check("XPENDING extended count limit",
+              len(c.cmd("XPENDING", "xg", "g1", "-", "+", "1")), 1)
+        check("XPENDING extended range empty",
+              c.cmd("XPENDING", "xg", "g1", "1000-0", "1000-9", "10"), [])
+        check("XPENDING extended this consumer",
+              len(c.cmd("XPENDING", "xg", "g1", "-", "+", "10", "c1")), 1)
+        check("XPENDING extended other consumer",
+              c.cmd("XPENDING", "xg", "g1", "-", "+", "10", "c2"), [])
+        check("XPENDING empty group create",
+              c.cmd("XGROUP", "CREATE", "xg", "g3", "$"), "OK")
+        check("XPENDING empty summary", c.cmd("XPENDING", "xg", "g3"),
+              [0, None, None, []])
+        check("XPENDING empty extended",
+              c.cmd("XPENDING", "xg", "g3", "-", "+", "10"), [])
+        check("XPENDING nogroup", c.cmd("XPENDING", "xg", "zz"),
+              ("error", "ERR NOGROUP No such key 'xg' or consumer group 'zz'"))
+        check("XPENDING missing key", c.cmd("XPENDING", "nope", "g1"),
+              ("error", "ERR NOGROUP No such key 'nope' or consumer group 'g1'"))
+        check("XPENDING wrongtype", c.cmd("XPENDING", "after", "g1"),
+              wrongtype)
+        check("XPENDING bad id", c.cmd("XPENDING", "xg", "g1", "abc", "+", "10"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XPENDING bad count", c.cmd("XPENDING", "xg", "g1", "-", "+", "0"),
+              ("error", "ERR COUNT must be a positive integer"))
+        check("XPENDING wrong args", c.cmd("XPENDING", "xg"),
+              ("error", "ERR wrong number of arguments for 'xpending' command"))
+        check("COMMAND lists XGROUP XREADGROUP XACK XPENDING",
               "XGROUP" in c.cmd("COMMAND") and "XREADGROUP" in c.cmd("COMMAND")
-              and "XACK" in c.cmd("COMMAND"), True)
+              and "XACK" in c.cmd("COMMAND") and "XPENDING" in c.cmd("COMMAND"), True)
         check("XGROUP cleanup", c.cmd("DEL", "xg", "xgm"), 2)
         # Sorted sets: add/update, scores, wrong type, TTL, AOF
         # persistence. Members are ordered by (score, member); range
@@ -3377,7 +3419,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.68.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.69.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
