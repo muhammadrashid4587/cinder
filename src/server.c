@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.55.0"
+#define CINDER_VERSION "0.56.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1231,6 +1231,25 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             return dbuf_error(reply, "WRONGTYPE Key is not a valid HyperLogLog string value."), 0;
         dbuf_int(reply, est);
         return 0;
+    }
+    if (strcasecmp(cmd, "PFMERGE") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'pfmerge' command"), 0;
+        int changed = 0;
+        int rc = store_pfmerge(g_store, argv[1], (const char **)(argv + 2),
+                               argc - 2, &changed);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == -3)
+            return dbuf_error(reply, "WRONGTYPE Key is not a valid HyperLogLog string value."), 0;
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_simple(reply, "OK");
+        /* Only a real change is logged and replicated: a PFMERGE
+           that reproduces the destination exactly changes nothing,
+           like a no-op PFADD, so it is not logged, not replicated,
+           and does not invalidate a WATCH. */
+        return changed ? 1 : 0;
     }
     if (strcasecmp(cmd, "HSET") == 0) {
         if (argc < 4 || (argc % 2) != 0)
@@ -3030,7 +3049,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "LINDEX", "LSET", "LINSERT", "LPUSHX", "RPUSHX", "LTRIM",
             "LMOVE",
             "SADD", "SREM", "SMEMBERS", "SSCAN", "SISMEMBER", "SCARD",
-            "PFADD", "PFCOUNT",
+            "PFADD", "PFCOUNT", "PFMERGE",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",

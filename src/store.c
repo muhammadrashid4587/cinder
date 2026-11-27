@@ -3623,3 +3623,62 @@ int store_pfcount(Store *s, const char **keys, int nkeys, long long *out) {
     free(merged);
     return 0;
 }
+
+int store_pfmerge(Store *s, const char *dest, const char **sources,
+                  int nsources, int *changed_out) {
+    /* The destination's own registers, when it already holds a
+       HyperLogLog: the merge is compared against them afterwards,
+       so reproducing dest exactly is a no-op. A plain string or a
+       non-string at dest is an error, never a silent overwrite. */
+    Entry *de = store_find(s, dest, NULL);
+    unsigned char *dregs = NULL;
+    if (de) {
+        if (de->type != ENTRY_STRING) return -1;
+        dregs = hll_regs(de);
+        if (!dregs) return -3;
+    }
+    unsigned char *merged = calloc(HLL_REGISTERS, 1);
+    if (!merged) return -2;
+    for (int k = 0; k < nsources; k++) {
+        Entry *e = store_find(s, sources[k], NULL);
+        if (!e) continue; /* missing counts as empty */
+        if (e->type != ENTRY_STRING) {
+            free(merged);
+            return -1;
+        }
+        unsigned char *regs = hll_regs(e);
+        if (!regs) {
+            free(merged);
+            return -3;
+        }
+        e->last_access = ++s->clock;
+        for (size_t i = 0; i < HLL_REGISTERS; i++)
+            if (regs[i] > merged[i]) merged[i] = regs[i];
+    }
+    if (dregs && memcmp(merged, dregs, HLL_REGISTERS) == 0) {
+        /* The merge reproduces dest exactly: change nothing, so
+           the version (and WATCH) and the AOF are untouched. */
+        free(merged);
+        *changed_out = 0;
+        return 0;
+    }
+    char *buf = malloc(HLL_LEN);
+    if (!buf) {
+        free(merged);
+        return -2;
+    }
+    memcpy(buf, HLL_MAGIC, 4);
+    memcpy(buf + 4, merged, HLL_REGISTERS);
+    free(merged);
+    /* store_set_len with expire_at -1 clears the TTL, as in Redis,
+       and stamps the new version; it also replaces any string
+       value wholesale, which is exactly the overwrite PFMERGE
+       needs (the type checks above already rejected the rest). */
+    if (!store_set_len(s, dest, buf, HLL_LEN, -1)) {
+        free(buf);
+        return -2;
+    }
+    free(buf);
+    *changed_out = 1;
+    return 0;
+}

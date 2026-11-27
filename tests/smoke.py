@@ -1835,6 +1835,45 @@ def main():
               1425 <= c.cmd("PFCOUNT", "hll1", "hll2") <= 1575, True)
         check("PFCOUNT union with missing", c.cmd("PFCOUNT", "hll1", "ghosthll"),
               c.cmd("PFCOUNT", "hll1"))
+        # PFMERGE: the registers merge by maximum into the
+        # destination, which is created when missing and overwritten
+        # when it exists; a missing source counts as empty, and a
+        # merge that reproduces the destination exactly is a no-op.
+        check("PFADD mhll1", c.cmd("PFADD", "mhll1", "a", "b", "c"), 1)
+        check("PFADD mhll2", c.cmd("PFADD", "mhll2", "c", "d", "e"), 1)
+        check("PFMERGE new dest", c.cmd("PFMERGE", "mdest", "mhll1", "mhll2"), "OK")
+        check("PFCOUNT merged five", c.cmd("PFCOUNT", "mdest"), 5)
+        check("PFMERGE dest length", c.cmd("STRLEN", "mdest"), 16388)
+        check("PFMERGE sources untouched", c.cmd("PFCOUNT", "mhll1"), 3)
+        check("PFMERGE missing source", c.cmd("PFMERGE", "mdest2", "mhll1", "ghosthll"), "OK")
+        check("PFCOUNT merged missing source", c.cmd("PFCOUNT", "mdest2"), 3)
+        check("PFMERGE all missing", c.cmd("PFMERGE", "mdest3", "ghosthll", "ghosthll2"), "OK")
+        check("PFCOUNT merged all missing", c.cmd("PFCOUNT", "mdest3"), 0)
+        check("PFMERGE no sources", c.cmd("PFMERGE", "mdest"),
+              ("error", "ERR wrong number of arguments for 'pfmerge' command"))
+        # A plain string at the destination or a source is an error,
+        # as is a list key at either end.
+        check("PFMERGE plain string dest", c.cmd("PFMERGE", "after", "mhll1"),
+              ("error", "ERR WRONGTYPE Key is not a valid HyperLogLog string value."))
+        check("PFMERGE plain string source", c.cmd("PFMERGE", "mdest4", "after"),
+              ("error", "ERR WRONGTYPE Key is not a valid HyperLogLog string value."))
+        check("PFMERGE list dest", c.cmd("PFMERGE", "plist", "mhll1"), wrongtype)
+        check("PFMERGE list source", c.cmd("PFMERGE", "mdest4", "plist"), wrongtype)
+        # Merging a destination into itself changes nothing, and a
+        # merge that reproduces the destination does not invalidate
+        # a WATCH; overwriting a destination clears its TTL.
+        check("PFMERGE into itself noop", c.cmd("PFMERGE", "mdest", "mdest"), "OK")
+        check("WATCH mdest", c.cmd("WATCH", "mdest"), "OK")
+        check("PFMERGE mdest noop", c.cmd("PFMERGE", "mdest", "mhll1", "mhll2"), "OK")
+        check("MULTI mdest noop", c.cmd("MULTI"), "OK")
+        check("MULTI mdest noop SET queued", c.cmd("SET", "wtestkey3", "v1"), "QUEUED")
+        check("EXEC mdest noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("wtestkey3 after mdest noop EXEC", c.cmd("GET", "wtestkey3"), "v1")
+        check("PFMERGE TTL setup", c.cmd("EXPIRE", "mdest", "100"), 1)
+        check("PFMERGE overwrite clears TTL", c.cmd("PFMERGE", "mdest", "mhll2"), "OK")
+        check("TTL cleared by PFMERGE", c.cmd("TTL", "mdest"), -1)
+        check("PFCOUNT mdest after overwrite", c.cmd("PFCOUNT", "mdest"), 3)
+        check("COMMAND lists PFMERGE", "PFMERGE" in c.cmd("COMMAND"), True)
         check("COMMAND lists PFADD", "PFADD" in c.cmd("COMMAND"), True)
         check("COMMAND lists PFCOUNT", "PFCOUNT" in c.cmd("COMMAND"), True)
         # A PFADD that moves no register does not invalidate a WATCH;
@@ -1853,11 +1892,19 @@ def main():
         check("EXEC hllwatch change watch aborts", c.cmd("EXEC"), None)
         check("wtestkey2 unchanged after hllwatch abort", c.cmd("GET", "wtestkey2"), "v1")
         # phll stays: the AOF restart below proves a HyperLogLog
-        # survives a SHUTDOWN and reload. Everything else is cleaned
-        # up so the restart still sees its expected key count.
-        check("PFADD phll", c.cmd("PFADD", "phll", "a", "b", "c"), 1)
+        # survives a SHUTDOWN and reload — and phll is itself the
+        # product of a PFMERGE, so the restart also proves a merged
+        # HyperLogLog replays from the AOF byte-identically.
+        # Everything else is cleaned up so the restart still sees
+        # its expected key count.
+        check("PFADD phll1", c.cmd("PFADD", "phll1", "a", "b"), 1)
+        check("PFADD phll2", c.cmd("PFADD", "phll2", "b", "c"), 1)
+        check("PFMERGE phll", c.cmd("PFMERGE", "phll", "phll1", "phll2"), "OK")
+        check("PFCOUNT phll merged", c.cmd("PFCOUNT", "phll"), 3)
         check("HLL cleanup", c.cmd("DEL", "hll", "hlldup", "hll1", "hll2",
-                                    "hllwatch", "wtestkey2"), 6)
+                                    "hllwatch", "wtestkey2", "mhll1", "mhll2",
+                                    "mdest", "mdest2", "mdest3", "wtestkey3",
+                                    "phll1", "phll2"), 14)
         check("ZREMRANGEBYLEX wrongtype", c.cmd("ZREMRANGEBYLEX", "after", "-", "+"),
               wrongtype)
         check("COMMAND lists ZREMRANGEBYLEX", "ZREMRANGEBYLEX" in c.cmd("COMMAND"), True)
@@ -2580,7 +2627,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.55.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.56.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

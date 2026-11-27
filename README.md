@@ -2,7 +2,7 @@
 
 A Redis-compatible in-memory key-value store, written in C from scratch.
 Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, lists,
-sets, hashes, sorted sets and HyperLogLog (`PFADD`/`PFCOUNT`) with TTLs, approximate LRU eviction, and an append-only file for
+sets, hashes, sorted sets and HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`) with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
 flush thread that does the once-a-second AOF sync under `everysec`,
@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.55.0.
+Version 0.56.0.
 
 ## Why
 
@@ -91,6 +91,7 @@ OK
 | `SCARD key` | Set size (`0` when missing) |
 | `PFADD key element [element ...]` | Add elements to the HyperLogLog at `key`, creating it when missing; returns `1` when a register changed, `0` when every element hashed into a register that already held at least that value; a plain string key is an error (`WRONGTYPE Key is not a valid HyperLogLog string value.`), as is any non-string key; preserves the TTL |
 | `PFCOUNT key [key ...]` | Estimate the cardinality of the union of the HyperLogLogs at `key` (or several keys, merged register-wise); a missing key counts as empty (`0` for no keys at all); a plain string or non-string key is an error, as for `PFADD` |
+| `PFMERGE destkey sourcekey [sourcekey ...]` | Merge the HyperLogLogs at `sourcekey` into `destkey` (registers merged by maximum), creating it when missing and overwriting it when it exists (its TTL is cleared); a missing source counts as empty, so merging only missing sources creates an empty HyperLogLog; sources are never modified, and the destination may itself be a source; a plain string or non-string key at either end is an error, as for `PFADD`; a merge that reproduces the destination exactly changes nothing, so it is not logged, not replicated, and does not invalidate a `WATCH` |
 | `HSET key field value [field value ...]` | Set fields; returns number of new fields (updates return `0` for that field) |
 | `MULTI`, `EXEC`, `DISCARD` | Transactions: `MULTI` queues commands (`+QUEUED` per command, nested `MULTI` is an error), `EXEC` runs the queue in order and returns one reply per command (an error inside the transaction takes its place in the array and the rest still run), `DISCARD` drops the queue; `EXEC`/`DISCARD` without `MULTI` are errors. Queued writes are invisible to other clients until `EXEC` runs, and the commands `EXEC` runs are AOF-logged and replicated individually, never `MULTI`/`EXEC` themselves |
 | `WATCH key [key ...]`, `UNWATCH` | Optimistic locking for `MULTI`/`EXEC`: `WATCH` records the version each key has right now (0 when it does not exist); if any watched key is created, modified, deleted, expired, or flushed away before `EXEC`, `EXEC` aborts with a nil array and the queue never runs. `UNWATCH` clears the watch set, as do `EXEC` and `DISCARD`; `WATCH` inside `MULTI` is an error, while `UNWATCH` inside `MULTI` queues and runs at `EXEC`, as in real Redis. A write that changes nothing (SADD of a member already present, HSET of an identical value) does not invalidate a watch. Limitation: a watched key that did not exist, was created and deleted again before `EXEC`, reads as version 0 again, so the abort is not detected — the version scheme cannot see a create-plus-delete round trip |
@@ -395,7 +396,16 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # 5% and a 1500-element union of two overlapping sets
             # within 5%, a no-op `PFADD` not invalidating a `WATCH`
             # while a changing one does, and `COMMAND` listing
-            # both), and
+            # both), and `PFMERGE` checks (merging two HyperLogLogs
+            # into a new destination counts the union, sources are
+            # untouched, a missing source counts as empty and
+            # merging only missing sources creates an empty
+            # destination, a plain string or list key errors at
+            # either end, merging a destination into itself is a
+            # no-op that does not invalidate a `WATCH`, overwriting
+            # a destination clears its TTL, and `COMMAND` lists
+            # it; the HyperLogLog that survives the AOF restart is
+            # itself the product of a `PFMERGE`), and
             # an AOF
             # restart test (data, a list, a set, a hash, a sorted set and a HyperLogLog survive a
             # SHUTDOWN and reload), and everysec-policy checks (INFO
@@ -1180,4 +1190,10 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       maximum), with linear counting for small ranges, and a
       missing key counts as empty. A plain string key is an error
       (`WRONGTYPE Key is not a valid HyperLogLog string value.`),
-      as is any non-string key. Not yet shipped: `PFMERGE`.
+      as is any non-string key. Second slice (0.56.0): `PFMERGE`,
+      which merges the registers of one or more sources into a
+      destination by maximum, creating it when missing and
+      overwriting it (TTL cleared) when it exists; a missing source
+      counts as empty, sources are never modified, and a merge that
+      reproduces the destination exactly is a no-op, like a no-op
+      `PFADD`.

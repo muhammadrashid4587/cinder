@@ -612,5 +612,19 @@ int store_pfadd(Store *s, const char *key, const char **elems, int nelems,
    estimate), -1 = a key holds a non-string, -2 = out of memory,
    -3 = a key holds a string that is not a valid HyperLogLog value. */
 int store_pfcount(Store *s, const char **keys, int nkeys, long long *out);
+/* Merge the HyperLogLogs at sources into dest (element-wise maximum
+   of the registers), creating dest when missing and overwriting it
+   when it exists — its TTL is cleared, as in Redis. A missing
+   source counts as empty, so merging only missing sources creates
+   an empty HyperLogLog at dest; sources are never modified, and
+   dest may itself be one of the sources. Returns 0 on success
+   (*changed_out is 1 when dest was created or its registers
+   changed, 0 when the merge reproduces dest exactly), -1 = dest
+   or a source holds a non-string, -2 = out of memory, -3 = dest or
+   a source holds a string that is not a valid HyperLogLog value.
+   A call that changes nothing touches neither the version (so
+   WATCH survives it) nor the AOF. */
+int store_pfmerge(Store *s, const char *dest, const char **sources,
+                  int nsources, int *changed_out);
 
 #endif
