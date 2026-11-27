@@ -1788,7 +1788,7 @@ def main():
         check("ZDIFFSTORE dest is input range", c.cmd("ZRANGE", "dfzset1", "0", "-1", "WITHSCORES"),
               ["a", "1", "e", "5"])
         check("ZDIFFSTORE cleanup", c.cmd("DEL", "dfzset1", "dfzset2", "dfdest", "strdest3", "wtestkey"), 5)
-        # Deleted again: the AOF restart below counts exactly 9 keys.
+        # Deleted again: the AOF restart below counts exactly 11 keys.
         check("ZMSCORE cleanup", c.cmd("DEL", "mszset"), 1)
         # HyperLogLog: PFADD / PFCOUNT. A new key takes the elements
         # and reports 1; re-adding the same elements moves no register
@@ -1891,6 +1891,74 @@ def main():
         check("MULTI hllwatch change SET queued", c.cmd("SET", "wtestkey2", "v2"), "QUEUED")
         check("EXEC hllwatch change watch aborts", c.cmd("EXEC"), None)
         check("wtestkey2 unchanged after hllwatch abort", c.cmd("GET", "wtestkey2"), "v1")
+        # GEO: GEOADD / GEODIST. A geo set is a sorted set whose
+        # scores are 52-bit geohashes, so ZSCORE sees the geohash;
+        # GEODIST decodes the members back to coordinates (the
+        # centres of their geohash cells, as in Redis) and measures
+        # the haversine distance. Palermo/Catania are the example
+        # from the Redis docs: real Redis answers 166274.1516 m.
+        check("GEOADD new", c.cmd("GEOADD", "geo", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"), 2)
+        check("GEODIST Palermo Catania m", c.cmd("GEODIST", "geo", "Palermo", "Catania"), "166274.1516")
+        check("GEODIST Palermo Catania km", c.cmd("GEODIST", "geo", "Palermo", "Catania", "km"), "166.2742")
+        check("GEODIST Palermo Catania ft", c.cmd("GEODIST", "geo", "Palermo", "Catania", "ft"), "545518.8700")
+        check("GEODIST Palermo Catania mi", c.cmd("GEODIST", "geo", "Palermo", "Catania", "mi"), "103.3180")
+        check("GEODIST same member", c.cmd("GEODIST", "geo", "Palermo", "Palermo"), "0.0000")
+        check("GEODIST missing member", c.cmd("GEODIST", "geo", "Palermo", "Rome"), None)
+        check("GEODIST missing key", c.cmd("GEODIST", "ghostgeo", "Palermo", "Catania"), None)
+        check("GEODIST bad unit", c.cmd("GEODIST", "geo", "Palermo", "Catania", "parsecs"),
+              ("error", "ERR unsupported unit provided. please use m, km, ft, mi"))
+        check("GEODIST no members", c.cmd("GEODIST", "geo", "Palermo"),
+              ("error", "ERR wrong number of arguments for 'geodist' command"))
+        # The score is the 52-bit geohash itself, visible through
+        # the sorted-set commands, as in Redis.
+        check("GEOADD ZSCORE Palermo", c.cmd("ZSCORE", "geo", "Palermo"), "3479099956230698")
+        check("GEOADD ZSCORE Catania", c.cmd("ZSCORE", "geo", "Catania"), "3479447370796909")
+        check("GEOADD ZCARD", c.cmd("ZCARD", "geo"), 2)
+        # Re-adding a member at its current coordinates is a no-op
+        # (0 added, no WATCH invalidation); moving it updates the
+        # score and answers 0 too, since it was not newly added.
+        check("GEOADD same coords", c.cmd("GEOADD", "geo", "13.361389", "38.115556", "Palermo"), 0)
+        check("GEOADD move member", c.cmd("GEOADD", "geo", "13.5", "38.2", "Palermo"), 0)
+        check("GEODIST after move differs", c.cmd("GEODIST", "geo", "Palermo", "Catania") != "166274.1516", True)
+        check("GEOADD move back", c.cmd("GEOADD", "geo", "13.361389", "38.115556", "Palermo"), 0)
+        check("GEODIST back to exact", c.cmd("GEODIST", "geo", "Palermo", "Catania"), "166274.1516")
+        # Bad coordinates: out of range, not a number, and the wrong
+        # argument count; a bad triple in a multi-member call adds
+        # nothing, since every coordinate is parsed first.
+        check("GEOADD bad lon", c.cmd("GEOADD", "geo", "200", "38.1", "Nowhere"),
+              ("error", "ERR invalid longitude,latitude pair 200,38.1"))
+        check("GEOADD bad lat", c.cmd("GEOADD", "geo", "13.3", "90", "Nowhere"),
+              ("error", "ERR invalid longitude,latitude pair 13.3,90"))
+        check("GEOADD bad number", c.cmd("GEOADD", "geo", "abc", "38.1", "Nowhere"),
+              ("error", "ERR value is not a valid float"))
+        check("GEOADD wrong argc", c.cmd("GEOADD", "geo", "13.3", "38.1"),
+              ("error", "ERR wrong number of arguments for 'geoadd' command"))
+        check("GEOADD partial apply", c.cmd("GEOADD", "geo2", "13.3", "38.1", "A", "200", "38.1", "B"),
+              ("error", "ERR invalid longitude,latitude pair 200,38.1"))
+        check("GEOADD partial apply adds nothing", c.cmd("ZCARD", "geo2"), 0)
+        check("GEOADD list wrongtype", c.cmd("GEOADD", "plist", "13.3", "38.1", "x"), wrongtype)
+        check("GEODIST list wrongtype", c.cmd("GEODIST", "plist", "x", "y"), wrongtype)
+        # GEOADD preserves the TTL, as in Redis.
+        check("GEOADD TTL setup", c.cmd("EXPIRE", "geo", "100"), 1)
+        check("GEOADD TTL add", c.cmd("GEOADD", "geo", "12.5", "41.9", "Rome"), 1)
+        check("GEOADD TTL member", c.cmd("GEODIST", "geo", "Palermo", "Rome") is not None, True)
+        check("TTL survives GEOADD", 99 <= c.cmd("TTL", "geo") <= 100, True)
+        # A no-op GEOADD does not invalidate a WATCH; a move does.
+        check("GEOADD WATCH setup", c.cmd("WATCH", "geo"), "OK")
+        check("GEOADD WATCH noop", c.cmd("GEOADD", "geo", "13.361389", "38.115556", "Palermo"), 0)
+        check("MULTI geo noop", c.cmd("MULTI"), "OK")
+        check("MULTI geo noop SET queued", c.cmd("SET", "wtestkey4", "v1"), "QUEUED")
+        check("EXEC geo noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("wtestkey4 after geo noop EXEC", c.cmd("GET", "wtestkey4"), "v1")
+        check("GEOADD WATCH setup 2", c.cmd("WATCH", "geo"), "OK")
+        check("GEOADD WATCH move", c.cmd("GEOADD", "geo", "13.5", "38.2", "Palermo"), 0)
+        check("MULTI geo move", c.cmd("MULTI"), "OK")
+        check("MULTI geo move SET queued", c.cmd("SET", "wtestkey4", "v2"), "QUEUED")
+        check("EXEC geo move watch aborts", c.cmd("EXEC"), None)
+        check("wtestkey4 unchanged after geo abort", c.cmd("GET", "wtestkey4"), "v1")
+        check("COMMAND lists GEOADD", "GEOADD" in c.cmd("COMMAND"), True)
+        check("COMMAND lists GEODIST", "GEODIST" in c.cmd("COMMAND"), True)
+        check("GEO cleanup", c.cmd("DEL", "geo", "geo2", "wtestkey4"), 2)
         # phll stays: the AOF restart below proves a HyperLogLog
         # survives a SHUTDOWN and reload — and phll is itself the
         # product of a PFMERGE, so the restart also proves a merged
@@ -2255,6 +2323,9 @@ def main():
         check("rebuild phash", c.cmd("HSET", "phash", "a", "1", "b", "2"), 2)
         check("rebuild pzset", c.cmd("ZADD", "pzset", "1.5", "x", "2.25", "y", "10", "z"), 3)
         check("rebuild phll", c.cmd("PFADD", "phll", "a", "b", "c"), 1)
+        # pgeo stays too: the AOF restart below proves a geo set
+        # replays from the AOF with its geohash scores intact.
+        check("rebuild pgeo", c.cmd("GEOADD", "pgeo", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"), 2)
         # A zero-padded string, so the restart proves SETRANGE padding
         # survives an AOF replay byte-for-byte.
         check("rebuild prange", c.cmd("SETRANGE", "prange", "5", "pad"), 8)
@@ -2264,7 +2335,7 @@ def main():
         check("COMMAND lists ZSCORE", "ZSCORE" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZCARD", "ZCARD" in c.cmd("COMMAND"), True)
         # Clean up the transaction keys: the AOF restart below counts
-        # exact keys (10: after, plist, pset, phash, pzset, prange, pfield, punion, pdiff, phll).
+        # exact keys (11: after, plist, pset, phash, pzset, prange, pfield, punion, pdiff, phll, pgeo).
         # ZINCRBY and ZREM on pzset before the restart, so the AOF
         # replay section below can prove they were logged; the
         # ZREMRANGEBYSCORE removes y (2.25) from pzset the same way.
@@ -2317,6 +2388,8 @@ def main():
         check("AOF replay padded GETRANGE", c.cmd("GETRANGE", "prange", "0", "4"), "\x00" * 5)
         check("AOF replay bitfield", c.cmd("BITFIELD", "pfield", "GET", "u16", "0"), [16706])
         check("AOF replay hll", c.cmd("PFCOUNT", "phll"), 3)
+        check("AOF replay geo dist", c.cmd("GEODIST", "pgeo", "Palermo", "Catania"), "166274.1516")
+        check("AOF replay geo card", c.cmd("ZCARD", "pgeo"), 2)
         # The replayed PEXPIRE re-arms blinklist's 50 ms TTL from replay
         # time, so it is briefly alive again. The checks above run only
         # a few ms after the restart, so whether the TTL has passed by
@@ -2334,7 +2407,7 @@ def main():
         check("AOF replay expired set gone", c.cmd("SCARD", "blinkset"), 0)
         check("AOF replay expired hash gone", c.cmd("HLEN", "blinkhash"), 0)
         check("AOF replay expired zset gone", c.cmd("ZCARD", "blinkzset"), 0)
-        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 10)
+        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 11)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -2627,7 +2700,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.56.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.57.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

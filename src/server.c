@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.56.0"
+#define CINDER_VERSION "0.57.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1250,6 +1250,90 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            like a no-op PFADD, so it is not logged, not replicated,
            and does not invalidate a WATCH. */
         return changed ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "GEOADD") == 0) {
+        if (argc < 5 || ((argc - 2) % 3) != 0)
+            return dbuf_error(reply, "wrong number of arguments for 'geoadd' command"), 0;
+        /* Parse every coordinate before adding any member, so a bad
+           coordinate errors without a partial apply, as ZADD does
+           with bad scores. Longitude is [-180, 180], latitude
+           [-85.05112878, 85.05112878], as in Redis. */
+        size_t ntriples = (size_t)(argc - 2) / 3;
+        double *coords = malloc(ntriples * 2 * sizeof(double));
+        if (!coords)
+            return dbuf_error(reply, "out of memory"), 0;
+        for (size_t k = 0; k < ntriples; k++) {
+            const char *lon_s = argv[2 + 3 * k];
+            const char *lat_s = argv[3 + 3 * k];
+            double lon, lat;
+            if (!parse_double(lon_s, &lon) || !parse_double(lat_s, &lat)) {
+                free(coords);
+                return dbuf_error(reply, "value is not a valid float"), 0;
+            }
+            if (lon < GEO_LON_MIN || lon > GEO_LON_MAX ||
+                lat < GEO_LAT_MIN || lat > GEO_LAT_MAX) {
+                char msg[1024];
+                snprintf(msg, sizeof(msg),
+                         "invalid longitude,latitude pair %s,%s",
+                         lon_s, lat_s);
+                free(coords);
+                return dbuf_error(reply, msg), 0;
+            }
+            coords[2 * k] = lon;
+            coords[2 * k + 1] = lat;
+        }
+        int zt = store_type(g_store, argv[1]);
+        if (zt != 0 && zt != 5) {
+            free(coords);
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        }
+        long long added = 0;
+        int changed = 0;
+        for (size_t k = 0; k < ntriples; k++) {
+            long long rc = store_geoadd(g_store, argv[1], coords[2 * k],
+                                        coords[2 * k + 1],
+                                        argv[4 + 3 * k]);
+            if (rc == -2) {
+                free(coords);
+                return dbuf_error(reply, "out of memory"), 0;
+            }
+            if (rc == 1) added++;
+            if (rc != 2) changed = 1;
+        }
+        free(coords);
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_int(reply, added);
+        /* Log only when something actually changed: re-adding a
+           member at its current coordinates, like a ZADD of the
+           same score, is a no-op. */
+        return changed ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "GEODIST") == 0) {
+        if (argc < 4 || argc > 5)
+            return dbuf_error(reply, "wrong number of arguments for 'geodist' command"), 0;
+        /* The unit is checked first, as in Redis: a bad unit is an
+           error even when the key is missing. */
+        double factor = 1.0; /* metres */
+        if (argc == 5) {
+            if (strcasecmp(argv[4], "m") == 0) factor = 1.0;
+            else if (strcasecmp(argv[4], "km") == 0) factor = 0.001;
+            else if (strcasecmp(argv[4], "ft") == 0) factor = 3.280839895013123;
+            else if (strcasecmp(argv[4], "mi") == 0) factor = 0.000621371192237334;
+            else return dbuf_error(reply, "unsupported unit provided. please use m, km, ft, mi"), 0;
+        }
+        int t = store_type(g_store, argv[1]);
+        if (t != 0 && t != 5)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        double dist;
+        int rc = store_geodist(g_store, argv[1], argv[2], argv[3], &dist);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == 0) return dbuf_null(reply), 0;
+        /* Redis answers a bulk string with four decimals. */
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.4f", dist * factor);
+        dbuf_bulk(reply, buf, strlen(buf));
+        return 0;
     }
     if (strcasecmp(cmd, "HSET") == 0) {
         if (argc < 4 || (argc % 2) != 0)
@@ -3050,6 +3134,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "LMOVE",
             "SADD", "SREM", "SMEMBERS", "SSCAN", "SISMEMBER", "SCARD",
             "PFADD", "PFCOUNT", "PFMERGE",
+            "GEOADD", "GEODIST",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",

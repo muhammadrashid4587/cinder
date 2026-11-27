@@ -2,7 +2,8 @@
 
 A Redis-compatible in-memory key-value store, written in C from scratch.
 Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, lists,
-sets, hashes, sorted sets and HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`) with TTLs, approximate LRU eviction, and an append-only file for
+sets, hashes, sorted sets, HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`) and geo
+(`GEOADD`/`GEODIST`) with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
 flush thread that does the once-a-second AOF sync under `everysec`,
@@ -10,7 +11,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.56.0.
+Version 0.57.0.
 
 ## Why
 
@@ -92,6 +93,8 @@ OK
 | `PFADD key element [element ...]` | Add elements to the HyperLogLog at `key`, creating it when missing; returns `1` when a register changed, `0` when every element hashed into a register that already held at least that value; a plain string key is an error (`WRONGTYPE Key is not a valid HyperLogLog string value.`), as is any non-string key; preserves the TTL |
 | `PFCOUNT key [key ...]` | Estimate the cardinality of the union of the HyperLogLogs at `key` (or several keys, merged register-wise); a missing key counts as empty (`0` for no keys at all); a plain string or non-string key is an error, as for `PFADD` |
 | `PFMERGE destkey sourcekey [sourcekey ...]` | Merge the HyperLogLogs at `sourcekey` into `destkey` (registers merged by maximum), creating it when missing and overwriting it when it exists (its TTL is cleared); a missing source counts as empty, so merging only missing sources creates an empty HyperLogLog; sources are never modified, and the destination may itself be a source; a plain string or non-string key at either end is an error, as for `PFADD`; a merge that reproduces the destination exactly changes nothing, so it is not logged, not replicated, and does not invalidate a `WATCH` |
+| `GEOADD key longitude latitude member [longitude latitude member ...]` | Add members at coordinates, stored as a sorted set whose scores are 52-bit geohashes (longitude in [-180, 180], latitude in [-85.05112878, 85.05112878]); returns the number of newly added members (moving an existing member answers `0`); every coordinate is parsed and range-checked before any member is added, so a bad triple adds nothing; a re-add at the same coordinates is a no-op, so it is not logged, not replicated, and does not invalidate a `WATCH`; preserves the TTL |
+| `GEODIST key member1 member2 [m \| km \| ft \| mi]` | Haversine distance between two members in metres by default (or the named unit), as a bulk string with four decimals (`166274.1516` for Palermo/Catania, as in real Redis); the members' geohash scores are decoded back to the centres of their geohash cells, as in Redis; `nil` when the key or a member is missing; a member of a plain sorted set decodes whatever score it holds, as in Redis |
 | `HSET key field value [field value ...]` | Set fields; returns number of new fields (updates return `0` for that field) |
 | `MULTI`, `EXEC`, `DISCARD` | Transactions: `MULTI` queues commands (`+QUEUED` per command, nested `MULTI` is an error), `EXEC` runs the queue in order and returns one reply per command (an error inside the transaction takes its place in the array and the rest still run), `DISCARD` drops the queue; `EXEC`/`DISCARD` without `MULTI` are errors. Queued writes are invisible to other clients until `EXEC` runs, and the commands `EXEC` runs are AOF-logged and replicated individually, never `MULTI`/`EXEC` themselves |
 | `WATCH key [key ...]`, `UNWATCH` | Optimistic locking for `MULTI`/`EXEC`: `WATCH` records the version each key has right now (0 when it does not exist); if any watched key is created, modified, deleted, expired, or flushed away before `EXEC`, `EXEC` aborts with a nil array and the queue never runs. `UNWATCH` clears the watch set, as do `EXEC` and `DISCARD`; `WATCH` inside `MULTI` is an error, while `UNWATCH` inside `MULTI` queues and runs at `EXEC`, as in real Redis. A write that changes nothing (SADD of a member already present, HSET of an identical value) does not invalidate a watch. Limitation: a watched key that did not exist, was created and deleted again before `EXEC`, reads as version 0 again, so the abort is not detected — the version scheme cannot see a create-plus-delete round trip |
@@ -405,10 +408,27 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # no-op that does not invalidate a `WATCH`, overwriting
             # a destination clears its TTL, and `COMMAND` lists
             # it; the HyperLogLog that survives the AOF restart is
-            # itself the product of a `PFMERGE`), and
+            # itself the product of a `PFMERGE`), and GEO checks
+            # (`GEOADD` adding two members and answering the count,
+            # `GEODIST` in metres, kilometres, feet and miles
+            # matching real Redis's Palermo/Catania example
+            # (166274.1516 m), the same member answering 0.0000,
+            # `nil` for a missing member or key, a bad unit and the
+            # wrong argument count, the scores visible through
+            # `ZSCORE` as the 52-bit geohashes, a re-add at the same
+            # coordinates and a move both answering 0 with the
+            # distance changing after the move and coming back exact
+            # after moving back, out-of-range and non-numeric
+            # coordinates and a bad triple adding nothing,
+            # wrong-type errors on a list key, the TTL surviving a
+            # `GEOADD`, a no-op `GEOADD` not invalidating a `WATCH`
+            # while a move does, `COMMAND` listing both, and the
+            # geo set that survives the AOF restart answering the
+            # exact distance again), and
             # an AOF
-            # restart test (data, a list, a set, a hash, a sorted set and a HyperLogLog survive a
-            # SHUTDOWN and reload), and everysec-policy checks (INFO
+            # restart test (data, a list, a set, a hash, a sorted set,
+            # a HyperLogLog and a geo set survive a SHUTDOWN and reload),
+            # and everysec-policy checks (INFO
             # reports the policy, the AOF holds the record before any
             # sync, data survives a SIGKILL + restart, unknown policy
             # is a startup error), and RDB snapshot checks (SAVE writes
@@ -1197,3 +1217,29 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       counts as empty, sources are never modified, and a merge that
       reproduces the destination exactly is a no-op, like a no-op
       `PFADD`.
+
+- [x] Geo, first slice (0.57.0): `GEOADD` / `GEODIST`, as in real
+      Redis. A geo set is a sorted set whose scores are 52-bit
+      geohashes (26 latitude bits and 26 longitude bits
+      interleaved, latitude in the even bit positions, over
+      longitude [-180, 180] and latitude [-85.05112878,
+      85.05112878]), so `TYPE` reports "zset", `ZRANGE` / `ZSCORE`
+      see the geohash scores, RDB snapshots carry them as `%.17g`
+      strings (a 52-bit integer round-trips exactly), the
+      replication full sync rebuilds them through `ZADD`, and an
+      AOF replay re-runs `GEOADD` deterministically. `GEOADD`
+      returns the number of newly added members (moving an existing
+      member answers `0`); every coordinate is parsed and
+      range-checked before any member is added, so a bad triple
+      adds nothing, and a re-add at the same coordinates is a no-op
+      that is not logged, not replicated, and does not invalidate a
+      `WATCH`. `GEODIST` decodes the members' scores back to the
+      centres of their geohash cells and measures the haversine
+      distance (earth radius 6372797.560856 m, as in Redis),
+      answering a bulk string with four decimals in metres by
+      default or `km` / `ft` / `mi` — Palermo/Catania answers
+      166274.1516 m, exactly as real Redis does — and `nil` for a
+      missing key or member. Limitation: no `GEOPOS` / `GEOHASH` /
+      `GEORADIUS` / `GEOSEARCH` yet, and `GEOADD` takes no `NX` /
+      `XX` / `CH` options (those come with the next slice, as
+      `ZADD`'s options did after its first slice).

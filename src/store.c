@@ -3682,3 +3682,133 @@ int store_pfmerge(Store *s, const char *dest, const char **sources,
     *changed_out = 1;
     return 0;
 }
+
+/* ---------- GEO (GEOADD / GEODIST) ----------
+ * The 52-bit geohash Redis stores as a sorted-set score: 26
+ * latitude bits and 26 longitude bits interleaved, latitude in
+ * the even bit positions, longitude in the odd ones — the same
+ * bit-spreading trick Redis's geohash.c uses. */
+
+#define GEO_STEP 26 /* 26 bits per axis, 52 bits total */
+#define GEO_EARTH_RADIUS 6372797.560856 /* metres, as in Redis */
+
+/* Spread the low 32 bits of xlo to the even bit positions and of
+   ylo to the odd ones. */
+static uint64_t geo_interleave64(uint32_t xlo, uint32_t ylo) {
+    static const uint64_t B[] = {0x5555555555555555ULL, 0x3333333333333333ULL,
+                                 0x0F0F0F0F0F0F0F0FULL, 0x00FF00FF00FF00FFULL,
+                                 0x0000FFFF0000FFFFULL};
+    uint64_t x = xlo;
+    uint64_t y = ylo;
+    x = (x | (x << 16)) & B[4];
+    y = (y | (y << 16)) & B[4];
+    x = (x | (x << 8)) & B[3];
+    y = (y | (y << 8)) & B[3];
+    x = (x | (x << 4)) & B[2];
+    y = (y | (y << 4)) & B[2];
+    x = (x | (x << 2)) & B[1];
+    y = (y | (y << 2)) & B[1];
+    x = (x | (x << 1)) & B[0];
+    y = (y | (y << 1)) & B[0];
+    return x | (y << 1);
+}
+
+/* Undo geo_interleave64: the low 32 bits of the result are the
+   even-position bits, the high 32 the odd-position ones. */
+static uint64_t geo_deinterleave64(uint64_t interleaved) {
+    static const uint64_t B[] = {0x5555555555555555ULL, 0x3333333333333333ULL,
+                                 0x0F0F0F0F0F0F0F0FULL, 0x00FF00FF00FF00FFULL,
+                                 0x0000FFFF0000FFFFULL, 0x00000000FFFFFFFFULL};
+    uint64_t x = interleaved;
+    uint64_t y = interleaved >> 1;
+    x = (x | (x >> 0)) & B[0];
+    y = (y | (y >> 0)) & B[0];
+    x = (x | (x >> 1)) & B[1];
+    y = (y | (y >> 1)) & B[1];
+    x = (x | (x >> 2)) & B[2];
+    y = (y | (y >> 2)) & B[2];
+    x = (x | (x >> 4)) & B[3];
+    y = (y | (y >> 4)) & B[3];
+    x = (x | (x >> 8)) & B[4];
+    y = (y | (y >> 8)) & B[4];
+    x = (x | (x >> 16)) & B[5];
+    y = (y | (y >> 16)) & B[5];
+    return x | (y << 32);
+}
+
+/* The 52-bit geohash of a coordinate pair: each axis is scaled to
+   a 26-bit fixed-point value over its range (truncated, as in
+   Redis), then interleaved with latitude in the even positions. */
+static uint64_t geo_encode(double lon, double lat) {
+    double lat_offset = (lat - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN);
+    double lon_offset = (lon - GEO_LON_MIN) / (GEO_LON_MAX - GEO_LON_MIN);
+    uint32_t ilat = (uint32_t)(lat_offset * (double)(1ULL << GEO_STEP));
+    uint32_t ilon = (uint32_t)(lon_offset * (double)(1ULL << GEO_STEP));
+    return geo_interleave64(ilat, ilon);
+}
+
+/* The centre of the geohash cell a hash names, as in Redis's
+   geohashDecode: the decoded coordinate is the cell centre, not
+   the coordinate that was encoded. */
+static void geo_decode(uint64_t hash, double *lon_out, double *lat_out) {
+    uint64_t sep = geo_deinterleave64(hash);
+    uint32_t ilat = (uint32_t)(sep & 0xFFFFFFFFULL);
+    uint32_t ilon = (uint32_t)(sep >> 32);
+    *lat_out = GEO_LAT_MIN + ((double)ilat + 0.5) *
+               (GEO_LAT_MAX - GEO_LAT_MIN) / (double)(1ULL << GEO_STEP);
+    *lon_out = GEO_LON_MIN + ((double)ilon + 0.5) *
+               (GEO_LON_MAX - GEO_LON_MIN) / (double)(1ULL << GEO_STEP);
+}
+
+/* A sorted-set score as a geohash: scores GEOADD writes are
+   52-bit integers, exactly representable, but a plain sorted set
+   can hold any double, and a double outside [0, 2^52) has no
+   defined conversion to uint64_t, so clamp before the cast. */
+static uint64_t geo_score_to_hash(double score) {
+    if (!(score >= 0.0)) return 0;
+    if (score >= 4503599627370496.0) return 4503599627370495ULL;
+    return (uint64_t)score;
+}
+
+/* Haversine distance in metres, as in Redis's geohashGetDistance.
+   The sqrt argument is clamped to 1: antipodal points can round
+   a hair past it, and asin of that is NaN. */
+static double geo_distance_m(double lon1, double lat1,
+                             double lon2, double lat2) {
+    double lat1r = lat1 * M_PI / 180.0;
+    double lon1r = lon1 * M_PI / 180.0;
+    double lat2r = lat2 * M_PI / 180.0;
+    double lon2r = lon2 * M_PI / 180.0;
+    double u = sin((lat2r - lat1r) / 2.0);
+    double v = sin((lon2r - lon1r) / 2.0);
+    double a = u * u + cos(lat1r) * cos(lat2r) * v * v;
+    if (a > 1.0) a = 1.0;
+    return 2.0 * GEO_EARTH_RADIUS * asin(sqrt(a));
+}
+
+long long store_geoadd(Store *s, const char *key, double lon, double lat,
+                       const char *member) {
+    /* The score is the 52-bit geohash, exactly representable as a
+       double, so store_zadd carries it like any other score — and
+       a re-add at the same coordinates is the same-score no-op,
+       which neither logs nor invalidates a WATCH, and the TTL
+       survives, as with ZADD. */
+    double score = (double)geo_encode(lon, lat);
+    return store_zadd(s, key, member, score);
+}
+
+int store_geodist(Store *s, const char *key, const char *m1, const char *m2,
+                  double *out) {
+    double s1, s2;
+    int r1 = store_zscore(s, key, m1, &s1);
+    if (r1 == -1) return -1;
+    if (r1 == 0) return 0;
+    int r2 = store_zscore(s, key, m2, &s2);
+    if (r2 == -1) return -1;
+    if (r2 == 0) return 0;
+    double lon1, lat1, lon2, lat2;
+    geo_decode(geo_score_to_hash(s1), &lon1, &lat1);
+    geo_decode(geo_score_to_hash(s2), &lon2, &lat2);
+    *out = geo_distance_m(lon1, lat1, lon2, lat2);
+    return 1;
+}

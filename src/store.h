@@ -627,4 +627,36 @@ int store_pfcount(Store *s, const char **keys, int nkeys, long long *out);
 int store_pfmerge(Store *s, const char *dest, const char **sources,
                   int nsources, int *changed_out);
 
+/* GEO (GEOADD / GEODIST), stored as a sorted set whose scores are
+   52-bit geohashes — the layout Redis uses, so TYPE reports "zset",
+   ZRANGE / ZSCORE see the geohash scores, RDB snapshots carry them
+   as %.17g strings (a 52-bit integer round-trips exactly), the
+   replication full sync rebuilds them through ZADD, and an AOF
+   replay re-runs GEOADD deterministically. The hash interleaves 26
+   latitude bits and 26 longitude bits (latitude in the even bit
+   positions), over longitude [-180, 180] and latitude
+   [-85.05112878, 85.05112878], as in Redis. */
+#define GEO_LAT_MIN -85.05112878
+#define GEO_LAT_MAX 85.05112878
+#define GEO_LON_MIN -180.0
+#define GEO_LON_MAX 180.0
+/* Add one member at longitude/latitude. Returns 1 when the member
+   is new, 0 when an existing member moved, 2 when the member
+   already sat at exactly those coordinates (no change, so no
+   WATCH invalidation and nothing to log), -1 = key holds a
+   non-sorted-set, -2 = out of memory. Preserves the key's TTL,
+   as in Redis. The coordinates are assumed in range; the handler
+   checks them first. */
+long long store_geoadd(Store *s, const char *key, double lon, double lat,
+                       const char *member);
+/* Distance in metres between two members, decoded from their
+   geohash scores (the centres of their geohash cells, as in
+   Redis) with the haversine formula over a 6372797.560856 m
+   earth. Returns 1 when both members are present (*out is the
+   distance), 0 when the key or a member is missing, -1 = wrong
+   type. A member of a plain sorted set decodes whatever score
+   it holds, as in Redis. */
+int store_geodist(Store *s, const char *key, const char *m1, const char *m2,
+                  double *out);
+
 #endif
