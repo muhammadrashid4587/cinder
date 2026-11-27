@@ -1215,6 +1215,37 @@ def main():
               ("error", "ERR wrong number of arguments for 'xrange' command"))
         check("COMMAND lists XRANGE XLEN",
               "XRANGE" in c.cmd("COMMAND") and "XLEN" in c.cmd("COMMAND"), True)
+        # XREVRANGE: the same range read back highest-first, with
+        # the bounds given end-first; COUNT takes the highest IDs,
+        # bare-ms bounds cover the whole millisecond, and the error
+        # cases mirror XRANGE's.
+        check("XREVRANGE all", c.cmd("XREVRANGE", "xrstream", "+", "-"),
+              [["2000-0", ["a", "4"]], ["1000-2", ["a", "3"]],
+               ["1000-1", ["a", "1", "b", "2"]]])
+        check("XREVRANGE range", c.cmd("XREVRANGE", "xrstream", "2000-0", "1000-2"),
+              [["2000-0", ["a", "4"]], ["1000-2", ["a", "3"]]])
+        check("XREVRANGE bare ms", c.cmd("XREVRANGE", "xrstream", "1000", "1000"),
+              [["1000-2", ["a", "3"]], ["1000-1", ["a", "1", "b", "2"]]])
+        check("XREVRANGE bare ms end", c.cmd("XREVRANGE", "xrstream", "+", "1000"),
+              [["2000-0", ["a", "4"]], ["1000-2", ["a", "3"]],
+               ["1000-1", ["a", "1", "b", "2"]]])
+        check("XREVRANGE empty range", c.cmd("XREVRANGE", "xrstream", "-", "+"), [])
+        check("XREVRANGE start above end", c.cmd("XREVRANGE", "xrstream", "1000-1", "2000-0"), [])
+        check("XREVRANGE count", c.cmd("XREVRANGE", "xrstream", "+", "-", "COUNT", "2"),
+              [["2000-0", ["a", "4"]], ["1000-2", ["a", "3"]]])
+        check("XREVRANGE count 0", c.cmd("XREVRANGE", "xrstream", "+", "-", "COUNT", "0"), [])
+        check("XREVRANGE missing key", c.cmd("XREVRANGE", "nope", "+", "-"), [])
+        check("XREVRANGE wrongtype", c.cmd("XREVRANGE", "after", "+", "-"), wrongtype)
+        check("XREVRANGE bad bound", c.cmd("XREVRANGE", "xrstream", "abc", "-"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XREVRANGE bad count", c.cmd("XREVRANGE", "xrstream", "+", "-", "COUNT", "-1"),
+              ("error", "ERR COUNT must be a positive integer"))
+        check("XREVRANGE bad option", c.cmd("XREVRANGE", "xrstream", "+", "-", "FOO", "1"),
+              ("error", "ERR syntax error"))
+        check("XREVRANGE no args", c.cmd("XREVRANGE", "xrstream"),
+              ("error", "ERR wrong number of arguments for 'xrevrange' command"))
+        check("COMMAND lists XREVRANGE",
+              "XREVRANGE" in c.cmd("COMMAND"), True)
         check("XRANGE cleanup", c.cmd("DEL", "xrstream"), 1)
         # XREAD: multi-stream reads, exclusive IDs, "$" resolved once
         # per call, per-stream COUNT, wrong-type and argument errors,
@@ -3249,7 +3280,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.66.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.67.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

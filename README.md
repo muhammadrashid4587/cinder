@@ -5,7 +5,7 @@ Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, 
 sets, hashes, sorted sets, HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`), geo
 (`GEOADD`/`GEODIST`/`GEOPOS`/`GEOHASH`/`GEOSEARCH`/`GEOSEARCHSTORE`/`GEORADIUS`/
 `GEORADIUSBYMEMBER`/`GEORADIUS_RO`/`GEORADIUSBYMEMBER_RO`) and streams
-(`XADD` / `XRANGE` / `XLEN` / `XREAD`) with TTLs, approximate LRU eviction, and an append-only file for
+(`XADD` / `XRANGE` / `XREVRANGE` / `XLEN` / `XREAD`) with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
 flush thread that does the once-a-second AOF sync under `everysec`,
@@ -13,7 +13,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.66.0.
+Version 0.67.0.
 
 ## Why
 
@@ -122,8 +122,9 @@ OK
 | `HEXPIREAT key seconds [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]`, `HPEXPIREAT key ms [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]` | The same per-field expiry, as an absolute Unix time (seconds / milliseconds); an absolute time already past deletes the field at once and answers `2` per field, with the same per-field replies and conditions as `HEXPIRE` |
 | `HTTL key FIELDS numfields field [field ...]`, `HPTTL key FIELDS numfields field [field ...]` | Remaining TTL of one or more hash fields, in seconds / milliseconds; one integer reply per field: `-1` the field has no expiry, `-2` the key or the field does not exist |
 | `HPERSIST key FIELDS numfields field [field ...]` | Remove the expiry from one or more hash fields; one integer reply per field: `1` an expiry was removed, `-1` the field had none, `-2` the key or the field does not exist |
-| `XADD key [MAXLEN [~] threshold] id field value [field value ...]` | Append one entry to a stream, creating it when missing; the ID is `*` (auto: the current ms, sequence 0, or one past the top ID when the ms is not ahead of it), `ms-seq` (explicit), or `ms-*` / `ms-` (partial: the ms given, the sequence auto-filled); answers the new ID as a bulk string. An ID equal to or smaller than the top ID is an error, as is `0-0` and a malformed ID; `MAXLEN` trims the oldest entries until at most `threshold` remain (`~` trims exactly the same way), and trimming the last entry deletes the key. Preserves the TTL, invalidates a `WATCH`, and is AOF-logged with the resolved ID (so a replay reproduces the exact entries) and replicated; a replica re-resolves `*` itself, so the entry order and contents match there but the ms part of an auto ID can differ. The entries are read back with `XRANGE` / `XLEN` / `XREAD` below; `XREVRANGE` is next |
+| `XADD key [MAXLEN [~] threshold] id field value [field value ...]` | Append one entry to a stream, creating it when missing; the ID is `*` (auto: the current ms, sequence 0, or one past the top ID when the ms is not ahead of it), `ms-seq` (explicit), or `ms-*` / `ms-` (partial: the ms given, the sequence auto-filled); answers the new ID as a bulk string. An ID equal to or smaller than the top ID is an error, as is `0-0` and a malformed ID; `MAXLEN` trims the oldest entries until at most `threshold` remain (`~` trims exactly the same way), and trimming the last entry deletes the key. Preserves the TTL, invalidates a `WATCH`, and is AOF-logged with the resolved ID (so a replay reproduces the exact entries) and replicated; a replica re-resolves `*` itself, so the entry order and contents match there but the ms part of an auto ID can differ. The entries are read back with `XRANGE` / `XREVRANGE` / `XLEN` / `XREAD` below |
 | `XRANGE key start end [COUNT count]` | The entries whose IDs fall in `[start, end]` inclusive, in ID order, each as `[id, [field, value, ...]]`; bounds are `-` (the minimum ID), `+` (the maximum ID), `ms` (the whole millisecond: `ms-0` as a start bound, `ms-MAX` as an end bound) or `ms-seq`; `COUNT` limits the entries returned (`0` returns none, a negative count is an error). An empty array when the key is missing or the range is empty, including a start above the end. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
+| `XREVRANGE key end start [COUNT count]` | The entries whose IDs fall in `[start, end]` inclusive, in reverse ID order (highest first), each as `[id, [field, value, ...]]`; the bounds are given end-first, as in Redis, and parsed the same way as `XRANGE`'s (`-` / `+` / `ms` / `ms-seq`, a bare ms covering the whole millisecond); `COUNT` takes the highest IDs first (`0` returns none, a negative count is an error). An empty array when the key is missing or the range is empty, including a start above the end. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
 | `XLEN key` | Number of entries in a stream (`0` when missing); read-only |
 | `XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]` | The entries after each ID, one `[key, [[id, [field, value, ...]], ...]]` element per stream that has any (streams with nothing new are left out); IDs are `ms-seq`, a bare `ms` (the whole millisecond: entries after `ms-0`), or `$` (the stream's top ID at read time, resolved once, so only entries added after the read qualify); `>` is an error (it needs `XREADGROUP`, which does not exist yet). `COUNT` limits the entries per stream; `BLOCK` waits for new entries instead of answering at once — an empty array when there is nothing and no `BLOCK`, a nil array when a `BLOCK` times out, `BLOCK 0` waits forever. A blocked client parks with no lock held (the loop re-checks it every iteration, so it wakes within one iteration of the `XADD` that releases it, and a disconnect while parked drops the request) and sends nothing more until its read is answered, so its `EPOLLIN` interest is dropped while it waits. `BLOCK` is refused inside `MULTI`/`EXEC`; a plain `XREAD` queues and runs at `EXEC`. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
@@ -681,7 +682,13 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # start and end bounds, an empty and a reversed range,
             # `COUNT` and `COUNT 0`, a missing key reading as empty,
             # wrong-type, bad-bound, bad-count and bad-option errors,
-            # and `COMMAND` listing both), and `XREAD` checks
+            # and `COMMAND` listing both), and `XREVRANGE` checks
+            # (the full range highest-first, a sub-range, bare-ms
+            # bounds, an empty range and a start above the end,
+            # `COUNT` taking the highest IDs and `COUNT 0`, a
+            # missing key reading as empty, wrong-type, bad-bound,
+            # bad-count and bad-option errors, and `COMMAND`
+            # listing it), and `XREAD` checks
             # (multi-stream reads from `0`, after an ID, and by
             # bare-ms ID; `$` resolving once per call and seeing
             # only entries added after it; per-stream `COUNT`;
@@ -1525,4 +1532,11 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       arrives or the timeout passes (nil on timeout, `BLOCK 0`
       waits forever), and is refused inside `MULTI`/`EXEC`.
       Read-only, so no AOF, RDB, or replication change was needed,
-      and it is safe on a replica. `XREVRANGE` is next.
+      and it is safe on a replica.
+- [x] Reverse stream reads, `XREVRANGE` (0.67.0): `XREVRANGE key end
+      start [COUNT count]` returns the entries in `[start, end]`
+      highest-first, with the bounds given end-first and parsed
+      the same way as `XRANGE`'s, and `COUNT` taking the highest
+      IDs first. Read-only, so no AOF, RDB, or replication change
+      was needed, and it is safe on a replica. `XREADGROUP`
+      (consumer groups) is next.

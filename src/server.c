@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.66.0"
+#define CINDER_VERSION "0.67.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2247,6 +2247,63 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         stream_entries_free(entries, n);
         return 0;
     }
+    if (strcasecmp(cmd, "XREVRANGE") == 0) {
+        /* XREVRANGE key end start [COUNT count]: the entries whose
+           IDs fall in [start, end], in reverse ID order (highest
+           first), each as [id, [field, value, ...]]. The bounds
+           are given end-first, as in Redis, and parsed the same
+           way as XRANGE's ("-" / "+" / "ms" / "ms-seq"; a bare ms
+           covers the whole millisecond). COUNT takes the highest
+           IDs first. A read, so nothing is logged or replicated,
+           and it is safe to run on a replica. */
+        if (argc < 4)
+            return dbuf_error(reply, "wrong number of arguments for 'xrevrange' command"), 0;
+        uint64_t start_ms, start_seq, end_ms, end_seq;
+        if (stream_parse_bound(argv[2], 1, &end_ms, &end_seq) != 0 ||
+            stream_parse_bound(argv[3], 0, &start_ms, &start_seq) != 0)
+            return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
+        long long count = -1;
+        int i = 4;
+        while (i < argc) {
+            if (strcasecmp(argv[i], "COUNT") == 0) {
+                if (i + 1 >= argc)
+                    return dbuf_error(reply, "wrong number of arguments for 'xrevrange' command"), 0;
+                if (!parse_ll(argv[i + 1], &count) || count < 0)
+                    return dbuf_error(reply, "COUNT must be a positive integer"), 0;
+                i += 2;
+            } else {
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        }
+        StreamEntry *entries = NULL;
+        size_t n = 0;
+        int rc = store_xrevrange(g_store, argv[1], start_ms, start_seq,
+                                 end_ms, end_seq, count, &entries, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2) {
+            stream_entries_free(entries, n);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        dbuf_array_header(reply, (long long)n);
+        for (size_t k = 0; k < n; k++) {
+            char idbuf[48];
+            snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                     (unsigned long long)entries[k].ms,
+                     (unsigned long long)entries[k].seq);
+            dbuf_array_header(reply, 2);
+            dbuf_bulk(reply, idbuf, strlen(idbuf));
+            dbuf_array_header(reply, (long long)(entries[k].nfields * 2));
+            for (size_t f = 0; f < entries[k].nfields; f++) {
+                dbuf_bulk(reply, entries[k].fields[f],
+                          strlen(entries[k].fields[f]));
+                dbuf_bulk(reply, entries[k].values[f],
+                          strlen(entries[k].values[f]));
+            }
+        }
+        stream_entries_free(entries, n);
+        return 0;
+    }
     if (strcasecmp(cmd, "XLEN") == 0) {
         if (argc != 2)
             return dbuf_error(reply, "wrong number of arguments for 'xlen' command"), 0;
@@ -4264,7 +4321,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HINCRBYFLOAT", "HSCAN",
             "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT",
             "HTTL", "HPTTL", "HPERSIST",
-            "XADD", "XRANGE", "XLEN", "XREAD",
+            "XADD", "XRANGE", "XREVRANGE", "XLEN", "XREAD",
             "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZINTER", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",

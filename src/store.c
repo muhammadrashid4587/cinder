@@ -4347,6 +4347,17 @@ int stream_foreach(const Stream *st, stream_foreach_fn fn, void *arg) {
     return 0;
 }
 
+int stream_foreach_rev(const Stream *st, stream_foreach_fn fn, void *arg) {
+    if (!st) return -1;
+    for (size_t i = st->len; i-- > 0;) {
+        const StreamEntry *en = &st->entries[i];
+        int rc = fn(en->ms, en->seq, en->fields, en->values, en->nfields,
+                    arg);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
 long long store_xlen(Store *s, const char *key) {
     Entry *e = store_find(s, key, NULL);
     if (!e) return 0;
@@ -4417,16 +4428,12 @@ struct xrange_collect_arg {
     int oom;
 };
 
-static int xrange_collect_cb(uint64_t ms, uint64_t seq, char *const *fields,
-                             char *const *values, size_t nfields,
-                             void *arg) {
-    struct xrange_collect_arg *a = arg;
-    if (ms < a->start_ms ||
-        (ms == a->start_ms && seq < a->start_seq))
-        return 0; /* before the range: skip */
-    if (ms > a->end_ms || (ms == a->end_ms && seq > a->end_seq))
-        return 1; /* past the range: entries are in ID order, stop */
-    if (a->count >= 0 && (long long)a->n >= a->count) return 1;
+/* Copy one visited entry into the collect arg's array (a copy, so
+   the reply can be built after the scan). Returns 0 on success,
+   -1 = out of memory (sets a->oom). */
+static int xrange_collect_copy(struct xrange_collect_arg *a, uint64_t ms,
+                               uint64_t seq, char *const *fields,
+                               char *const *values, size_t nfields) {
     if (a->n == a->cap) {
         size_t ncap = a->cap ? a->cap * 2 : 8;
         StreamEntry *nen = realloc(a->entries, ncap * sizeof(*nen));
@@ -4469,6 +4476,35 @@ static int xrange_collect_cb(uint64_t ms, uint64_t seq, char *const *fields,
     return 0;
 }
 
+static int xrange_collect_cb(uint64_t ms, uint64_t seq, char *const *fields,
+                             char *const *values, size_t nfields,
+                             void *arg) {
+    struct xrange_collect_arg *a = arg;
+    if (ms < a->start_ms ||
+        (ms == a->start_ms && seq < a->start_seq))
+        return 0; /* before the range: skip */
+    if (ms > a->end_ms || (ms == a->end_ms && seq > a->end_seq))
+        return 1; /* past the range: entries are in ID order, stop */
+    if (a->count >= 0 && (long long)a->n >= a->count) return 1;
+    return xrange_collect_copy(a, ms, seq, fields, values, nfields);
+}
+
+/* The XREVRANGE twin: entries arrive in reverse ID order, so the
+   ones above the end are skipped, the ones below the start stop
+   the scan, and COUNT takes the highest IDs first. */
+static int xrevrange_collect_cb(uint64_t ms, uint64_t seq,
+                                char *const *fields, char *const *values,
+                                size_t nfields, void *arg) {
+    struct xrange_collect_arg *a = arg;
+    if (ms > a->end_ms || (ms == a->end_ms && seq > a->end_seq))
+        return 0; /* above the range: skip */
+    if (ms < a->start_ms ||
+        (ms == a->start_ms && seq < a->start_seq))
+        return 1; /* below the range: entries are in reverse ID order, stop */
+    if (a->count >= 0 && (long long)a->n >= a->count) return 1;
+    return xrange_collect_copy(a, ms, seq, fields, values, nfields);
+}
+
 int store_xrange(Store *s, const char *key, uint64_t start_ms,
                  uint64_t start_seq, uint64_t end_ms, uint64_t end_seq,
                  long long count, StreamEntry **entries_out,
@@ -4487,6 +4523,33 @@ int store_xrange(Store *s, const char *key, uint64_t start_ms,
     arg.end_seq = end_seq;
     arg.count = count;
     int rc = stream_foreach(e->stream, xrange_collect_cb, &arg);
+    if (arg.oom || rc == -1) {
+        stream_entries_free(arg.entries, arg.n);
+        return -2;
+    }
+    *entries_out = arg.entries;
+    *n_out = arg.n;
+    return 0;
+}
+
+int store_xrevrange(Store *s, const char *key, uint64_t start_ms,
+                    uint64_t start_seq, uint64_t end_ms, uint64_t end_seq,
+                    long long count, StreamEntry **entries_out,
+                    size_t *n_out) {
+    *entries_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_STREAM) return -1;
+    e->last_access = ++s->clock;
+    struct xrange_collect_arg arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.start_ms = start_ms;
+    arg.start_seq = start_seq;
+    arg.end_ms = end_ms;
+    arg.end_seq = end_seq;
+    arg.count = count;
+    int rc = stream_foreach_rev(e->stream, xrevrange_collect_cb, &arg);
     if (arg.oom || rc == -1) {
         stream_entries_free(arg.entries, arg.n);
         return -2;

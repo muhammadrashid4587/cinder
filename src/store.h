@@ -823,6 +823,14 @@ int store_xrange(Store *s, const char *key, uint64_t start_ms,
                  long long count, StreamEntry **entries_out,
                  size_t *n_out);
 void stream_entries_free(StreamEntry *entries, size_t n);
+/* XREVRANGE: the entries whose IDs fall in [start, end] inclusive,
+   in reverse ID order (highest first), at most count of them
+   (count < 0 means no limit). Same ownership and return codes as
+   store_xrange. */
+int store_xrevrange(Store *s, const char *key, uint64_t start_ms,
+                    uint64_t start_seq, uint64_t end_ms, uint64_t end_seq,
+                    long long count, StreamEntry **entries_out,
+                    size_t *n_out);
 /* Visit every entry of a stream in ID order. Returns 0 on success,
    -1 = wrong type (or no such key, which the caller can treat the
    same way: no entries are visited). The callback receives each
@@ -835,5 +843,9 @@ typedef int (*stream_foreach_fn)(uint64_t ms, uint64_t seq,
                                  char *const *fields, char *const *values,
                                  size_t nfields, void *arg);
 int stream_foreach(const Stream *st, stream_foreach_fn fn, void *arg);
+/* stream_foreach in reverse ID order (highest first). Same
+   callback contract: returning non-zero stops the iteration and
+   that value is returned. */
+int stream_foreach_rev(const Stream *st, stream_foreach_fn fn, void *arg);
 
 #endif
