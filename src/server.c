@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.67.0"
+#define CINDER_VERSION "0.68.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -357,7 +357,7 @@ static int parse_fields_tail(char **argv, int argc, int i, int *first_out) {
  * element per stream that has any: [key, [[id, [field, value,
  * ...]], ...]]. A "$" ID resolves once, to the stream's top ID at
  * read time, so only entries added after the read qualify. ">" is
- * only for XREADGROUP, which does not exist yet, so it is an error.
+ * only for XREADGROUP, so it is an error here.
  * A read, so nothing is logged or replicated. With BLOCK and no
  * data yet, the client parks (see handle_xread) until an entry
  * arrives or the timeout passes; the parked request keeps the
@@ -2337,6 +2337,202 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (rc == -2)
             return dbuf_error(reply, "out of memory"), 0;
         return 0;
+    }
+    if (strcasecmp(cmd, "XGROUP") == 0) {
+        /* XGROUP CREATE key group id [MKSTREAM]: make a consumer
+           group on a stream. The id is "$" (the top ID at creation,
+           so only entries added later are delivered), "0" (from
+           the beginning) or an explicit ms-seq; MKSTREAM creates
+           the stream empty when it is missing. Only CREATE exists
+           so far; other subcommands are an error. A real write, so
+           it is logged to the AOF and replicated, which is also
+           how a group survives a restart (groups are not in RDB
+           snapshots yet). */
+        if (argc < 2)
+            return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
+        if (strcasecmp(argv[1], "CREATE") != 0)
+            return dbuf_error(reply, "Unknown subcommand or wrong number of arguments for 'xgroup'"), 0;
+        if (argc < 5 || argc > 6)
+            return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
+        int mkstream = 0;
+        if (argc == 6) {
+            if (strcasecmp(argv[5], "MKSTREAM") != 0)
+                return dbuf_error(reply, "syntax error"), 0;
+            mkstream = 1;
+        }
+        uint64_t ms, seq;
+        if (strcmp(argv[4], "$") == 0) {
+            if (store_stream_top(g_store, argv[2], &ms, &seq) != 0)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        } else if (stream_parse_bound(argv[4], 0, &ms, &seq) != 0) {
+            return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
+        }
+        int rc = store_xgroup_create(g_store, argv[2], argv[3], ms, seq, mkstream);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == -3)
+            return dbuf_error(reply, "BUSYGROUP Consumer Group name already exists"), 0;
+        if (rc == -4)
+            return dbuf_error(reply, "The XGROUP subcommand requires the key to exist. Use MKSTREAM to create the stream."), 0;
+        dbuf_simple(reply, "OK");
+        return 1;
+    }
+    if (strcasecmp(cmd, "XREADGROUP") == 0) {
+        /* XREADGROUP GROUP group consumer [COUNT count] STREAMS key
+           ... id ...: read a stream as a consumer of a group. ">"
+           delivers the entries after the group's cursor, records
+           them in the group's pending list and advances the cursor;
+           an explicit ID returns the group's pending entries for
+           this consumer after that ID, without changing delivery
+           state. "$" is not valid here. The reply is shaped like
+           XREAD's: one [key, entries] element per stream that has
+           any. BLOCK is not supported yet. A `>` read that delivers
+           entries changes state, so it is logged to the AOF and
+           replicated like a write; a read that delivers nothing, or
+           a pending-only read, is not. */
+        if (argc < 7)
+            return dbuf_error(reply, "wrong number of arguments for 'xreadgroup' command"), 0;
+        if (strcasecmp(argv[1], "GROUP") != 0)
+            return dbuf_error(reply, "syntax error"), 0;
+        const char *group = argv[2];
+        const char *consumer = argv[3];
+        long long count = -1;
+        int i = 4;
+        while (i < argc && strcasecmp(argv[i], "STREAMS") != 0) {
+            if (strcasecmp(argv[i], "COUNT") == 0) {
+                if (i + 1 >= argc)
+                    return dbuf_error(reply, "wrong number of arguments for 'xreadgroup' command"), 0;
+                if (!parse_ll(argv[i + 1], &count) || count < 1)
+                    return dbuf_error(reply, "COUNT must be a positive integer"), 0;
+                i += 2;
+            } else if (strcasecmp(argv[i], "BLOCK") == 0) {
+                return dbuf_error(reply, "BLOCK is not supported by XREADGROUP yet"), 0;
+            } else {
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        }
+        if (i >= argc)
+            return dbuf_error(reply, "wrong number of arguments for 'xreadgroup' command"), 0;
+        i++; /* past STREAMS */
+        if (argc - i < 2 || ((argc - i) % 2) != 0)
+            return dbuf_error(reply, "Unbalanced XREADGROUP list of streams: for each stream key an ID must be specified."), 0;
+        size_t nstreams = (size_t)(argc - i) / 2;
+        /* Collect first, then emit: a per-stream failure (a missing
+           group, say) answers an error, and the reply for the
+           streams already collected is discarded with it, as in
+           Redis — though entries already delivered to earlier
+           streams stay delivered. */
+        StreamEntry **all = calloc(nstreams, sizeof(StreamEntry *));
+        size_t *counts = calloc(nstreams, sizeof(size_t));
+        if (!all || !counts) {
+            free(all);
+            free(counts);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        size_t with_data = 0;
+        int changed = 0;
+        int rc = 0;
+        for (size_t k = 0; k < nstreams; k++) {
+            const char *key = argv[i + (int)k];
+            const char *id = argv[i + (int)nstreams + (int)k];
+            int new_only = 0;
+            uint64_t ms = 0, seq = 0;
+            if (strcmp(id, ">") == 0) {
+                new_only = 1;
+            } else if (strcmp(id, "$") == 0) {
+                rc = -4;
+                break;
+            } else if (stream_parse_bound(id, 0, &ms, &seq) != 0) {
+                rc = -4;
+                break;
+            }
+            size_t n = 0;
+            int xrc = store_xreadgroup(g_store, key, group, consumer,
+                                       new_only, ms, seq, count,
+                                       &all[k], &n);
+            if (xrc == -1) { rc = -1; break; }
+            if (xrc == -2) { rc = -2; break; }
+            if (xrc == -3) {
+                dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", key, group);
+                rc = -3;
+                break;
+            }
+            counts[k] = n;
+            if (n > 0) {
+                with_data++;
+                if (new_only) changed = 1;
+            }
+        }
+        if (rc == 0) {
+            dbuf_array_header(reply, (long long)with_data);
+            for (size_t k = 0; k < nstreams; k++) {
+                if (counts[k] == 0) continue;
+                dbuf_array_header(reply, 2);
+                dbuf_bulk(reply, argv[i + (int)k], strlen(argv[i + (int)k]));
+                dbuf_array_header(reply, (long long)counts[k]);
+                for (size_t e = 0; e < counts[k]; e++) {
+                    char idbuf[48];
+                    snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                             (unsigned long long)all[k][e].ms,
+                             (unsigned long long)all[k][e].seq);
+                    dbuf_array_header(reply, 2);
+                    dbuf_bulk(reply, idbuf, strlen(idbuf));
+                    dbuf_array_header(reply, (long long)(all[k][e].nfields * 2));
+                    for (size_t f = 0; f < all[k][e].nfields; f++) {
+                        dbuf_bulk(reply, all[k][e].fields[f],
+                                  strlen(all[k][e].fields[f]));
+                        dbuf_bulk(reply, all[k][e].values[f],
+                                  strlen(all[k][e].values[f]));
+                    }
+                }
+            }
+        }
+        for (size_t k = 0; k < nstreams; k++)
+            stream_entries_free(all[k], counts[k]);
+        free(all);
+        free(counts);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == -3) return 0; /* NOGROUP error already in the reply */
+        if (rc == -4)
+            return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
+        return changed ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "XACK") == 0) {
+        /* XACK key group id [id ...]: drop entries from a group's
+           pending list, answering how many were dropped. */
+        if (argc < 4)
+            return dbuf_error(reply, "wrong number of arguments for 'xack' command"), 0;
+        size_t n = (size_t)(argc - 3);
+        uint64_t *ms = malloc(n * sizeof(uint64_t));
+        uint64_t *seq = malloc(n * sizeof(uint64_t));
+        if (!ms || !seq) {
+            free(ms);
+            free(seq);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        for (size_t k = 0; k < n; k++) {
+            if (stream_parse_bound(argv[3 + (int)k], 0, &ms[k], &seq[k]) != 0) {
+                free(ms);
+                free(seq);
+                return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
+            }
+        }
+        long long removed = store_xack(g_store, argv[1], argv[2], ms, seq, n);
+        free(ms);
+        free(seq);
+        if (removed == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (removed == -3) {
+            dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", argv[1], argv[2]);
+            return 0;
+        }
+        dbuf_int(reply, removed);
+        return removed > 0 ? 1 : 0;
     }
     if (strcasecmp(cmd, "HSET") == 0) {
         if (argc < 4 || (argc % 2) != 0)
@@ -4322,6 +4518,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT",
             "HTTL", "HPTTL", "HPERSIST",
             "XADD", "XRANGE", "XREVRANGE", "XLEN", "XREAD",
+            "XGROUP", "XREADGROUP", "XACK",
             "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZINTER", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",

@@ -4163,10 +4163,23 @@ static void stream_entry_free(StreamEntry *en) {
     memset(en, 0, sizeof(*en));
 }
 
+/* Free one consumer group: its name, its consumer names, and the
+   consumer name on each pending entry. */
+static void stream_group_free(StreamGroup *g) {
+    free(g->name);
+    for (size_t i = 0; i < g->nconsumers; i++) free(g->consumers[i]);
+    free(g->consumers);
+    for (size_t i = 0; i < g->npel; i++) free(g->pel[i].consumer);
+    free(g->pel);
+    memset(g, 0, sizeof(*g));
+}
+
 static void stream_free(Stream *st) {
     if (!st) return;
     for (size_t i = 0; i < st->len; i++) stream_entry_free(&st->entries[i]);
     free(st->entries);
+    for (size_t i = 0; i < st->ngroups; i++) stream_group_free(&st->groups[i]);
+    free(st->groups);
     free(st);
 }
 
@@ -4557,6 +4570,228 @@ int store_xrevrange(Store *s, const char *key, uint64_t start_ms,
     *entries_out = arg.entries;
     *n_out = arg.n;
     return 0;
+}
+
+/* ---------- Consumer groups (XGROUP / XREADGROUP / XACK) ---------- */
+
+/* The group with this name on a stream, or NULL. */
+static StreamGroup *stream_group_find(Stream *st, const char *name) {
+    for (size_t i = 0; i < st->ngroups; i++)
+        if (strcmp(st->groups[i].name, name) == 0) return &st->groups[i];
+    return NULL;
+}
+
+/* Record a consumer on a group if it is not there already (a
+   no-op when it is). Returns 0 on success, -1 = out of memory. */
+static int stream_group_add_consumer(StreamGroup *g, const char *consumer) {
+    for (size_t i = 0; i < g->nconsumers; i++)
+        if (strcmp(g->consumers[i], consumer) == 0) return 0;
+    if (g->nconsumers == g->cap_consumers) {
+        size_t ncap = g->cap_consumers ? g->cap_consumers * 2 : 4;
+        char **ncon = realloc(g->consumers, ncap * sizeof(*ncon));
+        if (!ncon) return -1;
+        g->consumers = ncon;
+        g->cap_consumers = ncap;
+    }
+    g->consumers[g->nconsumers] = strdup(consumer);
+    if (!g->consumers[g->nconsumers]) return -1;
+    g->nconsumers++;
+    return 0;
+}
+
+/* The PEL entry for this ID, or NULL when the entry is not
+   pending. */
+static StreamPending *stream_pel_find(StreamGroup *g, uint64_t ms,
+                                      uint64_t seq) {
+    for (size_t i = 0; i < g->npel; i++)
+        if (g->pel[i].ms == ms && g->pel[i].seq == seq) return &g->pel[i];
+    return NULL;
+}
+
+/* Record a delivery in the PEL: a fresh entry gets count 1 and the
+   current time, one already pending gets its count bumped, its
+   time refreshed, and its owner moved to this consumer. Returns 0
+   on success, -1 = out of memory. */
+static int stream_pel_deliver(StreamGroup *g, uint64_t ms, uint64_t seq,
+                              const char *consumer) {
+    StreamPending *p = stream_pel_find(g, ms, seq);
+    if (p) {
+        if (strcmp(p->consumer, consumer) != 0) {
+            char *nc = strdup(consumer);
+            if (!nc) return -1;
+            free(p->consumer);
+            p->consumer = nc;
+        }
+        p->delivery_time = now_ms();
+        p->delivery_count++;
+        return 0;
+    }
+    if (g->npel == g->cap_pel) {
+        size_t ncap = g->cap_pel ? g->cap_pel * 2 : 8;
+        StreamPending *npel = realloc(g->pel, ncap * sizeof(*npel));
+        if (!npel) return -1;
+        g->pel = npel;
+        g->cap_pel = ncap;
+    }
+    StreamPending *np = &g->pel[g->npel];
+    memset(np, 0, sizeof(*np));
+    np->ms = ms;
+    np->seq = seq;
+    np->consumer = strdup(consumer);
+    if (!np->consumer) return -1;
+    np->delivery_time = now_ms();
+    np->delivery_count = 1;
+    g->npel++;
+    return 0;
+}
+
+int store_xgroup_create(Store *s, const char *key, const char *group,
+                        uint64_t ms, uint64_t seq, int mkstream) {
+    Entry *e = store_find(s, key, NULL);
+    if (e && e->type != ENTRY_STREAM) return -1;
+    if (!e && !mkstream) return -4;
+    if (!e) {
+        /* MKSTREAM: create the empty stream first, the same way
+           XADD creates its entry, so the group has a stream to
+           live on. */
+        if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+            store_resize(s);
+        e = calloc(1, sizeof(Entry));
+        if (!e) return -2;
+        e->key = strdup(key);
+        e->stream = stream_new();
+        if (!e->key || !e->stream) {
+            entry_free(e);
+            return -2;
+        }
+        e->type = ENTRY_STREAM;
+        e->expire_at = -1;
+        e->last_access = ++s->clock;
+        e->version = ++s->mod_seq;
+        size_t idx = hash_key(key) % s->cap;
+        e->next = s->buckets[idx];
+        s->buckets[idx] = e;
+        s->count++;
+    }
+    Stream *st = e->stream;
+    if (stream_group_find(st, group)) return -3;
+    if (st->ngroups == st->cap_groups) {
+        size_t ncap = st->cap_groups ? st->cap_groups * 2 : 4;
+        StreamGroup *ng = realloc(st->groups, ncap * sizeof(*ng));
+        if (!ng) return -2;
+        st->groups = ng;
+        st->cap_groups = ncap;
+    }
+    StreamGroup *g = &st->groups[st->ngroups];
+    memset(g, 0, sizeof(*g));
+    g->name = strdup(group);
+    if (!g->name) return -2;
+    g->last_ms = ms;
+    g->last_seq = seq;
+    st->ngroups++;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return 0;
+}
+
+int store_xreadgroup(Store *s, const char *key, const char *group,
+                     const char *consumer, int new_only, uint64_t ms,
+                     uint64_t seq, long long count,
+                     StreamEntry **entries_out, size_t *n_out) {
+    *entries_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    Stream *st = e->stream;
+    StreamGroup *g = stream_group_find(st, group);
+    if (!g) return -3;
+    e->last_access = ++s->clock;
+    /* Collect the entries first, so a copy failure leaves the
+       group untouched; delivery tracking is applied after the
+       scan, only for the entries actually returned. */
+    struct xrange_collect_arg arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.count = -1;
+    for (size_t i = 0; i < st->len; i++) {
+        const StreamEntry *en = &st->entries[i];
+        if (new_only) {
+            /* After the cursor: the cursor is the last ID
+               delivered, so anything above it is new. */
+            if (en->ms < g->last_ms ||
+                (en->ms == g->last_ms && en->seq <= g->last_seq))
+                continue;
+        } else {
+            /* Pending for this consumer, after the bound, and
+               still in the stream (a trimmed entry is skipped). */
+            if (en->ms < ms || (en->ms == ms && en->seq <= seq))
+                continue;
+            StreamPending *p = stream_pel_find(g, en->ms, en->seq);
+            if (!p || strcmp(p->consumer, consumer) != 0) continue;
+        }
+        if (count >= 0 && (long long)arg.n >= count) break;
+        if (xrange_collect_copy(&arg, en->ms, en->seq, en->fields,
+                                en->values, en->nfields) != 0)
+            break;
+    }
+    if (arg.oom) {
+        stream_entries_free(arg.entries, arg.n);
+        return -2;
+    }
+    if (arg.n == 0) {
+        free(arg.entries);
+        /* A new consumer still comes into being on an empty read,
+           as in Redis, so a later pending read finds it. */
+        if (stream_group_add_consumer(g, consumer) != 0) return -2;
+        return 0;
+    }
+    if (new_only) {
+        /* Deliver: PEL entries for what is returned, the cursor
+           moved to the last ID delivered. */
+        for (size_t i = 0; i < arg.n; i++) {
+            if (stream_pel_deliver(g, arg.entries[i].ms,
+                                   arg.entries[i].seq, consumer) != 0) {
+                stream_entries_free(arg.entries, arg.n);
+                return -2;
+            }
+        }
+        g->last_ms = arg.entries[arg.n - 1].ms;
+        g->last_seq = arg.entries[arg.n - 1].seq;
+        entry_touch(s, e);
+    }
+    if (stream_group_add_consumer(g, consumer) != 0) {
+        stream_entries_free(arg.entries, arg.n);
+        return -2;
+    }
+    *entries_out = arg.entries;
+    *n_out = arg.n;
+    return 0;
+}
+
+long long store_xack(Store *s, const char *key, const char *group,
+                     const uint64_t *ms, const uint64_t *seq, size_t n) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    Stream *st = e->stream;
+    StreamGroup *g = stream_group_find(st, group);
+    if (!g) return -3;
+    e->last_access = ++s->clock;
+    long long removed = 0;
+    for (size_t k = 0; k < n; k++) {
+        for (size_t i = 0; i < g->npel; i++) {
+            if (g->pel[i].ms == ms[k] && g->pel[i].seq == seq[k]) {
+                free(g->pel[i].consumer);
+                memmove(&g->pel[i], &g->pel[i + 1],
+                        (g->npel - i - 1) * sizeof(*g->pel));
+                g->npel--;
+                removed++;
+                break;
+            }
+        }
+    }
+    if (removed > 0) entry_touch(s, e);
+    return removed;
 }
 
 void stream_entries_free(StreamEntry *entries, size_t n) {

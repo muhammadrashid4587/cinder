@@ -1358,6 +1358,103 @@ def main():
                          ["2000-1", ["a", "5"]], ["2000-2", ["a", "6"]]]]]])
         check("COMMAND lists XREAD", "XREAD" in c.cmd("COMMAND"), True)
         check("XREAD cleanup", c.cmd("DEL", "xr1", "xr2"), 2)
+        # XGROUP / XREADGROUP / XACK: consumer groups, ">" delivery
+        # with PEL tracking, pending re-reads with 0, acking, and the
+        # error cases. A group created at 0 delivers everything;
+        # one created at "$" only what comes after.
+        check("XGROUP setup 1", c.cmd("XADD", "xg", "1000-1", "a", "1"), "1000-1")
+        check("XGROUP setup 2", c.cmd("XADD", "xg", "1000-2", "a", "2"), "1000-2")
+        check("XGROUP setup 3", c.cmd("XADD", "xg", "2000-0", "a", "3"), "2000-0")
+        check("XGROUP create from start",
+              c.cmd("XGROUP", "CREATE", "xg", "g1", "0"), "OK")
+        check("XGROUP create dup", c.cmd("XGROUP", "CREATE", "xg", "g1", "0"),
+              ("error", "ERR BUSYGROUP Consumer Group name already exists"))
+        check("XGROUP create missing", c.cmd("XGROUP", "CREATE", "nope", "g1", "0"),
+              ("error", "ERR The XGROUP subcommand requires the key to exist. Use MKSTREAM to create the stream."))
+        check("XGROUP create mkstream",
+              c.cmd("XGROUP", "CREATE", "xgm", "g1", "$", "MKSTREAM"), "OK")
+        check("XGROUP mkstream exists", c.cmd("EXISTS", "xgm"), 1)
+        check("XGROUP mkstream empty", c.cmd("XLEN", "xgm"), 0)
+        check("XGROUP create dollar",
+              c.cmd("XGROUP", "CREATE", "xg", "g2", "$"), "OK")
+        check("XGROUP create wrongtype",
+              c.cmd("XGROUP", "CREATE", "after", "g1", "0"), wrongtype)
+        check("XGROUP create bad id", c.cmd("XGROUP", "CREATE", "xg", "g3", "abc"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XGROUP bad subcommand", c.cmd("XGROUP", "SETID", "xg", "g1", "0"),
+              ("error", "ERR Unknown subcommand or wrong number of arguments for 'xgroup'"))
+        check("XGROUP bad mkstream", c.cmd("XGROUP", "CREATE", "xg", "g3", "0", "FOO"),
+              ("error", "ERR syntax error"))
+        check("XREADGROUP new",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "xg", ">"),
+              [["xg", [["1000-1", ["a", "1"]], ["1000-2", ["a", "2"]],
+                        ["2000-0", ["a", "3"]]]]])
+        check("XREADGROUP new again empty",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "xg", ">"), [])
+        check("XREADGROUP dollar group empty",
+              c.cmd("XREADGROUP", "GROUP", "g2", "c1", "STREAMS", "xg", ">"), [])
+        check("XREADGROUP pending 0",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "xg", "0"),
+              [["xg", [["1000-1", ["a", "1"]], ["1000-2", ["a", "2"]],
+                        ["2000-0", ["a", "3"]]]]])
+        check("XREADGROUP pending other consumer empty",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c2", "STREAMS", "xg", "0"), [])
+        check("XREADGROUP pending after id",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "xg", "1000-1"),
+              [["xg", [["1000-2", ["a", "2"]], ["2000-0", ["a", "3"]]]]])
+        check("XREADGROUP new add", c.cmd("XADD", "xg", "2000-1", "a", "4"), "2000-1")
+        check("XREADGROUP new count",
+              c.cmd("XREADGROUP", "GROUP", "g2", "c1", "COUNT", "1",
+                    "STREAMS", "xg", ">"),
+              [["xg", [["2000-1", ["a", "4"]]]]])
+        check("XREADGROUP count leaves rest",
+              c.cmd("XREADGROUP", "GROUP", "g2", "c1", "STREAMS", "xg", ">"), [])
+        check("XREADGROUP multi-stream",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS",
+                    "xg", "xgm", ">", ">"),
+              [["xg", [["2000-1", ["a", "4"]]]]])
+        check("XACK one", c.cmd("XACK", "xg", "g1", "1000-1"), 1)
+        check("XACK again", c.cmd("XACK", "xg", "g1", "1000-1"), 0)
+        check("XACK multi", c.cmd("XACK", "xg", "g1", "1000-2", "2000-0"), 2)
+        check("XREADGROUP pending after ack",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "xg", "0"),
+              [["xg", [["2000-1", ["a", "4"]]]]])
+        check("XREADGROUP nogroup",
+              c.cmd("XREADGROUP", "GROUP", "zz", "c1", "STREAMS", "xg", ">"),
+              ("error", "ERR NOGROUP No such key 'xg' or consumer group 'zz'"))
+        check("XREADGROUP missing key",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "nope", ">"),
+              ("error", "ERR NOGROUP No such key 'nope' or consumer group 'g1'"))
+        check("XREADGROUP wrongtype",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "after", ">"),
+              wrongtype)
+        check("XREADGROUP dollar",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "xg", "$"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XREADGROUP bad id",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "xg", "abc"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XREADGROUP block",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "BLOCK", "100",
+                    "STREAMS", "xg", ">"),
+              ("error", "ERR BLOCK is not supported by XREADGROUP yet"))
+        check("XREADGROUP bad count",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "COUNT", "0",
+                    "STREAMS", "xg", ">"),
+              ("error", "ERR COUNT must be a positive integer"))
+        check("XREADGROUP unbalanced",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "xg", "xgm", ">"),
+              ("error", "ERR Unbalanced XREADGROUP list of streams: for each stream key an ID must be specified."))
+        check("XACK nogroup", c.cmd("XACK", "xg", "zz", "1000-1"),
+              ("error", "ERR NOGROUP No such key 'xg' or consumer group 'zz'"))
+        check("XACK missing key", c.cmd("XACK", "nope", "g1", "1000-1"),
+              ("error", "ERR NOGROUP No such key 'nope' or consumer group 'g1'"))
+        check("XACK bad id", c.cmd("XACK", "xg", "g1", "abc"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("COMMAND lists XGROUP XREADGROUP XACK",
+              "XGROUP" in c.cmd("COMMAND") and "XREADGROUP" in c.cmd("COMMAND")
+              and "XACK" in c.cmd("COMMAND"), True)
+        check("XGROUP cleanup", c.cmd("DEL", "xg", "xgm"), 2)
         # Sorted sets: add/update, scores, wrong type, TTL, AOF
         # persistence. Members are ordered by (score, member); range
         # commands are not implemented yet.
@@ -3280,7 +3377,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.67.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.68.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

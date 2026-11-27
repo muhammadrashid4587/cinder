@@ -77,15 +77,42 @@ typedef struct StreamEntry {
     size_t cap;
 } StreamEntry;
 
+/* One pending entry in a consumer group's PEL: the entry ID, the
+   consumer it was delivered to, when it was last delivered (ms
+   since epoch) and how many times it has been delivered. The PEL
+   is kept in delivery (ID) order. */
+typedef struct StreamPending {
+    uint64_t ms, seq;
+    char *consumer; /* owned */
+    long long delivery_time;
+    long long delivery_count;
+} StreamPending;
+
+/* A consumer group on a stream: its name, the last ID delivered
+   (the cursor `>` reads from), the consumers that have read from
+   it, and its pending entries list (PEL). Consumers come into
+   being when they first read, as in Redis. */
+typedef struct StreamGroup {
+    char *name; /* owned */
+    uint64_t last_ms, last_seq;
+    char **consumers; /* owned names */
+    size_t nconsumers, cap_consumers;
+    StreamPending *pel;
+    size_t npel, cap_pel;
+} StreamGroup;
+
 /* A stream value: entries in insertion (ID) order, plus the top ID
    (last_ms, last_seq), so the next auto or partial ID is derived
    without scanning. New entries append at the end; MAXLEN trims
-   from the front. */
+   from the front. Consumer groups live on the stream too, so
+   deleting the key (or trimming it empty) drops them with it. */
 typedef struct Stream {
     StreamEntry *entries;
     size_t len;
     size_t cap;
     uint64_t last_ms, last_seq;
+    StreamGroup *groups;
+    size_t ngroups, cap_groups;
 } Stream;
 
 typedef struct Entry {
@@ -831,6 +858,37 @@ int store_xrevrange(Store *s, const char *key, uint64_t start_ms,
                     uint64_t start_seq, uint64_t end_ms, uint64_t end_seq,
                     long long count, StreamEntry **entries_out,
                     size_t *n_out);
+/* XGROUP CREATE: make a consumer group on a stream, starting at
+   (ms, seq) — the last-delivered ID, so `>` reads deliver what
+   comes after it. With mkstream set, a missing stream is created
+   empty first. Creating a group changes the key, so it bumps the
+   version (a WATCH on the key is invalidated). Returns 0 on
+   success, -1 = the key holds a non-stream value, -2 = out of
+   memory, -3 = the group already exists, -4 = the stream does not
+   exist. */
+int store_xgroup_create(Store *s, const char *key, const char *group,
+                        uint64_t ms, uint64_t seq, int mkstream);
+/* XREADGROUP: deliver entries of one stream to a consumer of a
+   group. When new_only is set, the entries after the group's
+   cursor, which are added to the PEL (delivery count 1, stamped
+   with the current time) and advance the cursor; otherwise the
+   group's pending entries for this consumer with an ID after
+   (ms, seq), returned without changing delivery state. Entries
+   trimmed from the stream are skipped on a pending read. At most
+   count entries (count < 0 means no limit). The returned entries
+   are copies owned by the caller; free them with
+   stream_entries_free. Returns 0 on success, -1 = the key holds a
+   non-stream value, -2 = out of memory, -3 = no such key or
+   consumer group. */
+int store_xreadgroup(Store *s, const char *key, const char *group,
+                     const char *consumer, int new_only, uint64_t ms,
+                     uint64_t seq, long long count,
+                     StreamEntry **entries_out, size_t *n_out);
+/* XACK: drop the given IDs from a group's PEL. Returns the number
+   removed, -1 = the key holds a non-stream value, -2 = out of
+   memory, -3 = no such key or consumer group. */
+long long store_xack(Store *s, const char *key, const char *group,
+                     const uint64_t *ms, const uint64_t *seq, size_t n);
 /* Visit every entry of a stream in ID order. Returns 0 on success,
    -1 = wrong type (or no such key, which the caller can treat the
    same way: no entries are visited). The callback receives each

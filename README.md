@@ -5,7 +5,8 @@ Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, 
 sets, hashes, sorted sets, HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`), geo
 (`GEOADD`/`GEODIST`/`GEOPOS`/`GEOHASH`/`GEOSEARCH`/`GEOSEARCHSTORE`/`GEORADIUS`/
 `GEORADIUSBYMEMBER`/`GEORADIUS_RO`/`GEORADIUSBYMEMBER_RO`) and streams
-(`XADD` / `XRANGE` / `XREVRANGE` / `XLEN` / `XREAD`) with TTLs, approximate LRU eviction, and an append-only file for
+(`XADD` / `XRANGE` / `XREVRANGE` / `XLEN` / `XREAD` / `XGROUP` /
+`XREADGROUP` / `XACK`) with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
 flush thread that does the once-a-second AOF sync under `everysec`,
@@ -13,7 +14,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.67.0.
+Version 0.68.0.
 
 ## Why
 
@@ -126,7 +127,10 @@ OK
 | `XRANGE key start end [COUNT count]` | The entries whose IDs fall in `[start, end]` inclusive, in ID order, each as `[id, [field, value, ...]]`; bounds are `-` (the minimum ID), `+` (the maximum ID), `ms` (the whole millisecond: `ms-0` as a start bound, `ms-MAX` as an end bound) or `ms-seq`; `COUNT` limits the entries returned (`0` returns none, a negative count is an error). An empty array when the key is missing or the range is empty, including a start above the end. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
 | `XREVRANGE key end start [COUNT count]` | The entries whose IDs fall in `[start, end]` inclusive, in reverse ID order (highest first), each as `[id, [field, value, ...]]`; the bounds are given end-first, as in Redis, and parsed the same way as `XRANGE`'s (`-` / `+` / `ms` / `ms-seq`, a bare ms covering the whole millisecond); `COUNT` takes the highest IDs first (`0` returns none, a negative count is an error). An empty array when the key is missing or the range is empty, including a start above the end. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
 | `XLEN key` | Number of entries in a stream (`0` when missing); read-only |
-| `XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]` | The entries after each ID, one `[key, [[id, [field, value, ...]], ...]]` element per stream that has any (streams with nothing new are left out); IDs are `ms-seq`, a bare `ms` (the whole millisecond: entries after `ms-0`), or `$` (the stream's top ID at read time, resolved once, so only entries added after the read qualify); `>` is an error (it needs `XREADGROUP`, which does not exist yet). `COUNT` limits the entries per stream; `BLOCK` waits for new entries instead of answering at once — an empty array when there is nothing and no `BLOCK`, a nil array when a `BLOCK` times out, `BLOCK 0` waits forever. A blocked client parks with no lock held (the loop re-checks it every iteration, so it wakes within one iteration of the `XADD` that releases it, and a disconnect while parked drops the request) and sends nothing more until its read is answered, so its `EPOLLIN` interest is dropped while it waits. `BLOCK` is refused inside `MULTI`/`EXEC`; a plain `XREAD` queues and runs at `EXEC`. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
+| `XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]` | The entries after each ID, one `[key, [[id, [field, value, ...]], ...]]` element per stream that has any (streams with nothing new are left out); IDs are `ms-seq`, a bare `ms` (the whole millisecond: entries after `ms-0`), or `$` (the stream's top ID at read time, resolved once, so only entries added after the read qualify); `>` is an error (it needs `XREADGROUP`, below). `COUNT` limits the entries per stream; `BLOCK` waits for new entries instead of answering at once — an empty array when there is nothing and no `BLOCK`, a nil array when a `BLOCK` times out, `BLOCK 0` waits forever. A blocked client parks with no lock held (the loop re-checks it every iteration, so it wakes within one iteration of the `XADD` that releases it, and a disconnect while parked drops the request) and sends nothing more until its read is answered, so its `EPOLLIN` interest is dropped while it waits. `BLOCK` is refused inside `MULTI`/`EXEC`; a plain `XREAD` queues and runs at `EXEC`. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
+| `XGROUP CREATE key group id [MKSTREAM]` | Create a consumer group on a stream, starting at `id`: `$` (the top ID at creation, so only entries added later are delivered), `0` (from the beginning) or an explicit `ms-seq`; `MKSTREAM` creates the stream empty when it is missing. An existing group name is a `BUSYGROUP` error, a missing stream without `MKSTREAM` is an error, and only `CREATE` exists so far. A real write, so it is AOF-logged and replicated, invalidates a `WATCH`, and is how a group survives a restart (groups are not in RDB snapshots yet) |
+| `XREADGROUP GROUP group consumer [COUNT count] STREAMS key [key ...] id [id ...]` | Read a stream as a consumer of a group, one `[key, [[id, [field, value, ...]], ...]]` element per stream that has any, as in `XREAD`. `>` delivers the entries after the group's cursor, records them in the group's pending list (PEL) with a delivery count and time, and advances the cursor; an explicit ID returns the group's pending entries for this consumer after that ID, without changing delivery state. `$` is not valid here, and `BLOCK` is not supported yet. `COUNT` limits the entries per stream. A `>` read that delivers entries is AOF-logged and replicated like a write (an AOF replay re-delivers, so delivery counts go up by one per replay); a read that delivers nothing, or a pending-only read, is not logged. A missing key or group is a `NOGROUP` error |
+| `XACK key group id [id ...]` | Drop entries from a group's pending list, answering how many were dropped (`0` for an ID that was not pending). A missing key or group is a `NOGROUP` error. A real change, so it is AOF-logged and replicated when it drops anything |
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZMSCORE key member [member ...]` | Scores of several members at once, in order (`nil` for a missing member, an array of `nil`s when the key is missing) |
@@ -1538,5 +1542,20 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       highest-first, with the bounds given end-first and parsed
       the same way as `XRANGE`'s, and `COUNT` taking the highest
       IDs first. Read-only, so no AOF, RDB, or replication change
-      was needed, and it is safe on a replica. `XREADGROUP`
-      (consumer groups) is next.
+      was needed, and it is safe on a replica.
+- [x] Consumer groups, `XGROUP` / `XREADGROUP` / `XACK` (0.68.0):
+      `XGROUP CREATE key group id [MKSTREAM]` makes a group starting
+      at `$` (only later entries), `0` (from the beginning) or an
+      explicit ID, creating the stream empty with `MKSTREAM`;
+      `XREADGROUP GROUP group consumer [COUNT count] STREAMS key ...
+      id ...` delivers new entries with `>` (recorded in the
+      group's pending list with delivery count and time, cursor
+      advanced) or re-reads pending entries for the consumer with
+      an explicit ID, across several streams; `XACK key group id
+      ...` drops entries from the pending list. Groups live on the
+      stream, so deleting the key drops them with it. A `>` read
+      that delivers, a group creation and a real ack are AOF-logged
+      and replicated; groups are not in RDB snapshots yet, and an
+      AOF replay re-delivers, so delivery counts go up by one per
+      replay. `XPENDING` / `XCLAIM` and `BLOCK` for `XREADGROUP`
+      are next.
