@@ -889,6 +889,26 @@ int store_xreadgroup(Store *s, const char *key, const char *group,
    memory, -3 = no such key or consumer group. */
 long long store_xack(Store *s, const char *key, const char *group,
                      const uint64_t *ms, const uint64_t *seq, size_t n);
+/* XCLAIM: take over pending entries of a group for another
+   consumer. An entry is claimed when it has been idle at least
+   min_idle_ms since its last delivery, or when force is set (which
+   also claims entries that are in the stream but not in the PEL at
+   all, creating a PEL entry for them). A claimed entry is moved to
+   this consumer, its delivery time is set to delivery_time and its
+   delivery count is bumped by one, or set to retrycount when that
+   is >= 0. IDs that are not in the stream, are not idle enough, or
+   are not pending (without FORCE) are left out of the reply, and a
+   repeated ID in one call is claimed only once. The claimed
+   entries are returned as copies in request order; free them with
+   stream_entries_free. Returns 0 on success, -1 = the key holds a
+   non-stream value, -2 = out of memory, -3 = no such key or
+   consumer group. A claim changes delivery state, so the caller
+   logs and replicates it like a write. */
+int store_xclaim(Store *s, const char *key, const char *group,
+                 const char *consumer, long long min_idle_ms,
+                 const uint64_t *ms, const uint64_t *seq, size_t n,
+                 int force, long long retrycount, long long delivery_time,
+                 StreamEntry **entries_out, size_t *n_out);
 /* One pending entry as XPENDING reports it: the entry ID, the
    consumer it was last delivered to, how long (ms) since it was
    last delivered, and how many times it has been delivered. */

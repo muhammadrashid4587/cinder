@@ -1434,10 +1434,81 @@ def main():
         check("XREADGROUP bad id",
               c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "xg", "abc"),
               ("error", "ERR Invalid stream ID specified as stream command argument"))
-        check("XREADGROUP block",
-              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "BLOCK", "100",
-                    "STREAMS", "xg", ">"),
-              ("error", "ERR BLOCK is not supported by XREADGROUP yet"))
+        # XREADGROUP BLOCK: data already there answers at once, a
+        # timeout answers nil, an XADD from another client wakes a
+        # blocked reader (BLOCK 0 too), a disconnect while parked
+        # does not wedge the server, and BLOCK is refused inside
+        # MULTI while a plain XREADGROUP queues and runs at EXEC.
+        # A fresh stream and group, so the wake-ups do not disturb
+        # the xg state the checks below rely on.
+        check("XREADGROUP block setup", c.cmd("XADD", "xgb", "1000-1", "f", "v"), "1000-1")
+        check("XREADGROUP block group",
+              c.cmd("XGROUP", "CREATE", "xgb", "gb", "0"), "OK")
+        check("XREADGROUP block drain",
+              c.cmd("XREADGROUP", "GROUP", "gb", "c1", "STREAMS", "xgb", ">"),
+              [["xgb", [["1000-1", ["f", "v"]]]]])
+        check("XREADGROUP block add", c.cmd("XADD", "xgb", "1000-2", "f", "w"), "1000-2")
+        check("XREADGROUP block data ready",
+              c.cmd("XREADGROUP", "GROUP", "gb", "c1", "BLOCK", "5000",
+                    "STREAMS", "xgb", ">"),
+              [["xgb", [["1000-2", ["f", "w"]]]]])
+        t0 = time.time()
+        check("XREADGROUP block timeout",
+              c.cmd("XREADGROUP", "GROUP", "gb", "c1", "BLOCK", "300",
+                    "STREAMS", "xgb", ">"), None)
+        check("XREADGROUP block timeout took ~300ms", 0.25 <= time.time() - t0 < 5, True)
+        cg = Client(PORT)
+        wake = {}
+        def blocked_group_read():
+            wake["r"] = cg.cmd("XREADGROUP", "GROUP", "gb", "c1", "BLOCK",
+                               "5000", "STREAMS", "xgb", ">")
+        bt = threading.Thread(target=blocked_group_read)
+        bt.start()
+        time.sleep(0.3)
+        check("XREADGROUP block wake add", c.cmd("XADD", "xgb", "1000-3", "f", "x"), "1000-3")
+        bt.join(timeout=6)
+        check("XREADGROUP block woken", bt.is_alive(), False)
+        check("XREADGROUP block wake result", wake.get("r"),
+              [["xgb", [["1000-3", ["f", "x"]]]]])
+        check("XREADGROUP blocked client alive", cg.cmd("PING"), "PONG")
+        # The woken read delivered, so the entry is pending for c1.
+        check("XREADGROUP block wake pending",
+              c.cmd("XPENDING", "xgb", "gb"),
+              [3, "1000-1", "1000-3", [["c1", 3]]])
+        wake0 = {}
+        def blocked_group_read0():
+            wake0["r"] = cg.cmd("XREADGROUP", "GROUP", "gb", "c1", "BLOCK",
+                                "0", "STREAMS", "xgb", ">")
+        bt0 = threading.Thread(target=blocked_group_read0)
+        bt0.start()
+        time.sleep(0.3)
+        check("XREADGROUP block 0 wake add", c.cmd("XADD", "xgb", "1000-4", "f", "y"), "1000-4")
+        bt0.join(timeout=6)
+        check("XREADGROUP block 0 woken", bt0.is_alive(), False)
+        check("XREADGROUP block 0 wake result", wake0.get("r"),
+              [["xgb", [["1000-4", ["f", "y"]]]]])
+        cg.close()
+        # A client that disconnects while parked on BLOCK 0 does not
+        # wedge the server: the parked request is dropped with it.
+        raw = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+        raw.sendall(b"*9\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$2\r\ngb\r\n$2\r\nc1\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n$7\r\nSTREAMS\r\n$3\r\nxgb\r\n$1\r\n>\r\n")
+        time.sleep(0.3)
+        raw.close()
+        time.sleep(0.3)
+        check("server alive after group blocked disconnect", c.cmd("PING"), "PONG")
+        check("server process alive after group blocked disconnect", proc.poll() is None, True)
+        # BLOCK is refused inside MULTI; a plain XREADGROUP queues
+        # and runs at EXEC.
+        check("MULTI xreadgroup", c.cmd("MULTI"), "OK")
+        check("MULTI xreadgroup block",
+              c.cmd("XREADGROUP", "GROUP", "gb", "c1", "BLOCK", "100",
+                    "STREAMS", "xgb", ">"),
+              ("error", "ERR BLOCK is not allowed in MULTI/EXEC"))
+        check("MULTI xreadgroup queued",
+              c.cmd("XREADGROUP", "GROUP", "gb", "c1", "STREAMS", "xgb", ">"),
+              "QUEUED")
+        check("EXEC xreadgroup", c.cmd("EXEC"), [[]])
+        check("XREADGROUP block cleanup", c.cmd("DEL", "xgb"), 1)
         check("XREADGROUP bad count",
               c.cmd("XREADGROUP", "GROUP", "g1", "c1", "COUNT", "0",
                     "STREAMS", "xg", ">"),
@@ -1493,6 +1564,80 @@ def main():
               ("error", "ERR COUNT must be a positive integer"))
         check("XPENDING wrong args", c.cmd("XPENDING", "xg"),
               ("error", "ERR wrong number of arguments for 'xpending' command"))
+        # XCLAIM: take over a pending entry for another consumer.
+        # g1 still has one pending entry (2000-1, delivered once to
+        # c1); a min-idle-time it has not reached yet claims nothing,
+        # 0 claims it at once, and the delivery count bumps each
+        # time it changes hands.
+        check("XCLAIM too idle", c.cmd("XCLAIM", "xg", "g1", "c2", "60000", "2000-1"), [])
+        check("XCLAIM basic", c.cmd("XCLAIM", "xg", "g1", "c2", "0", "2000-1"),
+              [["2000-1", ["a", "4"]]])
+        check("XPENDING after claim", c.cmd("XPENDING", "xg", "g1"),
+              [1, "2000-1", "2000-1", [["c2", 1]]])
+        pend = c.cmd("XPENDING", "xg", "g1", "-", "+", "10")
+        check("XCLAIM deliveries bumped", pend[0][3], 2)
+        check("XCLAIM new consumer", pend[0][1], "c2")
+        check("XCLAIM justid", c.cmd("XCLAIM", "xg", "g1", "c3", "0", "2000-1", "JUSTID"),
+              ["2000-1"])
+        pend = c.cmd("XPENDING", "xg", "g1", "-", "+", "10")
+        check("XCLAIM justid deliveries", pend[0][3], 3)
+        check("XCLAIM justid consumer", pend[0][1], "c3")
+        check("XCLAIM retrycount",
+              c.cmd("XCLAIM", "xg", "g1", "c2", "0", "2000-1", "RETRYCOUNT", "5"),
+              [["2000-1", ["a", "4"]]])
+        pend = c.cmd("XPENDING", "xg", "g1", "-", "+", "10")
+        check("XCLAIM retrycount set", pend[0][3], 5)
+        check("XCLAIM idle",
+              c.cmd("XCLAIM", "xg", "g1", "c2", "0", "2000-1", "IDLE", "1000"),
+              [["2000-1", ["a", "4"]]])
+        pend = c.cmd("XPENDING", "xg", "g1", "-", "+", "10")
+        check("XCLAIM idle applied", pend[0][2] >= 1000, True)
+        check("XCLAIM idle deliveries", pend[0][3], 6)
+        check("XCLAIM time",
+              c.cmd("XCLAIM", "xg", "g1", "c2", "0", "2000-1", "TIME", "1000"),
+              [["2000-1", ["a", "4"]]])
+        pend = c.cmd("XPENDING", "xg", "g1", "-", "+", "10")
+        check("XCLAIM time applied", pend[0][2] > 1000000, True)
+        check("XCLAIM time deliveries", pend[0][3], 7)
+        # FORCE claims an entry that is in the stream but not
+        # pending (1000-1 was acked earlier); without FORCE it is
+        # left alone.
+        check("XCLAIM not pending", c.cmd("XCLAIM", "xg", "g1", "c2", "0", "1000-1"), [])
+        check("XCLAIM force",
+              c.cmd("XCLAIM", "xg", "g1", "c2", "0", "1000-1", "FORCE"),
+              [["1000-1", ["a", "1"]]])
+        check("XPENDING after force claim", c.cmd("XPENDING", "xg", "g1"),
+              [2, "1000-1", "2000-1", [["c2", 2]]])
+        check("XCLAIM missing id", c.cmd("XCLAIM", "xg", "g1", "c2", "0", "9999-0"), [])
+        check("XCLAIM multi",
+              c.cmd("XCLAIM", "xg", "g1", "c2", "0", "1000-1", "2000-1", "9999-0"),
+              [["1000-1", ["a", "1"]], ["2000-1", ["a", "4"]]])
+        check("XCLAIM dup id once",
+              c.cmd("XCLAIM", "xg", "g1", "c2", "0", "2000-1", "2000-1"),
+              [["2000-1", ["a", "4"]]])
+        check("XCLAIM nogroup", c.cmd("XCLAIM", "xg", "zz", "c2", "0", "2000-1"),
+              ("error", "ERR NOGROUP No such key 'xg' or consumer group 'zz'"))
+        check("XCLAIM missing key", c.cmd("XCLAIM", "nope", "g1", "c2", "0", "2000-1"),
+              ("error", "ERR NOGROUP No such key 'nope' or consumer group 'g1'"))
+        check("XCLAIM wrongtype", c.cmd("XCLAIM", "after", "g1", "c2", "0", "2000-1"),
+              wrongtype)
+        check("XCLAIM bad id", c.cmd("XCLAIM", "xg", "g1", "c2", "0", "abc"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XCLAIM no ids", c.cmd("XCLAIM", "xg", "g1", "c2", "0", "FORCE"),
+              ("error", "ERR wrong number of arguments for 'xclaim' command"))
+        check("XCLAIM few args", c.cmd("XCLAIM", "xg", "g1", "c2"),
+              ("error", "ERR wrong number of arguments for 'xclaim' command"))
+        check("XCLAIM bad min idle", c.cmd("XCLAIM", "xg", "g1", "c2", "-1", "2000-1"),
+              ("error", "ERR Invalid min-idle-time"))
+        check("XCLAIM idle and time",
+              c.cmd("XCLAIM", "xg", "g1", "c2", "0", "2000-1", "IDLE", "10", "TIME", "20"),
+              ("error", "ERR IDLE and TIME cannot be used at the same time"))
+        check("XCLAIM bad retrycount",
+              c.cmd("XCLAIM", "xg", "g1", "c2", "0", "2000-1", "RETRYCOUNT", "-1"),
+              ("error", "ERR syntax error"))
+        check("XCLAIM bad option",
+              c.cmd("XCLAIM", "xg", "g1", "c2", "0", "2000-1", "FORCE", "FOO"),
+              ("error", "ERR syntax error"))
         check("COMMAND lists XGROUP XREADGROUP XACK XPENDING",
               "XGROUP" in c.cmd("COMMAND") and "XREADGROUP" in c.cmd("COMMAND")
               and "XACK" in c.cmd("COMMAND") and "XPENDING" in c.cmd("COMMAND"), True)
@@ -3419,7 +3564,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.69.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.70.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

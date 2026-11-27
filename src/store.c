@@ -4794,6 +4794,137 @@ long long store_xack(Store *s, const char *key, const char *group,
     return removed;
 }
 
+/* Claim one pending entry for a consumer: an entry already in the
+   PEL gets its owner moved, its delivery time set and its delivery
+   count bumped (or set to retrycount when that is >= 0); one that
+   is not pending yet (a FORCE claim) is inserted in ID order with
+   count 1 (or retrycount). Returns 0 on success, -1 = out of
+   memory. */
+static int stream_pel_claim(StreamGroup *g, uint64_t ms, uint64_t seq,
+                            const char *consumer, long long delivery_time,
+                            long long retrycount) {
+    StreamPending *p = stream_pel_find(g, ms, seq);
+    if (p) {
+        if (strcmp(p->consumer, consumer) != 0) {
+            char *nc = strdup(consumer);
+            if (!nc) return -1;
+            free(p->consumer);
+            p->consumer = nc;
+        }
+        p->delivery_time = delivery_time;
+        p->delivery_count =
+            retrycount >= 0 ? retrycount : p->delivery_count + 1;
+        return 0;
+    }
+    if (g->npel == g->cap_pel) {
+        size_t ncap = g->cap_pel ? g->cap_pel * 2 : 8;
+        StreamPending *npel = realloc(g->pel, ncap * sizeof(*npel));
+        if (!npel) return -1;
+        g->pel = npel;
+        g->cap_pel = ncap;
+    }
+    /* Insert in ID order, so XPENDING still walks the PEL lowest
+       first even when a FORCE claim lands out of order. */
+    size_t at = g->npel;
+    while (at > 0 && (g->pel[at - 1].ms > ms ||
+                      (g->pel[at - 1].ms == ms && g->pel[at - 1].seq > seq)))
+        at--;
+    memmove(&g->pel[at + 1], &g->pel[at],
+            (g->npel - at) * sizeof(*g->pel));
+    StreamPending *np = &g->pel[at];
+    memset(np, 0, sizeof(*np));
+    np->ms = ms;
+    np->seq = seq;
+    np->consumer = strdup(consumer);
+    if (!np->consumer) {
+        /* Roll the hole back out: the PEL must stay contiguous. */
+        memmove(&g->pel[at], &g->pel[at + 1],
+                (g->npel - at) * sizeof(*g->pel));
+        return -1;
+    }
+    np->delivery_time = delivery_time;
+    np->delivery_count = retrycount >= 0 ? retrycount : 1;
+    g->npel++;
+    return 0;
+}
+
+int store_xclaim(Store *s, const char *key, const char *group,
+                 const char *consumer, long long min_idle_ms,
+                 const uint64_t *ms, const uint64_t *seq, size_t n,
+                 int force, long long retrycount, long long delivery_time,
+                 StreamEntry **entries_out, size_t *n_out) {
+    *entries_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    Stream *st = e->stream;
+    StreamGroup *g = stream_group_find(st, group);
+    if (!g) return -3;
+    e->last_access = ++s->clock;
+    long long now = now_ms();
+    /* Pass 1: decide which IDs are claimable and copy their entries,
+       so a copy failure leaves the group untouched; the claims are
+       applied in pass 2, only for the entries actually returned. */
+    struct xrange_collect_arg arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.count = -1;
+    for (size_t k = 0; k < n; k++) {
+        /* Already claimed once in this call: skip the repeat. */
+        int dup = 0;
+        for (size_t j = 0; j < arg.n; j++)
+            if (arg.entries[j].ms == ms[k] && arg.entries[j].seq == seq[k]) {
+                dup = 1;
+                break;
+            }
+        if (dup) continue;
+        /* The entry must still be in the stream: a trimmed or
+           never-added ID is not claimed. */
+        const StreamEntry *en = NULL;
+        for (size_t i = 0; i < st->len; i++)
+            if (st->entries[i].ms == ms[k] && st->entries[i].seq == seq[k]) {
+                en = &st->entries[i];
+                break;
+            }
+        if (!en) continue;
+        StreamPending *p = stream_pel_find(g, ms[k], seq[k]);
+        if (p) {
+            /* Idle long enough, or forced: claimable. A delivery
+               time in the future reads as a negative idle, so it
+               is not claimable without FORCE. */
+            if (now - p->delivery_time < min_idle_ms && !force) continue;
+        } else if (!force) {
+            continue;
+        }
+        if (xrange_collect_copy(&arg, en->ms, en->seq, en->fields,
+                                en->values, en->nfields) != 0)
+            break;
+    }
+    if (arg.oom) {
+        stream_entries_free(arg.entries, arg.n);
+        return -2;
+    }
+    if (arg.n == 0) {
+        free(arg.entries);
+        return 0;
+    }
+    for (size_t i = 0; i < arg.n; i++) {
+        if (stream_pel_claim(g, arg.entries[i].ms, arg.entries[i].seq,
+                             consumer, delivery_time, retrycount) != 0) {
+            stream_entries_free(arg.entries, arg.n);
+            return -2;
+        }
+    }
+    if (stream_group_add_consumer(g, consumer) != 0) {
+        stream_entries_free(arg.entries, arg.n);
+        return -2;
+    }
+    entry_touch(s, e);
+    *entries_out = arg.entries;
+    *n_out = arg.n;
+    return 0;
+}
+
 void stream_pending_info_free(StreamPendingInfo *infos, size_t n) {
     if (!infos) return;
     for (size_t i = 0; i < n; i++) free(infos[i].consumer);

@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.69.0"
+#define CINDER_VERSION "0.70.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -538,13 +538,251 @@ static int xread_collect(Dbuf *reply, XReadArgs *a) {
 
 /* Does this XREAD argv carry a BLOCK option (scanned only up to
    STREAMS, so a key literally named BLOCK is not mistaken for
-   one)? Used to refuse BLOCK inside MULTI at queue time. */
+   one)? Used to refuse BLOCK inside MULTI at queue time. The scan
+   works for XREADGROUP too: its BLOCK also comes before STREAMS. */
 static int xread_has_block(char **argv, int argc) {
     for (int i = 1; i < argc; i++) {
         if (strcasecmp(argv[i], "STREAMS") == 0) return 0;
         if (strcasecmp(argv[i], "BLOCK") == 0) return 1;
     }
     return 0;
+}
+
+/* ---------- XREADGROUP ----------
+ * XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms] STREAMS
+ * key [key ...] id [id ...]: read streams as a consumer of a group.
+ * ">" delivers the entries after the group's cursor, records them
+ * in the group's pending list and advances the cursor; an explicit
+ * ID returns the group's pending entries for this consumer after
+ * that ID, without changing delivery state. "$" is not valid here.
+ * The reply is shaped like XREAD's: one [key, entries] element per
+ * stream that has any. A ">" read that delivers entries changes
+ * state, so it is logged to the AOF and replicated like a write.
+ * With BLOCK and no data yet, the live path parks the client (see
+ * handle_xreadgroup) until an entry arrives or the timeout passes;
+ * dispatch has no client to park, so a BLOCK that reaches it (only
+ * via the replica link or an AOF replay, since the live path routes
+ * around dispatch and MULTI refuses BLOCK at queue time) reads
+ * once, at once, and never parks. */
+
+typedef struct {
+    char *group;         /* owned */
+    char *consumer;      /* owned */
+    char **keys;         /* owned copies, one per stream */
+    int *new_only;       /* per stream: 1 = ">" (deliver new), 0 = pending re-read */
+    uint64_t *start_ms;  /* exclusive lower bound per stream (pending reads only) */
+    uint64_t *start_seq;
+    size_t nstreams;
+    long long count;     /* per stream, -1 = no limit */
+    long long block_ms;  /* -1 = no BLOCK; 0 = wait forever */
+    long long deadline_ms; /* -1 = no deadline, else now_ms() to stop at */
+} XReadGroupArgs;
+
+/* Free the arrays inside an XReadGroupArgs (not the struct itself,
+   which may live on the stack or inside a parked block). */
+static void xreadgroup_args_free(XReadGroupArgs *a) {
+    if (!a) return;
+    free(a->group);
+    free(a->consumer);
+    if (a->keys) {
+        for (size_t i = 0; i < a->nstreams; i++) free(a->keys[i]);
+    }
+    free(a->keys);
+    free(a->new_only);
+    free(a->start_ms);
+    free(a->start_seq);
+    a->group = NULL;
+    a->consumer = NULL;
+    a->keys = NULL;
+    a->new_only = NULL;
+    a->start_ms = NULL;
+    a->start_seq = NULL;
+    a->nstreams = 0;
+}
+
+/* Parse an XREADGROUP's argv into *a (owned strings and arrays
+   allocated; the caller frees them with xreadgroup_args_free). On
+   an error the reply is filled and -1 is returned. */
+static int xreadgroup_parse(char **argv, int argc, XReadGroupArgs *a,
+                            Dbuf *reply) {
+    memset(a, 0, sizeof(*a));
+    a->count = -1;
+    a->block_ms = -1;
+    a->deadline_ms = -1;
+    if (argc < 7)
+        return dbuf_error(reply, "wrong number of arguments for 'xreadgroup' command"), -1;
+    if (strcasecmp(argv[1], "GROUP") != 0)
+        return dbuf_error(reply, "syntax error"), -1;
+    a->group = strdup(argv[2]);
+    a->consumer = strdup(argv[3]);
+    if (!a->group || !a->consumer) {
+        xreadgroup_args_free(a);
+        return dbuf_error(reply, "out of memory"), -1;
+    }
+    int i = 4;
+    int seen_count = 0, seen_block = 0;
+    while (i < argc && strcasecmp(argv[i], "STREAMS") != 0) {
+        if (strcasecmp(argv[i], "COUNT") == 0) {
+            if (seen_count || i + 1 >= argc)
+                return dbuf_error(reply, "syntax error"), -1;
+            if (!parse_ll(argv[i + 1], &a->count) || a->count < 1) {
+                xreadgroup_args_free(a);
+                return dbuf_error(reply, "COUNT must be a positive integer"), -1;
+            }
+            seen_count = 1;
+            i += 2;
+        } else if (strcasecmp(argv[i], "BLOCK") == 0) {
+            if (seen_block || i + 1 >= argc)
+                return dbuf_error(reply, "syntax error"), -1;
+            if (!parse_ll(argv[i + 1], &a->block_ms) || a->block_ms < 0) {
+                xreadgroup_args_free(a);
+                return dbuf_error(reply, "BLOCK must be a non-negative integer"), -1;
+            }
+            seen_block = 1;
+            i += 2;
+        } else {
+            xreadgroup_args_free(a);
+            return dbuf_error(reply, "syntax error"), -1;
+        }
+    }
+    if (i >= argc) {
+        xreadgroup_args_free(a);
+        return dbuf_error(reply, "wrong number of arguments for 'xreadgroup' command"), -1;
+    }
+    i++; /* past STREAMS */
+    if (argc - i < 2 || ((argc - i) % 2) != 0) {
+        xreadgroup_args_free(a);
+        return dbuf_error(reply, "Unbalanced XREADGROUP list of streams: for each stream key an ID must be specified."), -1;
+    }
+    size_t n = (size_t)(argc - i) / 2;
+    a->keys = calloc(n, sizeof(char *));
+    a->new_only = calloc(n, sizeof(int));
+    a->start_ms = malloc(n * sizeof(uint64_t));
+    a->start_seq = malloc(n * sizeof(uint64_t));
+    if (!a->keys || !a->new_only || !a->start_ms || !a->start_seq) {
+        xreadgroup_args_free(a);
+        return dbuf_error(reply, "out of memory"), -1;
+    }
+    a->nstreams = n;
+    for (size_t k = 0; k < n; k++) {
+        a->keys[k] = strdup(argv[i + (int)k]);
+        if (!a->keys[k]) {
+            xreadgroup_args_free(a);
+            return dbuf_error(reply, "out of memory"), -1;
+        }
+        const char *id = argv[i + (int)n + (int)k];
+        if (strcmp(id, ">") == 0) {
+            a->new_only[k] = 1;
+        } else if (strcmp(id, "$") == 0) {
+            xreadgroup_args_free(a);
+            return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), -1;
+        } else if (stream_parse_bound(id, 0, &a->start_ms[k],
+                                      &a->start_seq[k]) != 0) {
+            xreadgroup_args_free(a);
+            return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), -1;
+        }
+    }
+    return 0;
+}
+
+/* Build an XREADGROUP reply for the parsed request: one [key,
+   entries] element per stream that has any, in ID order. Returns 1
+   when at least one stream had entries, 0 when the reply holds an
+   empty array, -1 = a key holds a non-stream value, -2 = out of
+   memory, -3 = no such key or consumer group (the NOGROUP error is
+   already in the reply). *changed_out is 1 when a ">" read
+   delivered entries. Collect first, then emit: a per-stream failure
+   answers an error, and the reply for the streams already collected
+   is discarded with it, as in Redis — though entries already
+   delivered to earlier streams stay delivered. */
+static int xreadgroup_collect(Dbuf *reply, XReadGroupArgs *a,
+                              int *changed_out) {
+    *changed_out = 0;
+    StreamEntry **all = calloc(a->nstreams, sizeof(StreamEntry *));
+    size_t *counts = calloc(a->nstreams, sizeof(size_t));
+    if (!all || !counts) {
+        free(all);
+        free(counts);
+        return -2;
+    }
+    size_t with_data = 0;
+    int changed = 0;
+    int rc = 0;
+    for (size_t k = 0; k < a->nstreams; k++) {
+        size_t n = 0;
+        int xrc = store_xreadgroup(g_store, a->keys[k], a->group,
+                                   a->consumer, a->new_only[k],
+                                   a->start_ms[k], a->start_seq[k],
+                                   a->count, &all[k], &n);
+        if (xrc == -1) { rc = -1; break; }
+        if (xrc == -2) { rc = -2; break; }
+        if (xrc == -3) {
+            dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n",
+                      a->keys[k], a->group);
+            rc = -3;
+            break;
+        }
+        counts[k] = n;
+        if (n > 0) {
+            with_data++;
+            if (a->new_only[k]) changed = 1;
+        }
+    }
+    if (rc == 0) {
+        dbuf_array_header(reply, (long long)with_data);
+        for (size_t k = 0; k < a->nstreams; k++) {
+            if (counts[k] == 0) continue;
+            dbuf_array_header(reply, 2);
+            dbuf_bulk(reply, a->keys[k], strlen(a->keys[k]));
+            dbuf_array_header(reply, (long long)counts[k]);
+            for (size_t e = 0; e < counts[k]; e++) {
+                char idbuf[48];
+                snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                         (unsigned long long)all[k][e].ms,
+                         (unsigned long long)all[k][e].seq);
+                dbuf_array_header(reply, 2);
+                dbuf_bulk(reply, idbuf, strlen(idbuf));
+                dbuf_array_header(reply, (long long)(all[k][e].nfields * 2));
+                for (size_t f = 0; f < all[k][e].nfields; f++) {
+                    dbuf_bulk(reply, all[k][e].fields[f],
+                              strlen(all[k][e].fields[f]));
+                    dbuf_bulk(reply, all[k][e].values[f],
+                              strlen(all[k][e].values[f]));
+                }
+            }
+        }
+        rc = with_data > 0 ? 1 : 0;
+    }
+    for (size_t k = 0; k < a->nstreams; k++)
+        stream_entries_free(all[k], counts[k]);
+    free(all);
+    free(counts);
+    *changed_out = changed;
+    return rc;
+}
+
+/* A client parked on XREADGROUP BLOCK: the parsed request plus a
+   deep copy of the original command, which is what gets AOF-logged
+   and replicated when the read finally delivers (the reply itself
+   cannot wait: the client sent nothing more, so the command bytes
+   are gone by wake time). */
+typedef struct {
+    XReadGroupArgs args;
+    char **argv; /* owned deep copy */
+    int argc;
+} XReadGroupBlock;
+
+/* Free a parked XREADGROUP BLOCK (not the struct itself, which may
+   live on a client). */
+static void xreadgroup_block_free(XReadGroupBlock *b) {
+    if (!b) return;
+    xreadgroup_args_free(&b->args);
+    if (b->argv) {
+        for (int i = 0; i < b->argc; i++) free(b->argv[i]);
+    }
+    free(b->argv);
+    b->argv = NULL;
+    b->argc = 0;
 }
 
 static int dispatch(char **argv, int argc, Dbuf *reply) {
@@ -2380,126 +2618,31 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         return 1;
     }
     if (strcasecmp(cmd, "XREADGROUP") == 0) {
-        /* XREADGROUP GROUP group consumer [COUNT count] STREAMS key
-           ... id ...: read a stream as a consumer of a group. ">"
-           delivers the entries after the group's cursor, records
-           them in the group's pending list and advances the cursor;
-           an explicit ID returns the group's pending entries for
-           this consumer after that ID, without changing delivery
+        /* XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms]
+           STREAMS key ... id ...: read a stream as a consumer of a
+           group. ">" delivers the entries after the group's cursor,
+           records them in the group's pending list and advances the
+           cursor; an explicit ID returns the group's pending entries
+           for this consumer after that ID, without changing delivery
            state. "$" is not valid here. The reply is shaped like
            XREAD's: one [key, entries] element per stream that has
-           any. BLOCK is not supported yet. A `>` read that delivers
-           entries changes state, so it is logged to the AOF and
-           replicated like a write; a read that delivers nothing, or
-           a pending-only read, is not. */
-        if (argc < 7)
-            return dbuf_error(reply, "wrong number of arguments for 'xreadgroup' command"), 0;
-        if (strcasecmp(argv[1], "GROUP") != 0)
-            return dbuf_error(reply, "syntax error"), 0;
-        const char *group = argv[2];
-        const char *consumer = argv[3];
-        long long count = -1;
-        int i = 4;
-        while (i < argc && strcasecmp(argv[i], "STREAMS") != 0) {
-            if (strcasecmp(argv[i], "COUNT") == 0) {
-                if (i + 1 >= argc)
-                    return dbuf_error(reply, "wrong number of arguments for 'xreadgroup' command"), 0;
-                if (!parse_ll(argv[i + 1], &count) || count < 1)
-                    return dbuf_error(reply, "COUNT must be a positive integer"), 0;
-                i += 2;
-            } else if (strcasecmp(argv[i], "BLOCK") == 0) {
-                return dbuf_error(reply, "BLOCK is not supported by XREADGROUP yet"), 0;
-            } else {
-                return dbuf_error(reply, "syntax error"), 0;
-            }
-        }
-        if (i >= argc)
-            return dbuf_error(reply, "wrong number of arguments for 'xreadgroup' command"), 0;
-        i++; /* past STREAMS */
-        if (argc - i < 2 || ((argc - i) % 2) != 0)
-            return dbuf_error(reply, "Unbalanced XREADGROUP list of streams: for each stream key an ID must be specified."), 0;
-        size_t nstreams = (size_t)(argc - i) / 2;
-        /* Collect first, then emit: a per-stream failure (a missing
-           group, say) answers an error, and the reply for the
-           streams already collected is discarded with it, as in
-           Redis — though entries already delivered to earlier
-           streams stay delivered. */
-        StreamEntry **all = calloc(nstreams, sizeof(StreamEntry *));
-        size_t *counts = calloc(nstreams, sizeof(size_t));
-        if (!all || !counts) {
-            free(all);
-            free(counts);
-            return dbuf_error(reply, "out of memory"), 0;
-        }
-        size_t with_data = 0;
+           any. A `>` read that delivers entries changes state, so
+           it is logged to the AOF and replicated like a write; a
+           read that delivers nothing, or a pending-only read, is
+           not. BLOCK reaches dispatch only from the replica link or
+           an AOF replay (the live path routes around dispatch, and
+           MULTI refuses BLOCK at queue time), where there is no
+           client to park: it reads once, at once. */
+        XReadGroupArgs a;
+        if (xreadgroup_parse(argv, argc, &a, reply) != 0) return 0;
         int changed = 0;
-        int rc = 0;
-        for (size_t k = 0; k < nstreams; k++) {
-            const char *key = argv[i + (int)k];
-            const char *id = argv[i + (int)nstreams + (int)k];
-            int new_only = 0;
-            uint64_t ms = 0, seq = 0;
-            if (strcmp(id, ">") == 0) {
-                new_only = 1;
-            } else if (strcmp(id, "$") == 0) {
-                rc = -4;
-                break;
-            } else if (stream_parse_bound(id, 0, &ms, &seq) != 0) {
-                rc = -4;
-                break;
-            }
-            size_t n = 0;
-            int xrc = store_xreadgroup(g_store, key, group, consumer,
-                                       new_only, ms, seq, count,
-                                       &all[k], &n);
-            if (xrc == -1) { rc = -1; break; }
-            if (xrc == -2) { rc = -2; break; }
-            if (xrc == -3) {
-                dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", key, group);
-                rc = -3;
-                break;
-            }
-            counts[k] = n;
-            if (n > 0) {
-                with_data++;
-                if (new_only) changed = 1;
-            }
-        }
-        if (rc == 0) {
-            dbuf_array_header(reply, (long long)with_data);
-            for (size_t k = 0; k < nstreams; k++) {
-                if (counts[k] == 0) continue;
-                dbuf_array_header(reply, 2);
-                dbuf_bulk(reply, argv[i + (int)k], strlen(argv[i + (int)k]));
-                dbuf_array_header(reply, (long long)counts[k]);
-                for (size_t e = 0; e < counts[k]; e++) {
-                    char idbuf[48];
-                    snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
-                             (unsigned long long)all[k][e].ms,
-                             (unsigned long long)all[k][e].seq);
-                    dbuf_array_header(reply, 2);
-                    dbuf_bulk(reply, idbuf, strlen(idbuf));
-                    dbuf_array_header(reply, (long long)(all[k][e].nfields * 2));
-                    for (size_t f = 0; f < all[k][e].nfields; f++) {
-                        dbuf_bulk(reply, all[k][e].fields[f],
-                                  strlen(all[k][e].fields[f]));
-                        dbuf_bulk(reply, all[k][e].values[f],
-                                  strlen(all[k][e].values[f]));
-                    }
-                }
-            }
-        }
-        for (size_t k = 0; k < nstreams; k++)
-            stream_entries_free(all[k], counts[k]);
-        free(all);
-        free(counts);
+        int rc = xreadgroup_collect(reply, &a, &changed);
+        xreadgroup_args_free(&a);
         if (rc == -1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         if (rc == -2)
             return dbuf_error(reply, "out of memory"), 0;
         if (rc == -3) return 0; /* NOGROUP error already in the reply */
-        if (rc == -4)
-            return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
         return changed ? 1 : 0;
     }
     if (strcasecmp(cmd, "XACK") == 0) {
@@ -2533,6 +2676,150 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         }
         dbuf_int(reply, removed);
         return removed > 0 ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "XCLAIM") == 0) {
+        /* XCLAIM key group consumer min-idle-time id [id ...]
+           [IDLE ms] [TIME ms-unix-time] [RETRYCOUNT count] [FORCE]
+           [JUSTID]: take over pending entries for another consumer,
+           usually because the consumer that held them died. An
+           entry is claimed when it has been idle at least
+           min-idle-time since its last delivery; FORCE claims it
+           even when it has not been idle that long, and also claims
+           entries that are in the stream but not pending at all
+           (creating a PEL entry for them). The claimed entry is
+           moved to this consumer, its delivery time is set to now
+           (or to IDLE ms ago, or to the absolute TIME given) and
+           its delivery count is bumped (or set by RETRYCOUNT).
+           JUSTID answers only the IDs. IDs that are not in the
+           stream, are not idle enough, or are not pending (without
+           FORCE) are left out of the reply, where Redis answers nil
+           for them. A claim changes delivery state, so a real claim
+           is logged to the AOF and replicated like a write (an AOF
+           replay re-claims, so delivery counts go up by one per
+           replay, as with XREADGROUP). */
+        if (argc < 6)
+            return dbuf_error(reply, "wrong number of arguments for 'xclaim' command"), 0;
+        long long min_idle = 0;
+        if (!parse_ll(argv[4], &min_idle) || min_idle < 0)
+            return dbuf_error(reply, "Invalid min-idle-time"), 0;
+        /* IDs run until the first option keyword; at least one ID
+           is required. */
+        size_t nids = 0;
+        int seen_idle = 0, seen_time = 0, seen_retry = 0;
+        int force = 0, justid = 0;
+        long long idle_ms = -1, time_ms = -1, retrycount = -1;
+        size_t i = 5;
+        while (i < (size_t)argc) {
+            if (strcasecmp(argv[i], "IDLE") == 0 ||
+                strcasecmp(argv[i], "TIME") == 0 ||
+                strcasecmp(argv[i], "RETRYCOUNT") == 0 ||
+                strcasecmp(argv[i], "FORCE") == 0 ||
+                strcasecmp(argv[i], "JUSTID") == 0)
+                break;
+            nids++;
+            i++;
+        }
+        if (nids == 0)
+            return dbuf_error(reply, "wrong number of arguments for 'xclaim' command"), 0;
+        uint64_t *ms = malloc(nids * sizeof(uint64_t));
+        uint64_t *seq = malloc(nids * sizeof(uint64_t));
+        if (!ms || !seq) {
+            free(ms);
+            free(seq);
+            return dbuf_error(reply, "out of memory"), 0;
+        }
+        for (size_t k = 0; k < nids; k++) {
+            if (stream_parse_bound(argv[5 + (int)k], 0, &ms[k], &seq[k]) != 0) {
+                free(ms);
+                free(seq);
+                return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
+            }
+        }
+        while (i < (size_t)argc) {
+            if (strcasecmp(argv[i], "IDLE") == 0) {
+                if (seen_idle || i + 1 >= (size_t)argc ||
+                    !parse_ll(argv[i + 1], &idle_ms) || idle_ms < 0) {
+                    free(ms);
+                    free(seq);
+                    return dbuf_error(reply, "syntax error"), 0;
+                }
+                seen_idle = 1;
+                i += 2;
+            } else if (strcasecmp(argv[i], "TIME") == 0) {
+                if (seen_time || i + 1 >= (size_t)argc ||
+                    !parse_ll(argv[i + 1], &time_ms) || time_ms < 0) {
+                    free(ms);
+                    free(seq);
+                    return dbuf_error(reply, "syntax error"), 0;
+                }
+                seen_time = 1;
+                i += 2;
+            } else if (strcasecmp(argv[i], "RETRYCOUNT") == 0) {
+                if (seen_retry || i + 1 >= (size_t)argc ||
+                    !parse_ll(argv[i + 1], &retrycount) || retrycount < 0) {
+                    free(ms);
+                    free(seq);
+                    return dbuf_error(reply, "syntax error"), 0;
+                }
+                seen_retry = 1;
+                i += 2;
+            } else if (strcasecmp(argv[i], "FORCE") == 0) {
+                force = 1;
+                i++;
+            } else if (strcasecmp(argv[i], "JUSTID") == 0) {
+                justid = 1;
+                i++;
+            } else {
+                free(ms);
+                free(seq);
+                return dbuf_error(reply, "syntax error"), 0;
+            }
+        }
+        if (seen_idle && seen_time) {
+            free(ms);
+            free(seq);
+            return dbuf_error(reply, "IDLE and TIME cannot be used at the same time"), 0;
+        }
+        long long delivery_time = now_ms();
+        if (seen_time) delivery_time = time_ms;
+        else if (seen_idle) delivery_time = now_ms() - idle_ms;
+        StreamEntry *entries = NULL;
+        size_t nclaimed = 0;
+        int rc = store_xclaim(g_store, argv[1], argv[2], argv[3],
+                              min_idle, ms, seq, nids, force, retrycount,
+                              delivery_time, &entries, &nclaimed);
+        free(ms);
+        free(seq);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == -3) {
+            dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", argv[1], argv[2]);
+            return 0;
+        }
+        dbuf_array_header(reply, (long long)nclaimed);
+        for (size_t k = 0; k < nclaimed; k++) {
+            char idbuf[48];
+            snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                     (unsigned long long)entries[k].ms,
+                     (unsigned long long)entries[k].seq);
+            if (justid) {
+                dbuf_bulk(reply, idbuf, strlen(idbuf));
+                continue;
+            }
+            dbuf_array_header(reply, 2);
+            dbuf_bulk(reply, idbuf, strlen(idbuf));
+            dbuf_array_header(reply, (long long)(entries[k].nfields * 2));
+            for (size_t f = 0; f < entries[k].nfields; f++) {
+                dbuf_bulk(reply, entries[k].fields[f],
+                          strlen(entries[k].fields[f]));
+                dbuf_bulk(reply, entries[k].values[f],
+                          strlen(entries[k].values[f]));
+            }
+        }
+        stream_entries_free(entries, nclaimed);
+        return nclaimed > 0 ? 1 : 0;
     }
     if (strcasecmp(cmd, "XPENDING") == 0) {
         /* XPENDING key group: the summary — how many entries are
@@ -4608,7 +4895,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT",
             "HTTL", "HPTTL", "HPERSIST",
             "XADD", "XRANGE", "XREVRANGE", "XLEN", "XREAD",
-            "XGROUP", "XREADGROUP", "XACK", "XPENDING",
+            "XGROUP", "XREADGROUP", "XACK", "XPENDING", "XCLAIM",
             "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZINTER", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",
@@ -4721,6 +5008,10 @@ typedef struct Client {
         deadline in deadline_ms (-1 = BLOCK 0, wait forever). While
         parked the client sends nothing more, so its EPOLLIN
         interest is dropped until the read is answered. */
+    XReadGroupBlock *xreadgroup_block; /* non-NULL while parked on
+        an XREADGROUP BLOCK: the same deal as xread_block, plus a
+        copy of the original command, which is what gets AOF-logged
+        and replicated when the read finally delivers. */
     int epoll_registered; /* this fd is registered with epoll (its
         interest may currently be 0 events while blocked) */
     int is_replica;     /* primary side: this client is a replica (SYNC'd);
@@ -4882,13 +5173,13 @@ static int watch_dirty(Client *c) {
    (send_full_sync / backlog_send). */
 static void client_sync_interest(Client *c) {
     if (g_epollfd < 0 || !c->epoll_registered) return;
-    /* A client parked on XREAD BLOCK sends nothing more until its
-       read is answered, so drop EPOLLIN while it waits: with
-       level-triggered epoll a pipelined byte behind the block would
-       otherwise wake the loop forever. EPOLLRDHUP stays, so a peer
-       that goes away while blocked is noticed and dropped instead
-       of parked until its deadline. */
-    uint32_t want = c->xread_block ? EPOLLRDHUP : EPOLLIN;
+    /* A client parked on XREAD or XREADGROUP BLOCK sends nothing
+       more until its read is answered, so drop EPOLLIN while it
+       waits: with level-triggered epoll a pipelined byte behind the
+       block would otherwise wake the loop forever. EPOLLRDHUP
+       stays, so a peer that goes away while blocked is noticed and
+       dropped instead of parked until its deadline. */
+    uint32_t want = (c->xread_block || c->xreadgroup_block) ? EPOLLRDHUP : EPOLLIN;
     if (c->out.len > 0 || c->repl_connecting) want |= EPOLLOUT;
     if (want == c->epoll_events) return;
     struct epoll_event ev;
@@ -4910,12 +5201,17 @@ static void client_remove(size_t idx) {
        it: nothing queued ever executes. */
     multi_clear(&g_clients[idx]);
     watch_clear(&g_clients[idx]);
-    /* ... and a client that disconnects while parked on XREAD BLOCK
-       drops its parked request with it. */
+    /* ... and a client that disconnects while parked on XREAD or
+       XREADGROUP BLOCK drops its parked request with it. */
     if (g_clients[idx].xread_block) {
         xread_args_free(g_clients[idx].xread_block);
         free(g_clients[idx].xread_block);
         g_clients[idx].xread_block = NULL;
+    }
+    if (g_clients[idx].xreadgroup_block) {
+        xreadgroup_block_free(g_clients[idx].xreadgroup_block);
+        free(g_clients[idx].xreadgroup_block);
+        g_clients[idx].xreadgroup_block = NULL;
     }
     g_clients[idx] = g_clients[--g_nclients];
 }
@@ -5793,22 +6089,133 @@ static void handle_xread(Client *c, char **argv, int argc) {
        behind the block cannot spin the loop. */
 }
 
-/* Re-check every client parked on XREAD BLOCK: answer the ones with
-   new entries, time out the ones past their deadline (a nil array,
-   as in Redis), and error the ones whose key stopped being a stream
-   while they waited. Runs once per loop iteration, next to
-   deferred_drain, so a wake-up costs at most one iteration after
-   the XADD that should release it (the epoll_wait timeout is
-   100 ms, so a timeout lands within 100 ms of its deadline). */
+/* XREADGROUP on a live client: parse, answer at once when data is
+   already there (even with BLOCK), and otherwise park the client on
+   the request until an entry arrives or the timeout passes. BLOCK 0
+   waits forever. A ">" read that delivers entries is a write, so
+   it is logged to the AOF and replicated like one — at once when
+   the data was already there, and at wake time when the client was
+   parked (from the deep-copied command kept in the parked block:
+   the client sent nothing more, so the original bytes are gone). */
+static void handle_xreadgroup(Client *c, char **argv, int argc) {
+    Dbuf reply = {0};
+    XReadGroupArgs a;
+    if (xreadgroup_parse(argv, argc, &a, &reply) != 0) {
+        client_reply(c, &reply, 0);
+        free(reply.data);
+        return;
+    }
+    /* With or without BLOCK, data already there answers at once, as
+       in Redis, so a waiting client never misses entries that
+       arrived before the read. */
+    int changed = 0;
+    int rc = xreadgroup_collect(&reply, &a, &changed);
+    if (a.block_ms < 0 || rc != 0) {
+        unsigned long long aof_seq = 0;
+        if (rc == 1 && changed && !g_replaying) {
+            aof_seq = aof_append(argv, argc);
+            Dbuf raw = {0};
+            emit_resp_cmd(&raw, argv, argc);
+            forward_to_replicas(raw.data, raw.len);
+            free(raw.data);
+        }
+        xreadgroup_args_free(&a);
+        if (rc == -1)
+            dbuf_error(&reply, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        else if (rc == -2)
+            dbuf_error(&reply, "out of memory");
+        client_reply(c, &reply, aof_seq);
+        free(reply.data);
+        return;
+    }
+    /* Nothing yet: park. The deadline is absolute, and BLOCK 0 has
+       none. No lock is held while waiting — the store is
+       single-threaded and the parked request is just data; the loop
+       re-checks it every iteration. */
+    free(reply.data);
+    if (a.block_ms == 0) {
+        a.deadline_ms = -1;
+    } else {
+        long long now = now_ms();
+        a.deadline_ms = a.block_ms > LLONG_MAX - now ? -1 : now + a.block_ms;
+    }
+    XReadGroupBlock *parked = malloc(sizeof(*parked));
+    if (!parked) {
+        xreadgroup_args_free(&a);
+        Dbuf err = {0};
+        dbuf_error(&err, "out of memory");
+        client_reply(c, &err, 0);
+        free(err.data);
+        return;
+    }
+    memset(parked, 0, sizeof(*parked));
+    parked->args = a;
+    parked->argc = argc;
+    parked->argv = malloc((argc > 0 ? argc : 1) * sizeof(char *));
+    if (!parked->argv) {
+        xreadgroup_args_free(&a);
+        free(parked);
+        Dbuf err = {0};
+        dbuf_error(&err, "out of memory");
+        client_reply(c, &err, 0);
+        free(err.data);
+        return;
+    }
+    int oom = 0;
+    for (int i = 0; i < argc; i++) {
+        parked->argv[i] = strdup(argv[i]);
+        if (!parked->argv[i]) oom = 1;
+    }
+    if (oom) {
+        xreadgroup_block_free(parked);
+        free(parked);
+        Dbuf err = {0};
+        dbuf_error(&err, "out of memory");
+        client_reply(c, &err, 0);
+        free(err.data);
+        return;
+    }
+    c->xreadgroup_block = parked;
+    /* Interest drops EPOLLIN at the next sync, so a pipelined byte
+       behind the block cannot spin the loop. */
+}
+
+/* Re-check every client parked on XREAD or XREADGROUP BLOCK:
+   answer the ones with new entries, time out the ones past their
+   deadline (a nil array, as in Redis), and error the ones whose key
+   stopped being a stream while they waited. Runs once per loop
+   iteration, next to deferred_drain, so a wake-up costs at most one
+   iteration after the XADD that should release it (the epoll_wait
+   timeout is 100 ms, so a timeout lands within 100 ms of its
+   deadline). A parked XREADGROUP that delivers is a write, so it is
+   AOF-logged and replicated at wake time, from the command copy
+   kept in the parked block. */
 static void xread_blocked_check(void) {
     long long now = now_ms();
     for (size_t i = 0; i < g_nclients; i++) {
         Client *c = &g_clients[i];
-        if (!c->xread_block) continue;
-        XReadArgs *a = c->xread_block;
-        Dbuf reply = {0};
-        if (a->deadline_ms >= 0 && now >= a->deadline_ms) {
-            dbuf_null_array(&reply);
+        if (c->xread_block) {
+            XReadArgs *a = c->xread_block;
+            Dbuf reply = {0};
+            if (a->deadline_ms >= 0 && now >= a->deadline_ms) {
+                dbuf_null_array(&reply);
+                client_reply(c, &reply, 0);
+                free(reply.data);
+                xread_args_free(a);
+                free(a);
+                c->xread_block = NULL;
+                continue;
+            }
+            int rc = xread_collect(&reply, a);
+            if (rc == 0) {
+                /* Still nothing: stay parked. */
+                free(reply.data);
+                continue;
+            }
+            if (rc == -1)
+                dbuf_error(&reply, "WRONGTYPE Operation against a key holding the wrong kind of value");
+            else if (rc == -2)
+                dbuf_error(&reply, "out of memory");
             client_reply(c, &reply, 0);
             free(reply.data);
             xread_args_free(a);
@@ -5816,21 +6223,42 @@ static void xread_blocked_check(void) {
             c->xread_block = NULL;
             continue;
         }
-        int rc = xread_collect(&reply, a);
+        if (!c->xreadgroup_block) continue;
+        XReadGroupBlock *b = c->xreadgroup_block;
+        Dbuf reply = {0};
+        if (b->args.deadline_ms >= 0 && now >= b->args.deadline_ms) {
+            dbuf_null_array(&reply);
+            client_reply(c, &reply, 0);
+            free(reply.data);
+            xreadgroup_block_free(b);
+            free(b);
+            c->xreadgroup_block = NULL;
+            continue;
+        }
+        int changed = 0;
+        int rc = xreadgroup_collect(&reply, &b->args, &changed);
         if (rc == 0) {
             /* Still nothing: stay parked. */
             free(reply.data);
             continue;
         }
+        unsigned long long aof_seq = 0;
+        if (rc == 1 && changed && !g_replaying) {
+            aof_seq = aof_append(b->argv, b->argc);
+            Dbuf raw = {0};
+            emit_resp_cmd(&raw, b->argv, b->argc);
+            forward_to_replicas(raw.data, raw.len);
+            free(raw.data);
+        }
         if (rc == -1)
             dbuf_error(&reply, "WRONGTYPE Operation against a key holding the wrong kind of value");
         else if (rc == -2)
             dbuf_error(&reply, "out of memory");
-        client_reply(c, &reply, 0);
+        client_reply(c, &reply, aof_seq);
         free(reply.data);
-        xread_args_free(a);
-        free(a);
-        c->xread_block = NULL;
+        xreadgroup_block_free(b);
+        free(b);
+        c->xreadgroup_block = NULL;
     }
 }
 
@@ -6079,12 +6507,13 @@ int main(int argc, char **argv) {
             if (idx == g_nclients) continue;
             Client *c = &g_clients[idx];
             if (re & (EPOLLERR | EPOLLHUP)) { c->dead = 1; continue; }
-            if (c->xread_block && (re & EPOLLRDHUP)) {
-                /* A client parked on XREAD BLOCK went away: drop the
-                   parked request with it instead of waiting out its
-                   deadline (its EPOLLIN is suppressed while blocked,
-                   so without this the half-close would not be
-                   noticed until the read timed out). */
+            if ((c->xread_block || c->xreadgroup_block) && (re & EPOLLRDHUP)) {
+                /* A client parked on XREAD or XREADGROUP BLOCK went
+                   away: drop the parked request with it instead of
+                   waiting out its deadline (its EPOLLIN is
+                   suppressed while blocked, so without this the
+                   half-close would not be noticed until the read
+                   timed out). */
                 c->dead = 1;
                 continue;
             }
@@ -6240,11 +6669,12 @@ int main(int argc, char **argv) {
                            not queued: it runs at once and errors
                            inside MULTI, as in Redis. UNWATCH does
                            queue, as in Redis, and runs at EXEC. An
-                           XREAD with BLOCK cannot queue: there is no
-                           client to park at EXEC time, so it errors
-                           at once, as in Redis. */
+                           XREAD or XREADGROUP with BLOCK cannot
+                           queue: there is no client to park at EXEC
+                           time, so it errors at once, as in Redis. */
                         Dbuf reply = {0};
-                        if (strcasecmp(cargv[0], "XREAD") == 0 &&
+                        if ((strcasecmp(cargv[0], "XREAD") == 0 ||
+                             strcasecmp(cargv[0], "XREADGROUP") == 0) &&
                             xread_has_block(cargv, cargc))
                             dbuf_error(&reply, "BLOCK is not allowed in MULTI/EXEC");
                         else if (multi_queue(c, cargv, cargc) < 0)
@@ -6381,6 +6811,12 @@ int main(int argc, char **argv) {
                                dispatch; the non-blocking form still
                                runs through dispatch at EXEC. */
                             handle_xread(c, cargv, cargc);
+                        } else if (strcasecmp(cargv[0], "XREADGROUP") == 0) {
+                            /* XREADGROUP needs the client itself for
+                               BLOCK, for the same reason; the
+                               non-blocking form still runs through
+                               dispatch at EXEC. */
+                            handle_xreadgroup(c, cargv, cargc);
                         } else {
                             Dbuf reply = {0};
                             int drc = dispatch(cargv, cargc, &reply);
