@@ -868,6 +868,18 @@ int store_xrevrange(Store *s, const char *key, uint64_t start_ms,
    exist. */
 int store_xgroup_create(Store *s, const char *key, const char *group,
                         uint64_t ms, uint64_t seq, int mkstream);
+/* XGROUP SETID: move a consumer group's last-delivered ID to
+   (ms, seq), so the next `>` read delivers what comes after it.
+   The pending list is untouched: entries already delivered stay
+   pending for their consumers, and entries after the new cursor
+   are delivered again on the next `>` read. A set to the ID the
+   group already holds changes nothing, so it bumps no version
+   (a WATCH on the key survives it) and the caller need not log
+   it; a real move bumps the version. Returns 1 when the cursor
+   moved, 0 when it was already that ID, -1 = the key holds a
+   non-stream value, -3 = no such key or consumer group. */
+int store_xgroup_setid(Store *s, const char *key, const char *group,
+                       uint64_t ms, uint64_t seq);
 /* XREADGROUP: deliver entries of one stream to a consumer of a
    group. When new_only is set, the entries after the group's
    cursor, which are added to the PEL (delivery count 1, stamped

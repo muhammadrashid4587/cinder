@@ -4732,6 +4732,21 @@ int store_xgroup_create(Store *s, const char *key, const char *group,
     return 0;
 }
 
+int store_xgroup_setid(Store *s, const char *key, const char *group,
+                       uint64_t ms, uint64_t seq) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    StreamGroup *g = stream_group_find(e->stream, group);
+    if (!g) return -3;
+    if (g->last_ms == ms && g->last_seq == seq) return 0;
+    g->last_ms = ms;
+    g->last_seq = seq;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return 1;
+}
+
 int store_xgroup_restore(Store *s, const char *key, const char *group,
                          uint64_t last_ms, uint64_t last_seq,
                          char *const *consumers, size_t nconsumers,

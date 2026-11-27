@@ -1381,8 +1381,67 @@ def main():
               c.cmd("XGROUP", "CREATE", "after", "g1", "0"), wrongtype)
         check("XGROUP create bad id", c.cmd("XGROUP", "CREATE", "xg", "g3", "abc"),
               ("error", "ERR Invalid stream ID specified as stream command argument"))
-        check("XGROUP bad subcommand", c.cmd("XGROUP", "SETID", "xg", "g1", "0"),
+        check("XGROUP bad subcommand", c.cmd("XGROUP", "FOO", "xg", "g1", "0"),
               ("error", "ERR Unknown subcommand or wrong number of arguments for 'xgroup'"))
+        # XGROUP SETID: move a group's last-delivered ID, so the
+        # next ">" read delivers what comes after it; the pending
+        # list is untouched, "$" jumps to the top, and a set to
+        # the ID the group already holds changes nothing. A fresh
+        # stream, so the xg state below is undisturbed.
+        check("XGROUP SETID setup 1", c.cmd("XADD", "xgs", "1000-1", "a", "1"), "1000-1")
+        check("XGROUP SETID setup 2", c.cmd("XADD", "xgs", "1000-2", "a", "2"), "1000-2")
+        check("XGROUP SETID setup 3", c.cmd("XADD", "xgs", "2000-0", "a", "3"), "2000-0")
+        check("XGROUP SETID create",
+              c.cmd("XGROUP", "CREATE", "xgs", "gs", "0"), "OK")
+        check("XGROUP SETID drain",
+              c.cmd("XREADGROUP", "GROUP", "gs", "c1", "STREAMS", "xgs", ">"),
+              [["xgs", [["1000-1", ["a", "1"]], ["1000-2", ["a", "2"]],
+                        ["2000-0", ["a", "3"]]]]])
+        check("XGROUP SETID drain again empty",
+              c.cmd("XREADGROUP", "GROUP", "gs", "c1", "STREAMS", "xgs", ">"), [])
+        check("XGROUP SETID back",
+              c.cmd("XGROUP", "SETID", "xgs", "gs", "1000-1"), "OK")
+        check("XGROUP SETID re-delivers",
+              c.cmd("XREADGROUP", "GROUP", "gs", "c1", "STREAMS", "xgs", ">"),
+              [["xgs", [["1000-2", ["a", "2"]], ["2000-0", ["a", "3"]]]]])
+        check("XGROUP SETID pending untouched",
+              c.cmd("XPENDING", "xgs", "gs"),
+              [3, "1000-1", "2000-0", [["c1", 3]]])
+        check("XGROUP SETID dollar",
+              c.cmd("XGROUP", "SETID", "xgs", "gs", "$"), "OK")
+        check("XGROUP SETID dollar empty",
+              c.cmd("XREADGROUP", "GROUP", "gs", "c1", "STREAMS", "xgs", ">"), [])
+        check("XGROUP SETID noop",
+              c.cmd("XGROUP", "SETID", "xgs", "gs", "$"), "OK")
+        check("XGROUP SETID missing key",
+              c.cmd("XGROUP", "SETID", "nope", "gs", "0"),
+              ("error", "ERR NOGROUP No such key 'nope' or consumer group 'gs'"))
+        check("XGROUP SETID missing group",
+              c.cmd("XGROUP", "SETID", "xgs", "zz", "0"),
+              ("error", "ERR NOGROUP No such key 'xgs' or consumer group 'zz'"))
+        check("XGROUP SETID wrongtype",
+              c.cmd("XGROUP", "SETID", "after", "g1", "0"), wrongtype)
+        check("XGROUP SETID bad id", c.cmd("XGROUP", "SETID", "xgs", "gs", "abc"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XGROUP SETID wrong args",
+              c.cmd("XGROUP", "SETID", "xgs", "gs"),
+              ("error", "ERR wrong number of arguments for 'xgroup' command"))
+        # A SETID that moves the cursor invalidates a WATCH on the
+        # key; one to the ID the group already holds does not.
+        cs = Client(PORT)
+        check("WATCH xgs", c.cmd("WATCH", "xgs"), "OK")
+        check("other client SETID move", cs.cmd("XGROUP", "SETID", "xgs", "gs", "1000-2"), "OK")
+        check("MULTI setid watch", c.cmd("MULTI"), "OK")
+        check("MULTI setid SET queued", c.cmd("SET", "xswatchkey", "v1"), "QUEUED")
+        check("EXEC setid watch aborts", c.cmd("EXEC"), None)
+        check("xswatchkey unchanged after abort", c.cmd("GET", "xswatchkey"), None)
+        check("WATCH xgs noop", c.cmd("WATCH", "xgs"), "OK")
+        check("other client SETID noop", cs.cmd("XGROUP", "SETID", "xgs", "gs", "1000-2"), "OK")
+        check("MULTI setid noop watch", c.cmd("MULTI"), "OK")
+        check("MULTI setid noop SET queued", c.cmd("SET", "xswatchkey", "v1"), "QUEUED")
+        check("EXEC setid noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("xswatchkey after noop", c.cmd("GET", "xswatchkey"), "v1")
+        cs.close()
         check("XGROUP bad mkstream", c.cmd("XGROUP", "CREATE", "xg", "g3", "0", "FOO"),
               ("error", "ERR syntax error"))
         check("XREADGROUP new",
@@ -1641,7 +1700,7 @@ def main():
         check("COMMAND lists XGROUP XREADGROUP XACK XPENDING",
               "XGROUP" in c.cmd("COMMAND") and "XREADGROUP" in c.cmd("COMMAND")
               and "XACK" in c.cmd("COMMAND") and "XPENDING" in c.cmd("COMMAND"), True)
-        check("XGROUP cleanup", c.cmd("DEL", "xg", "xgm"), 2)
+        check("XGROUP cleanup", c.cmd("DEL", "xg", "xgm", "xgs", "xswatchkey"), 4)
         # Sorted sets: add/update, scores, wrong type, TTL, AOF
         # persistence. Members are ordered by (score, member); range
         # commands are not implemented yet.
@@ -3613,7 +3672,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.71.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.72.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

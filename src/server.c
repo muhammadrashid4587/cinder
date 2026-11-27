@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.71.0"
+#define CINDER_VERSION "0.72.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2581,41 +2581,68 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            group on a stream. The id is "$" (the top ID at creation,
            so only entries added later are delivered), "0" (from
            the beginning) or an explicit ms-seq; MKSTREAM creates
-           the stream empty when it is missing. Only CREATE exists
-           so far; other subcommands are an error. A real write, so
-           it is logged to the AOF and replicated, which is also
-           how a group survives a restart (groups ride in RDB
-           snapshots since 0.71.0, as well as in the AOF). */
+           the stream empty when it is missing. XGROUP SETID key
+           group id moves an existing group's last-delivered ID
+           ("$" for the top ID, or an explicit ms-seq), so the
+           next ">" read delivers what comes after it; the pending
+           list is untouched. Other subcommands are an error, and
+           SETID's ENTRIESREAD option is not supported yet. A
+           real write, so it is logged to the AOF and replicated,
+           which is also how a group survives a restart (groups
+           ride in RDB snapshots since 0.71.0, as well as in the
+           AOF). A SETID to the ID the group already holds changes
+           nothing, so it is not logged. */
         if (argc < 2)
             return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
-        if (strcasecmp(argv[1], "CREATE") != 0)
-            return dbuf_error(reply, "Unknown subcommand or wrong number of arguments for 'xgroup'"), 0;
-        if (argc < 5 || argc > 6)
-            return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
-        int mkstream = 0;
-        if (argc == 6) {
-            if (strcasecmp(argv[5], "MKSTREAM") != 0)
-                return dbuf_error(reply, "syntax error"), 0;
-            mkstream = 1;
-        }
-        uint64_t ms, seq;
-        if (strcmp(argv[4], "$") == 0) {
-            if (store_stream_top(g_store, argv[2], &ms, &seq) != 0)
+        if (strcasecmp(argv[1], "CREATE") == 0) {
+            if (argc < 5 || argc > 6)
+                return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
+            int mkstream = 0;
+            if (argc == 6) {
+                if (strcasecmp(argv[5], "MKSTREAM") != 0)
+                    return dbuf_error(reply, "syntax error"), 0;
+                mkstream = 1;
+            }
+            uint64_t ms, seq;
+            if (strcmp(argv[4], "$") == 0) {
+                if (store_stream_top(g_store, argv[2], &ms, &seq) != 0)
+                    return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            } else if (stream_parse_bound(argv[4], 0, &ms, &seq) != 0) {
+                return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
+            }
+            int rc = store_xgroup_create(g_store, argv[2], argv[3], ms, seq, mkstream);
+            if (rc == -1)
                 return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
-        } else if (stream_parse_bound(argv[4], 0, &ms, &seq) != 0) {
-            return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
+            if (rc == -2)
+                return dbuf_error(reply, "out of memory"), 0;
+            if (rc == -3)
+                return dbuf_error(reply, "BUSYGROUP Consumer Group name already exists"), 0;
+            if (rc == -4)
+                return dbuf_error(reply, "The XGROUP subcommand requires the key to exist. Use MKSTREAM to create the stream."), 0;
+            dbuf_simple(reply, "OK");
+            return 1;
         }
-        int rc = store_xgroup_create(g_store, argv[2], argv[3], ms, seq, mkstream);
-        if (rc == -1)
-            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
-        if (rc == -2)
-            return dbuf_error(reply, "out of memory"), 0;
-        if (rc == -3)
-            return dbuf_error(reply, "BUSYGROUP Consumer Group name already exists"), 0;
-        if (rc == -4)
-            return dbuf_error(reply, "The XGROUP subcommand requires the key to exist. Use MKSTREAM to create the stream."), 0;
-        dbuf_simple(reply, "OK");
-        return 1;
+        if (strcasecmp(argv[1], "SETID") == 0) {
+            if (argc != 5)
+                return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
+            uint64_t ms, seq;
+            if (strcmp(argv[4], "$") == 0) {
+                if (store_stream_top(g_store, argv[2], &ms, &seq) != 0)
+                    return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            } else if (stream_parse_bound(argv[4], 0, &ms, &seq) != 0) {
+                return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
+            }
+            int rc = store_xgroup_setid(g_store, argv[2], argv[3], ms, seq);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == -3) {
+                dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", argv[2], argv[3]);
+                return 0;
+            }
+            dbuf_simple(reply, "OK");
+            return rc; /* 1 when the cursor moved, 0 when it was already there */
+        }
+        return dbuf_error(reply, "Unknown subcommand or wrong number of arguments for 'xgroup'"), 0;
     }
     if (strcasecmp(cmd, "XREADGROUP") == 0) {
         /* XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms]
