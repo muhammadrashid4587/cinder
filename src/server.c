@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.61.0"
+#define CINDER_VERSION "0.62.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1252,19 +1252,37 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         return changed ? 1 : 0;
     }
     if (strcasecmp(cmd, "GEOADD") == 0) {
-        if (argc < 5 || ((argc - 2) % 3) != 0)
+        if (argc < 5)
+            return dbuf_error(reply, "wrong number of arguments for 'geoadd' command"), 0;
+        /* Options come after the key and before the first longitude:
+           NX | XX | CH, as in Redis. Anything after the first
+           longitude is a lon/lat/member triple, never an option. */
+        int nx = 0, xx = 0, ch = 0;
+        int i = 2;
+        for (; i < argc; i++) {
+            if (strcasecmp(argv[i], "NX") == 0) nx = 1;
+            else if (strcasecmp(argv[i], "XX") == 0) xx = 1;
+            else if (strcasecmp(argv[i], "CH") == 0) ch = 1;
+            else break;
+        }
+        /* NX and XX are mutually exclusive, as in Redis; CH composes
+           with either. */
+        if (nx && xx)
+            return dbuf_error(reply, "XX and NX options at the same time are not compatible"), 0;
+        int nrest = argc - i;
+        if (nrest < 3 || (nrest % 3) != 0)
             return dbuf_error(reply, "wrong number of arguments for 'geoadd' command"), 0;
         /* Parse every coordinate before adding any member, so a bad
            coordinate errors without a partial apply, as ZADD does
            with bad scores. Longitude is [-180, 180], latitude
            [-85.05112878, 85.05112878], as in Redis. */
-        size_t ntriples = (size_t)(argc - 2) / 3;
+        size_t ntriples = (size_t)nrest / 3;
         double *coords = malloc(ntriples * 2 * sizeof(double));
         if (!coords)
             return dbuf_error(reply, "out of memory"), 0;
         for (size_t k = 0; k < ntriples; k++) {
-            const char *lon_s = argv[2 + 3 * k];
-            const char *lat_s = argv[3 + 3 * k];
+            const char *lon_s = argv[i + 3 * k];
+            const char *lat_s = argv[i + 1 + 3 * k];
             double lon, lat;
             if (!parse_double(lon_s, &lon) || !parse_double(lat_s, &lat)) {
                 free(coords);
@@ -1287,22 +1305,34 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             free(coords);
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         }
-        long long added = 0;
+        long long added = 0, updated = 0;
         int changed = 0;
         for (size_t k = 0; k < ntriples; k++) {
+            const char *member = argv[i + 2 + 3 * k];
+            /* The conditions only gate the member: a new member is
+               skipped under XX, an existing one under NX.
+               Re-reading each triple also makes a duplicate member
+               in one call see the coordinates the earlier triple
+               just set. */
+            double cur = 0;
+            int exists = store_zscore(g_store, argv[1], member, &cur) == 1;
+            if ((nx && exists) || (xx && !exists)) continue;
             long long rc = store_geoadd(g_store, argv[1], coords[2 * k],
-                                        coords[2 * k + 1],
-                                        argv[4 + 3 * k]);
+                                        coords[2 * k + 1], member);
             if (rc == -2) {
                 free(coords);
                 return dbuf_error(reply, "out of memory"), 0;
             }
             if (rc == 1) added++;
+            if (rc == 0) updated++;
             if (rc != 2) changed = 1;
         }
         free(coords);
         if (g_max_entries) store_evict_lru(g_store, g_max_entries);
-        dbuf_int(reply, added);
+        /* Without CH the reply counts only newly added members; with
+           CH it counts every changed member, added or updated, as
+           in Redis. */
+        dbuf_int(reply, ch ? added + updated : added);
         /* Log only when something actually changed: re-adding a
            member at its current coordinates, like a ZADD of the
            same score, is a no-op. */

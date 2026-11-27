@@ -12,7 +12,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.61.0.
+Version 0.62.0.
 
 ## Why
 
@@ -94,7 +94,7 @@ OK
 | `PFADD key element [element ...]` | Add elements to the HyperLogLog at `key`, creating it when missing; returns `1` when a register changed, `0` when every element hashed into a register that already held at least that value; a plain string key is an error (`WRONGTYPE Key is not a valid HyperLogLog string value.`), as is any non-string key; preserves the TTL |
 | `PFCOUNT key [key ...]` | Estimate the cardinality of the union of the HyperLogLogs at `key` (or several keys, merged register-wise); a missing key counts as empty (`0` for no keys at all); a plain string or non-string key is an error, as for `PFADD` |
 | `PFMERGE destkey sourcekey [sourcekey ...]` | Merge the HyperLogLogs at `sourcekey` into `destkey` (registers merged by maximum), creating it when missing and overwriting it when it exists (its TTL is cleared); a missing source counts as empty, so merging only missing sources creates an empty HyperLogLog; sources are never modified, and the destination may itself be a source; a plain string or non-string key at either end is an error, as for `PFADD`; a merge that reproduces the destination exactly changes nothing, so it is not logged, not replicated, and does not invalidate a `WATCH` |
-| `GEOADD key longitude latitude member [longitude latitude member ...]` | Add members at coordinates, stored as a sorted set whose scores are 52-bit geohashes (longitude in [-180, 180], latitude in [-85.05112878, 85.05112878]); returns the number of newly added members (moving an existing member answers `0`); every coordinate is parsed and range-checked before any member is added, so a bad triple adds nothing; a re-add at the same coordinates is a no-op, so it is not logged, not replicated, and does not invalidate a `WATCH`; preserves the TTL |
+| `GEOADD key [NX \| XX] [CH] longitude latitude member [longitude latitude member ...]` | Add members at coordinates, stored as a sorted set whose scores are 52-bit geohashes (longitude in [-180, 180], latitude in [-85.05112878, 85.05112878]); returns the number of newly added members (moving an existing member answers `0`); `NX` only adds new members, `XX` only updates existing ones, `CH` counts changed members (added plus updated) instead of only new ones, and `NX` with `XX` is an error; every coordinate is parsed and range-checked before any member is added, so a bad triple adds nothing; a re-add at the same coordinates is a no-op, so it is not logged, not replicated, and does not invalidate a `WATCH`; preserves the TTL |
 | `GEODIST key member1 member2 [m \| km \| ft \| mi]` | Haversine distance between two members in metres by default (or the named unit), as a bulk string with four decimals (`166274.1516` for Palermo/Catania, as in real Redis); the members' geohash scores are decoded back to the centres of their geohash cells, as in Redis; `nil` when the key or a member is missing; a member of a plain sorted set decodes whatever score it holds, as in Redis |
 | `GEOPOS key member [member ...]` | The position of each member as a `[longitude, latitude]` array, each coordinate a bulk string with `%.17g` precision (the centres of their geohash cells, as in Redis); a missing member — or one whose score does not decode as a geohash (NaN, negative, 2^64 or more, or exactly 0) — answers a null array, and a missing key answers one null array per member; a member of a plain sorted set decodes whatever score it holds, as in Redis |
 | `GEOHASH key member [member ...]` | The 11-character base32 geohash string of each member's position (`sqc8b49rny0` for Palermo, `sqdtr74hyu0` for Catania, as in real Redis); the score is decoded to the centre of its geohash cell and re-encoded over the standard ranges (longitude [-180, 180], latitude [-90, 90]), because the stored hash uses latitude [-85.05112878, 85.05112878] instead, and the last character is always `0` (52 bits cannot fill the 55 an 11-character string holds); `nil` for a missing member or one whose score does not decode, and a missing key answers one `nil` per member |
@@ -431,7 +431,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # `GEOADD`, a no-op `GEOADD` not invalidating a `WATCH`
             # while a move does, `COMMAND` listing both, and the
             # geo set that survives the AOF restart answering the
-            # exact distance again), and `GEOPOS` / `GEOHASH` checks
+            # exact distance again), and `GEOADD` option checks
+            # (`NX` adding only new members and skipping an
+            # existing one without moving it, `XX` updating only
+            # existing members and skipping a new one, `CH`
+            # counting added plus updated members including a
+            # mixed call and answering 0 for a same-coordinates
+            # re-add, `NX` with `CH` and `XX` with `CH`, `NX`
+            # with `XX` erroring in either order, options alone
+            # or with an incomplete triple erroring, a duplicate
+            # member in one call keeping the first coordinates,
+            # lowercase options, a wrong-type error under `NX`,
+            # and a no-op update under `XX` not invalidating a
+            # `WATCH`), and `GEOPOS` / `GEOHASH` checks
             # (`GEOPOS` answering the decoded cell centres as
             # `[longitude, latitude]` bulk-string pairs, a null
             # array for a missing member and one null array per
@@ -1363,5 +1375,26 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       `STORE` and `STOREDIST` are refused with an error, so the
       commands never write, never log to the AOF, and never
       replicate, and are safe to run on a replica. Both are
-      listed by `COMMAND`. Limitation: `GEOADD` still takes no
-      `NX` / `XX` / `CH` options.
+      listed by `COMMAND`.
+
+- [x] Geo, sixth slice (0.62.0): `GEOADD` `NX` / `XX` / `CH`
+      options, as in real Redis. `NX` only adds new members,
+      `XX` only updates existing ones, `CH` counts changed
+      members (added plus updated) instead of only newly added
+      ones, and `NX` with `XX` is an error; the options come
+      after the key and before the first longitude, and are
+      case-insensitive. A pair the options skip changes nothing
+      and is not logged, and a no-op update at the same
+      coordinates still neither logs nor invalidates a `WATCH`,
+      as before. A duplicate member in one call sees the
+      coordinates the earlier triple just set, so `NX` keeps the
+      first pair and skips the second. The options are part of
+      the logged command, so AOF replay and replication
+      reproduce the same result.
+
+- [ ] Hash field TTLs (Redis 7.2): `HEXPIRE` / `HPEXPIRE` /
+      `HEXPIREAT` / `HPTTL` / `HTTL` / `HPERSIST` — per-field
+      expiries inside a hash, with the same lazy-expiry and
+      AOF/RDB/replication treatment as key TTLs, so a field whose
+      TTL passed reads as missing and an emptied hash deletes
+      its key

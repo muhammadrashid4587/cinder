@@ -1999,6 +1999,51 @@ def main():
         check("COMMAND lists GEODIST", "GEODIST" in c.cmd("COMMAND"), True)
         check("COMMAND lists GEOPOS", "GEOPOS" in c.cmd("COMMAND"), True)
         check("COMMAND lists GEOHASH", "GEOHASH" in c.cmd("COMMAND"), True)
+        # GEOADD NX / XX / CH options, as in Redis: NX adds only
+        # new members, XX updates only existing ones, CH counts
+        # changed members (added plus updated) instead of only new
+        # ones, and NX with XX is an error.
+        check("GEOADD NX new", c.cmd("GEOADD", "geoo", "NX", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"), 2)
+        check("GEOADD NX existing skipped", c.cmd("GEOADD", "geoo", "NX", "13.5", "38.2", "Palermo", "15.5", "37.5", "Catania"), 0)
+        check("GEOADD NX skipped move", c.cmd("GEODIST", "geoo", "Palermo", "Catania"), "166274.1516")
+        check("GEOADD XX new skipped", c.cmd("GEOADD", "geoo", "XX", "12.5", "41.9", "Rome"), 0)
+        check("GEOADD XX skipped member absent", c.cmd("GEOPOS", "geoo", "Rome"), [None])
+        check("GEOADD XX move", c.cmd("GEOADD", "geoo", "XX", "13.5", "38.2", "Palermo"), 0)
+        check("GEOADD XX move changed dist", c.cmd("GEODIST", "geoo", "Palermo", "Catania") != "166274.1516", True)
+        check("GEOADD XX move back", c.cmd("GEOADD", "geoo", "XX", "13.361389", "38.115556", "Palermo"), 0)
+        check("GEOADD XX move back exact", c.cmd("GEODIST", "geoo", "Palermo", "Catania"), "166274.1516")
+        check("GEOADD CH new", c.cmd("GEOADD", "geoo", "CH", "12.5", "41.9", "Rome"), 1)
+        check("GEOADD CH update", c.cmd("GEOADD", "geoo", "CH", "13.5", "38.2", "Palermo"), 1)
+        check("GEOADD CH mixed", c.cmd("GEOADD", "geoo", "CH", "13.361389", "38.115556", "Palermo", "12.6", "42.0", "Rome", "10.0", "45.0", "Milan"), 3)
+        check("GEOADD CH no-op same coords", c.cmd("GEOADD", "geoo", "CH", "13.361389", "38.115556", "Palermo"), 0)
+        check("GEOADD NX CH new", c.cmd("GEOADD", "geoo", "NX", "CH", "11.0", "46.0", "Turin"), 1)
+        check("GEOADD NX CH existing", c.cmd("GEOADD", "geoo", "NX", "CH", "11.5", "46.5", "Turin"), 0)
+        check("GEOADD XX CH update", c.cmd("GEOADD", "geoo", "XX", "CH", "11.5", "46.5", "Turin"), 1)
+        check("GEOADD NX XX conflict", c.cmd("GEOADD", "geoo", "NX", "XX", "13.3", "38.1", "A"),
+              ("error", "ERR XX and NX options at the same time are not compatible"))
+        check("GEOADD XX NX conflict", c.cmd("GEOADD", "geoo", "XX", "NX", "13.3", "38.1", "A"),
+              ("error", "ERR XX and NX options at the same time are not compatible"))
+        check("GEOADD options only", c.cmd("GEOADD", "geoo", "NX"),
+              ("error", "ERR wrong number of arguments for 'geoadd' command"))
+        check("GEOADD options bad triple", c.cmd("GEOADD", "geoo", "NX", "13.3", "38.1"),
+              ("error", "ERR wrong number of arguments for 'geoadd' command"))
+        # A duplicate member in one call: the second triple sees the
+        # member the first triple just added, so NX skips it and the
+        # first coordinates win.
+        check("GEOADD NX dup in one call", c.cmd("GEOADD", "geoo", "NX", "9.0", "44.0", "Genoa", "9.5", "44.5", "Genoa"), 1)
+        check("GEOADD dup control", c.cmd("GEOADD", "geoo3", "9.0", "44.0", "Genoa"), 1)
+        check("GEOADD NX dup first wins", c.cmd("GEOPOS", "geoo", "Genoa"), c.cmd("GEOPOS", "geoo3", "Genoa"))
+        check("GEOADD nx lowercase", c.cmd("GEOADD", "geoo", "nx", "8.0", "43.0", "Pisa"), 1)
+        check("GEOADD options ZCARD", c.cmd("ZCARD", "geoo"), 7)
+        check("GEOADD NX list wrongtype", c.cmd("GEOADD", "plist", "NX", "13.3", "38.1", "x"), wrongtype)
+        # A no-op update under XX does not invalidate a WATCH, like
+        # the plain same-coordinates re-add.
+        check("GEOADD XX WATCH setup", c.cmd("WATCH", "geoo"), "OK")
+        check("GEOADD XX WATCH noop", c.cmd("GEOADD", "geoo", "XX", "13.361389", "38.115556", "Palermo"), 0)
+        check("MULTI geo XX noop", c.cmd("MULTI"), "OK")
+        check("MULTI geo XX noop SET queued", c.cmd("SET", "wtestkey5", "v1"), "QUEUED")
+        check("EXEC geo XX noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("wtestkey5 after geo XX noop EXEC", c.cmd("GET", "wtestkey5"), "v1")
         # GEOSEARCH / GEORADIUS / GEORADIUSBYMEMBER. geos holds
         # Palermo, Catania and Rome; the centre (15, 37) is about
         # 56 km from Catania and 190 km from Palermo, and Rome is
@@ -2852,7 +2897,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.61.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.62.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
