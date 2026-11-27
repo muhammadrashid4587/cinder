@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.73.0"
+#define CINDER_VERSION "0.74.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2588,7 +2588,12 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            list is untouched. XGROUP DESTROY key group drops a
            whole group — cursor, consumers and pending list — and
            answers 1, or 0 when there was no such group; the
-           stream and its entries survive. Other subcommands are
+           stream and its entries survive. XGROUP DELCONSUMER key
+           group consumer drops one consumer and, with it, the
+           pending entries it held (as in real Redis they become
+           unclaimable, so claim or acknowledge them first), and
+           answers how many pending entries the consumer had, or
+           0 when there was no such consumer. Other subcommands are
            an error, and SETID's ENTRIESREAD option is not
            supported yet. A real write, so it is logged to the AOF
            and replicated, which is also how a group survives a
@@ -2659,6 +2664,25 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             }
             dbuf_putf(reply, ":%d\r\n", rc);
             return rc; /* 1 when a group was destroyed, 0 when there was none */
+        }
+        if (strcasecmp(argv[1], "DELCONSUMER") == 0) {
+            if (argc != 5)
+                return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
+            long long rc = store_xgroup_delconsumer(g_store, argv[2], argv[3], argv[4]);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == -3) {
+                dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", argv[2], argv[3]);
+                return 0;
+            }
+            if (rc == -4) {
+                /* No such consumer: the answer is 0, and nothing
+                   changed, so it is not logged. */
+                dbuf_putf(reply, ":0\r\n");
+                return 0;
+            }
+            dbuf_putf(reply, ":%lld\r\n", rc);
+            return 1; /* a consumer was deleted, even with no pending entries */
         }
         return dbuf_error(reply, "Unknown subcommand or wrong number of arguments for 'xgroup'"), 0;
     }

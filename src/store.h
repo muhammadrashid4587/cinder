@@ -888,6 +888,20 @@ int store_xgroup_setid(Store *s, const char *key, const char *group,
    WATCH on the key is invalidated); destroying a group that does
    not exist changes nothing. */
 int store_xgroup_destroy(Store *s, const char *key, const char *group);
+/* XGROUP DELCONSUMER: drop one consumer from a group, and with
+   it the consumer's pending entries — as in real Redis, the
+   entries it held become unclaimable, so claim or acknowledge
+   them first. The group, its cursor and the other consumers'
+   pending entries survive, and the stream is untouched. Returns
+   the number of pending entries the consumer had (0 when it had
+   none), -1 = the key holds a non-stream value, -3 = no such key
+   or consumer group, -4 = no such consumer. Deleting a consumer
+   that exists bumps the version (a WATCH on the key is
+   invalidated) even when it had no pending entries; deleting one
+   that does not exist changes nothing. */
+long long store_xgroup_delconsumer(Store *s, const char *key,
+                                   const char *group,
+                                   const char *consumer);
 /* XREADGROUP: deliver entries of one stream to a consumer of a
    group. When new_only is set, the entries after the group's
    cursor, which are added to the PEL (delivery count 1, stamped

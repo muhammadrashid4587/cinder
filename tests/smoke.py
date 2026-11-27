@@ -1496,6 +1496,82 @@ def main():
         check("xdwatchkey unchanged after abort", c.cmd("GET", "xdwatchkey"), "v1")
         cs.close()
         check("XGROUP DESTROY cleanup", c.cmd("DEL", "xgd"), 1)
+        # XGROUP DELCONSUMER: drop one consumer and, with it, the
+        # pending entries it held — as in real Redis they become
+        # unclaimable, not left pending for another consumer — and
+        # answer how many pending entries it had. The group, its
+        # cursor and the other consumers survive.
+        check("XGROUP DELCONSUMER setup 1", c.cmd("XADD", "xgdc", "1000-1", "a", "1"), "1000-1")
+        check("XGROUP DELCONSUMER setup 2", c.cmd("XADD", "xgdc", "1000-2", "a", "2"), "1000-2")
+        check("XGROUP DELCONSUMER setup 3", c.cmd("XADD", "xgdc", "2000-0", "a", "3"), "2000-0")
+        check("XGROUP DELCONSUMER create",
+              c.cmd("XGROUP", "CREATE", "xgdc", "gdc", "0"), "OK")
+        check("XGROUP DELCONSUMER drain c1",
+              c.cmd("XREADGROUP", "GROUP", "gdc", "c1", "STREAMS", "xgdc", ">"),
+              [["xgdc", [["1000-1", ["a", "1"]], ["1000-2", ["a", "2"]],
+                         ["2000-0", ["a", "3"]]]]])
+        check("XGROUP DELCONSUMER setup 4", c.cmd("XADD", "xgdc", "3000-0", "a", "4"), "3000-0")
+        check("XGROUP DELCONSUMER drain c2",
+              c.cmd("XREADGROUP", "GROUP", "gdc", "c2", "STREAMS", "xgdc", ">"),
+              [["xgdc", [["3000-0", ["a", "4"]]]]])
+        check("XGROUP DELCONSUMER pending before",
+              c.cmd("XPENDING", "xgdc", "gdc"),
+              [4, "1000-1", "3000-0", [["c1", 3], ["c2", 1]]])
+        check("XGROUP DELCONSUMER c1", c.cmd("XGROUP", "DELCONSUMER", "xgdc", "gdc", "c1"), 3)
+        check("XGROUP DELCONSUMER pending after",
+              c.cmd("XPENDING", "xgdc", "gdc"),
+              [1, "3000-0", "3000-0", [["c2", 1]]])
+        # c1's entries are gone from the pending list, not left
+        # for another consumer to claim: a plain XCLAIM of one
+        # finds nothing pending to take over. (FORCE is not used
+        # here: it claims entries that are in the stream but not
+        # pending at all, so it would take the entry over.)
+        check("XGROUP DELCONSUMER gone not claimable",
+              c.cmd("XCLAIM", "xgdc", "gdc", "c2", "0", "1000-1"),
+              [])
+        check("XGROUP DELCONSUMER c1 pending read empty",
+              c.cmd("XREADGROUP", "GROUP", "gdc", "c1", "STREAMS", "xgdc", "0"), [])
+        check("XGROUP DELCONSUMER c1 again", c.cmd("XGROUP", "DELCONSUMER", "xgdc", "gdc", "c1"), 0)
+        check("XGROUP DELCONSUMER c2", c.cmd("XGROUP", "DELCONSUMER", "xgdc", "gdc", "c2"), 1)
+        check("XGROUP DELCONSUMER pending empty",
+              c.cmd("XPENDING", "xgdc", "gdc"),
+              [0, None, None, []])
+        # A consumer with no pending entries is still deleted,
+        # and answers 0: an empty ">" read brings c3 into being.
+        check("XGROUP DELCONSUMER empty read c3",
+              c.cmd("XREADGROUP", "GROUP", "gdc", "c3", "STREAMS", "xgdc", ">"), [])
+        check("XGROUP DELCONSUMER c3 no pending", c.cmd("XGROUP", "DELCONSUMER", "xgdc", "gdc", "c3"), 0)
+        check("XGROUP DELCONSUMER c3 again", c.cmd("XGROUP", "DELCONSUMER", "xgdc", "gdc", "c3"), 0)
+        check("XGROUP DELCONSUMER missing key",
+              c.cmd("XGROUP", "DELCONSUMER", "nope", "gdc", "c1"),
+              ("error", "ERR NOGROUP No such key 'nope' or consumer group 'gdc'"))
+        check("XGROUP DELCONSUMER missing group",
+              c.cmd("XGROUP", "DELCONSUMER", "xgdc", "nogrp", "c1"),
+              ("error", "ERR NOGROUP No such key 'xgdc' or consumer group 'nogrp'"))
+        check("XGROUP DELCONSUMER wrongtype",
+              c.cmd("XGROUP", "DELCONSUMER", "after", "gdc", "c1"), wrongtype)
+        check("XGROUP DELCONSUMER wrong args",
+              c.cmd("XGROUP", "DELCONSUMER", "xgdc", "gdc"),
+              ("error", "ERR wrong number of arguments for 'xgroup' command"))
+        # A real DELCONSUMER invalidates a WATCH on the key;
+        # deleting a consumer that does not exist does not.
+        check("XGROUP DELCONSUMER recreate c1",
+              c.cmd("XREADGROUP", "GROUP", "gdc", "c1", "STREAMS", "xgdc", ">"), [])
+        cs = Client(PORT)
+        check("WATCH xgdc noop", c.cmd("WATCH", "xgdc"), "OK")
+        check("other client DELCONSUMER missing", cs.cmd("XGROUP", "DELCONSUMER", "xgdc", "gdc", "ghost"), 0)
+        check("MULTI delconsumer noop watch", c.cmd("MULTI"), "OK")
+        check("MULTI delconsumer noop SET queued", c.cmd("SET", "xdcwatchkey", "v1"), "QUEUED")
+        check("EXEC delconsumer noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("xdcwatchkey after noop", c.cmd("GET", "xdcwatchkey"), "v1")
+        check("WATCH xgdc", c.cmd("WATCH", "xgdc"), "OK")
+        check("other client DELCONSUMER", cs.cmd("XGROUP", "DELCONSUMER", "xgdc", "gdc", "c1"), 0)
+        check("MULTI delconsumer watch", c.cmd("MULTI"), "OK")
+        check("MULTI delconsumer SET queued", c.cmd("SET", "xdcwatchkey", "v2"), "QUEUED")
+        check("EXEC delconsumer watch aborts", c.cmd("EXEC"), None)
+        check("xdcwatchkey unchanged after abort", c.cmd("GET", "xdcwatchkey"), "v1")
+        cs.close()
+        check("XGROUP DELCONSUMER cleanup", c.cmd("DEL", "xgdc"), 1)
         check("XGROUP bad mkstream", c.cmd("XGROUP", "CREATE", "xg", "g3", "0", "FOO"),
               ("error", "ERR syntax error"))
         check("XREADGROUP new",
@@ -3726,7 +3802,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.73.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.74.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

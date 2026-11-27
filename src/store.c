@@ -4775,6 +4775,49 @@ int store_xgroup_destroy(Store *s, const char *key, const char *group) {
     return 1;
 }
 
+/* XGROUP DELCONSUMER: drop one consumer from a group. The
+   consumer's pending entries go with it — real Redis deletes
+   them too, so they become unclaimable rather than staying
+   pending for another consumer to claim; the reply is how many
+   pending entries the consumer had. The group, its cursor, the
+   other consumers and their pending entries all survive. */
+long long store_xgroup_delconsumer(Store *s, const char *key,
+                                   const char *group,
+                                   const char *consumer) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    Stream *st = e->stream;
+    StreamGroup *g = stream_group_find(st, group);
+    if (!g) return -3;
+    size_t cidx = g->nconsumers;
+    for (size_t i = 0; i < g->nconsumers; i++)
+        if (strcmp(g->consumers[i], consumer) == 0) { cidx = i; break; }
+    if (cidx == g->nconsumers) return -4;
+    /* Drop the consumer's pending entries first, counting them,
+       then the consumer's name. PEL entries are in ID order, so
+       a compacting scan keeps the survivors in order. */
+    long long removed = 0;
+    size_t w = 0;
+    for (size_t i = 0; i < g->npel; i++) {
+        if (strcmp(g->pel[i].consumer, consumer) == 0) {
+            free(g->pel[i].consumer);
+            removed++;
+        } else {
+            if (w != i) g->pel[w] = g->pel[i];
+            w++;
+        }
+    }
+    g->npel = w;
+    free(g->consumers[cidx]);
+    memmove(&g->consumers[cidx], &g->consumers[cidx + 1],
+            (g->nconsumers - cidx - 1) * sizeof(*g->consumers));
+    g->nconsumers--;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return removed;
+}
+
 int store_xgroup_restore(Store *s, const char *key, const char *group,
                          uint64_t last_ms, uint64_t last_seq,
                          char *const *consumers, size_t nconsumers,
