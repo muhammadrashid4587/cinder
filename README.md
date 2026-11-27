@@ -14,7 +14,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.70.0.
+Version 0.71.0.
 
 ## Why
 
@@ -128,7 +128,7 @@ OK
 | `XREVRANGE key end start [COUNT count]` | The entries whose IDs fall in `[start, end]` inclusive, in reverse ID order (highest first), each as `[id, [field, value, ...]]`; the bounds are given end-first, as in Redis, and parsed the same way as `XRANGE`'s (`-` / `+` / `ms` / `ms-seq`, a bare ms covering the whole millisecond); `COUNT` takes the highest IDs first (`0` returns none, a negative count is an error). An empty array when the key is missing or the range is empty, including a start above the end. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
 | `XLEN key` | Number of entries in a stream (`0` when missing); read-only |
 | `XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]` | The entries after each ID, one `[key, [[id, [field, value, ...]], ...]]` element per stream that has any (streams with nothing new are left out); IDs are `ms-seq`, a bare `ms` (the whole millisecond: entries after `ms-0`), or `$` (the stream's top ID at read time, resolved once, so only entries added after the read qualify); `>` is an error (it needs `XREADGROUP`, below). `COUNT` limits the entries per stream; `BLOCK` waits for new entries instead of answering at once — an empty array when there is nothing and no `BLOCK`, a nil array when a `BLOCK` times out, `BLOCK 0` waits forever. A blocked client parks with no lock held (the loop re-checks it every iteration, so it wakes within one iteration of the `XADD` that releases it, and a disconnect while parked drops the request) and sends nothing more until its read is answered, so its `EPOLLIN` interest is dropped while it waits. `BLOCK` is refused inside `MULTI`/`EXEC`; a plain `XREAD` queues and runs at `EXEC`. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
-| `XGROUP CREATE key group id [MKSTREAM]` | Create a consumer group on a stream, starting at `id`: `$` (the top ID at creation, so only entries added later are delivered), `0` (from the beginning) or an explicit `ms-seq`; `MKSTREAM` creates the stream empty when it is missing. An existing group name is a `BUSYGROUP` error, a missing stream without `MKSTREAM` is an error, and only `CREATE` exists so far. A real write, so it is AOF-logged and replicated, invalidates a `WATCH`, and is how a group survives a restart (groups are not in RDB snapshots yet) |
+| `XGROUP CREATE key group id [MKSTREAM]` | Create a consumer group on a stream, starting at `id`: `$` (the top ID at creation, so only entries added later are delivered), `0` (from the beginning) or an explicit `ms-seq`; `MKSTREAM` creates the stream empty when it is missing. An existing group name is a `BUSYGROUP` error, a missing stream without `MKSTREAM` is an error, and only `CREATE` exists so far. A real write, so it is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and, since 0.71.0, through RDB snapshots too |
 | `XREADGROUP GROUP group consumer [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]` | Read a stream as a consumer of a group, one `[key, [[id, [field, value, ...]], ...]]` element per stream that has any, as in `XREAD`. `>` delivers the entries after the group's cursor, records them in the group's pending list (PEL) with a delivery count and time, and advances the cursor; an explicit ID returns the group's pending entries for this consumer after that ID, without changing delivery state. `$` is not valid here. `COUNT` limits the entries per stream; `BLOCK` waits for new entries instead of answering at once — an empty array when there is nothing and no `BLOCK`, a nil array when a `BLOCK` times out, `BLOCK 0` waits forever (a blocked client parks with no lock held, as with `XREAD`'s `BLOCK`, and a disconnect while parked drops the request; `BLOCK` is refused inside `MULTI`/`EXEC`). A `>` read that delivers entries is AOF-logged and replicated like a write (an AOF replay re-delivers, so delivery counts go up by one per replay, and a replayed `BLOCK` read answers at once); a read that delivers nothing, or a pending-only read, is not logged. A missing key or group is a `NOGROUP` error |
 | `XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME ms-unix-time] [RETRYCOUNT count] [FORCE] [JUSTID]` | Take over pending entries of a group for another consumer, usually because the consumer that held them died: an entry is claimed when it has been idle at least `min-idle-time` since its last delivery, or when `FORCE` is given (which also claims entries that are in the stream but not pending at all, creating a PEL entry for them). A claimed entry is moved to this consumer, its delivery time is set to now (or to `IDLE` ms ago, or to the absolute `TIME` given — `IDLE` and `TIME` cannot be combined) and its delivery count is bumped (or set by `RETRYCOUNT`); `JUSTID` answers only the IDs. A repeated ID in one call is claimed once. A real claim is AOF-logged and replicated like a write (an AOF replay re-claims, so delivery counts go up by one per replay). IDs that are not in the stream (trimmed, or never added), are not idle enough, or are not pending (without `FORCE`) are left out of the reply, where Redis answers nil for them. A missing key or group is a `NOGROUP` error |
 | `XACK key group id [id ...]` | Drop entries from a group's pending list, answering how many were dropped (`0` for an ID that was not pending). A missing key or group is a `NOGROUP` error. A real change, so it is AOF-logged and replicated when it drops anything |
@@ -212,12 +212,15 @@ src/
   rdb.c      RDB-style snapshots: `SAVE` writes the whole dataset (all
              types, TTLs as absolute expiries, hash field TTLs as one
              absolute expiry per field, streams as one record per
-             entry with its explicit ID) to `dump.rdb` in a compact
+             entry with its explicit ID, plus each stream's consumer
+             groups with their cursor, consumers, and pending
+             entries) to `dump.rdb` in a compact
              binary format, atomically via `dump.rdb.tmp` + rename; the
              snapshot is loaded on startup before the AOF is replayed;
-             format version 3, which version 1 and 2 snapshots still
-             load from (a version 1 snapshot's hash fields just come
-             back without a TTL);
+             format version 4, which version 1, 2, and 3 snapshots
+             still load from (a version 1 snapshot's hash fields just
+             come back without a TTL, and a version 3 snapshot's
+             streams just come back without their groups);
              `rdb_serialize` renders the same bytes to memory so a
              worker thread can write them for `BGSAVE`
   threadpool.c FIFO job queue with N worker threads (`--threads`); jobs
@@ -1605,3 +1608,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       reply, where Redis answers nil for them. Consumer groups are
       now complete; the remaining known gap is that groups are not
       in RDB snapshots yet.
+- [x] Consumer groups in RDB snapshots (0.71.0): the snapshot
+      format is now version 4, and a stream's record carries its
+      consumer groups after its entries — each group's name, its
+      last-delivered ID, its consumer names, and its pending
+      entries with their recorded delivery times and delivery
+      counts, so a group restored from a snapshot reports the same
+      idle times and counts it had when saved and keeps working
+      from the same cursor. Version 1, 2, and 3 snapshots still
+      load (a version 3 snapshot's streams just come back without
+      their groups, which the AOF replay then rebuilds, as
+      before), and the same bytes ride a replication full sync.
+      One honest note: when both a snapshot and an AOF are
+      present, the AOF replay after the snapshot load still
+      re-delivers entries the snapshot already restored, so
+      delivery counts go up by one per replay, as they always
+      have; a restart from the snapshot alone is exact.

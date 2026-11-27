@@ -3409,12 +3409,29 @@ def main():
         check("rdb SET snapstream ttl", c.cmd("EXPIRE", "snapstream", "100"), 1)
         check("rdb HPEXPIRE fexp gone", c.cmd("HPEXPIRE", "snapfexp", "50", "FIELDS", "1", "f2"), [1])
         check("rdb HEXPIREAT fexp", c.cmd("HEXPIREAT", "snapfexp", str(int(time.time()) + 3600), "FIELDS", "1", "f3"), [1])
+        # Consumer groups on the stream: g1 has one pending entry
+        # (1000-2, claimed once from alice to bob, so two
+        # deliveries) and g2 was created at $ with nothing
+        # delivered, so the snapshot must carry a group with a
+        # pending list and a group with none.
+        check("rdb XGROUP create", c.cmd("XGROUP", "CREATE", "snapstream", "g1", "0"), "OK")
+        check("rdb XREADGROUP deliver",
+              c.cmd("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "snapstream", ">"),
+              [["snapstream", [["1000-1", ["f1", "v1", "f2", "v2"]],
+                               ["1000-2", ["f1", "v1"]]]]])
+        check("rdb XACK one", c.cmd("XACK", "snapstream", "g1", "1000-1"), 1)
+        check("rdb XCLAIM to bob", c.cmd("XCLAIM", "snapstream", "g1", "bob", "0", "1000-2"),
+              [["1000-2", ["f1", "v1"]]])
+        check("rdb XPENDING pre-save", c.cmd("XPENDING", "snapstream", "g1"),
+              [1, "1000-2", "1000-2", [["bob", 1]]])
+        check("rdb XGROUP empty", c.cmd("XGROUP", "CREATE", "snapstream", "g2", "$"), "OK")
         time.sleep(0.1)
         check("rdb SAVE", c.cmd("SAVE"), "OK")
         with open(os.path.join(rdb_dir, "dump.rdb"), "rb") as f:
             snap = f.read()
         check("rdb file magic", snap[:6], b"CINDER")
         check("rdb file has keys", b"snapstr" in snap and b"snaphash" in snap and b"snapzset" in snap and b"snapstream" in snap, True)
+        check("rdb file has groups", b"\x02\x00\x00\x00g1" in snap and b"\x02\x00\x00\x00g2" in snap, True)
         check("rdb file skips expired key", b"snapgone" not in snap, True)
         c.cmd("SHUTDOWN")
         c.close()
@@ -3437,6 +3454,30 @@ def main():
         check("rdb reload zset card", c.cmd("ZCARD", "snapzset"), 2)
         check("rdb reload zset score", c.cmd("ZSCORE", "snapzset", "a"), "1.5")
         check("rdb reload hll", c.cmd("PFCOUNT", "snaphll"), 4)
+        # The groups came back with the snapshot: g1's pending
+        # entry is still bob's with two deliveries, g2 is still
+        # empty, and both cursors are still 1000-2.
+        check("rdb reload group pending", c.cmd("XPENDING", "snapstream", "g1"),
+              [1, "1000-2", "1000-2", [["bob", 1]]])
+        pend = c.cmd("XPENDING", "snapstream", "g1", "-", "+", "10")
+        check("rdb reload group pending one", len(pend), 1)
+        check("rdb reload group pending id", pend[0][0], "1000-2")
+        check("rdb reload group pending consumer", pend[0][1], "bob")
+        check("rdb reload group pending idle non-negative",
+              isinstance(pend[0][2], int) and pend[0][2] >= 0, True)
+        check("rdb reload group pending deliveries", pend[0][3], 2)
+        check("rdb reload group empty pending", c.cmd("XPENDING", "snapstream", "g2"),
+              [0, None, None, []])
+        check("rdb reload group exists",
+              c.cmd("XGROUP", "CREATE", "snapstream", "g1", "0"),
+              ("error", "ERR BUSYGROUP Consumer Group name already exists"))
+        check("rdb reload group pending re-read",
+              c.cmd("XREADGROUP", "GROUP", "g1", "bob", "STREAMS", "snapstream", "1000-1"),
+              [["snapstream", [["1000-2", ["f1", "v1"]]]]])
+        check("rdb reload group new empty",
+              c.cmd("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "snapstream", ">"), [])
+        check("rdb reload group dollar empty",
+              c.cmd("XREADGROUP", "GROUP", "g2", "alice", "STREAMS", "snapstream", ">"), [])
         # The stream's entries and its TTL survived the snapshot: an
         # ID at or below the top still errors, a higher one appends,
         # and the TTL is still armed.
@@ -3444,6 +3485,14 @@ def main():
               ("error", "ERR The ID specified in XADD is equal or smaller than the target stream top item"))
         check("rdb reload stream append", c.cmd("XADD", "snapstream", "1000-3", "f1", "v1"), "1000-3")
         check("rdb reload stream TTL", 90000 <= c.cmd("PTTL", "snapstream") <= 100000, True)
+        # Both groups keep delivering from their restored cursors.
+        check("rdb reload group new deliver",
+              c.cmd("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "snapstream", ">"),
+              [["snapstream", [["1000-3", ["f1", "v1"]]]]])
+        check("rdb reload group dollar deliver",
+              c.cmd("XREADGROUP", "GROUP", "g2", "alice", "STREAMS", "snapstream", ">"),
+              [["snapstream", [["1000-3", ["f1", "v1"]]]]])
+        check("rdb reload group ack new", c.cmd("XACK", "snapstream", "g1", "1000-3"), 1)
         check("rdb reload stream wrongtype", c.cmd("HSET", "snapstream", "a", "1"), wrongtype)
         check("rdb reload TTL survives", 90000 <= c.cmd("PTTL", "snapttl") <= 100000, True)
         check("rdb reload expired gone", c.cmd("GET", "snapgone"), None)
@@ -3564,7 +3613,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.70.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.71.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

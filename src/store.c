@@ -4360,6 +4360,16 @@ int stream_foreach(const Stream *st, stream_foreach_fn fn, void *arg) {
     return 0;
 }
 
+int stream_group_foreach(const Stream *st, stream_group_foreach_fn fn,
+                         void *arg) {
+    if (!st) return -1;
+    for (size_t i = 0; i < st->ngroups; i++) {
+        int rc = fn(&st->groups[i], arg);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
 int stream_foreach_rev(const Stream *st, stream_foreach_fn fn, void *arg) {
     if (!st) return -1;
     for (size_t i = st->len; i-- > 0;) {
@@ -4645,6 +4655,34 @@ static int stream_pel_deliver(StreamGroup *g, uint64_t ms, uint64_t seq,
     return 0;
 }
 
+/* Record a pending entry with the delivery time and count a
+   snapshot recorded, instead of "now" and 1 as stream_pel_deliver
+   does. Used only by store_xgroup_restore. Returns 0 on success,
+   -1 = the ID is already pending (a duplicate in the snapshot),
+   -2 = out of memory. */
+static int stream_pel_restore(StreamGroup *g, uint64_t ms, uint64_t seq,
+                              const char *consumer, long long delivery_time,
+                              long long delivery_count) {
+    if (stream_pel_find(g, ms, seq)) return -1;
+    if (g->npel == g->cap_pel) {
+        size_t ncap = g->cap_pel ? g->cap_pel * 2 : 8;
+        StreamPending *npel = realloc(g->pel, ncap * sizeof(*npel));
+        if (!npel) return -2;
+        g->pel = npel;
+        g->cap_pel = ncap;
+    }
+    StreamPending *np = &g->pel[g->npel];
+    memset(np, 0, sizeof(*np));
+    np->ms = ms;
+    np->seq = seq;
+    np->consumer = strdup(consumer);
+    if (!np->consumer) return -2;
+    np->delivery_time = delivery_time;
+    np->delivery_count = delivery_count;
+    g->npel++;
+    return 0;
+}
+
 int store_xgroup_create(Store *s, const char *key, const char *group,
                         uint64_t ms, uint64_t seq, int mkstream) {
     Entry *e = store_find(s, key, NULL);
@@ -4691,6 +4729,32 @@ int store_xgroup_create(Store *s, const char *key, const char *group,
     st->ngroups++;
     e->last_access = ++s->clock;
     entry_touch(s, e);
+    return 0;
+}
+
+int store_xgroup_restore(Store *s, const char *key, const char *group,
+                         uint64_t last_ms, uint64_t last_seq,
+                         char *const *consumers, size_t nconsumers,
+                         const StreamPending *pel, size_t npel) {
+    /* Create the group with its recorded cursor first; the checks
+       (wrong type, group exists, stream missing) are the same as
+       XGROUP CREATE's, and a load into a fresh store meets none
+       of them. A failed consumer or PEL copy leaves a half-built
+       group behind, which the loader treats as a corrupt snapshot
+       and the next load overwrites; a snapshot the writer produced
+       never hits it. */
+    int rc = store_xgroup_create(s, key, group, last_ms, last_seq, 0);
+    if (rc != 0) return rc;
+    Entry *e = store_find(s, key, NULL);
+    StreamGroup *g = stream_group_find(e->stream, group);
+    for (size_t i = 0; i < nconsumers; i++)
+        if (stream_group_add_consumer(g, consumers[i]) != 0) return -2;
+    for (size_t i = 0; i < npel; i++) {
+        rc = stream_pel_restore(g, pel[i].ms, pel[i].seq, pel[i].consumer,
+                                pel[i].delivery_time,
+                                pel[i].delivery_count);
+        if (rc != 0) return -2;
+    }
     return 0;
 }
 

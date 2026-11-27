@@ -969,5 +969,28 @@ int stream_foreach(const Stream *st, stream_foreach_fn fn, void *arg);
    callback contract: returning non-zero stops the iteration and
    that value is returned. */
 int stream_foreach_rev(const Stream *st, stream_foreach_fn fn, void *arg);
+/* Visit every consumer group of a stream, in creation order. The
+   callback receives the group itself (owned by the stream, must
+   not be freed or kept past the call); returning non-zero stops
+   the iteration and that value is returned. Used by the snapshot
+   writer, which needs each group's name, cursor, consumers, and
+   pending list. */
+typedef int (*stream_group_foreach_fn)(const StreamGroup *g, void *arg);
+int stream_group_foreach(const Stream *st, stream_group_foreach_fn fn,
+                         void *arg);
+/* Restore one consumer group exactly as a snapshot recorded it:
+   name, last-delivered ID, consumer names, and pending entries
+   with their recorded delivery times and counts (not "now", so a
+   reloaded group reports the same idle times and delivery counts
+   it had when saved). Used by the RDB loader; the stream must
+   already exist and the group must not. Returns 0 on success,
+   -1 = the key holds a non-stream value, -2 = out of memory,
+   -3 = the group already exists, -4 = the stream does not exist.
+   A duplicate pending ID in the snapshot is treated as out of
+   memory (-2): it cannot occur in a file the writer produced. */
+int store_xgroup_restore(Store *s, const char *key, const char *group,
+                         uint64_t last_ms, uint64_t last_seq,
+                         char *const *consumers, size_t nconsumers,
+                         const StreamPending *pel, size_t npel);
 
 #endif

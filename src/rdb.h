@@ -7,14 +7,23 @@
  * written alongside the AOF.
  *
  * Format (all integers little-endian):
- *   "CINDER" magic (6 bytes), uint32 version (= 1), then one record
+ *   "CINDER" magic (6 bytes), uint32 version (= 4), then one record
  *   per non-expired key:
- *     uint8  type      (0 = string, 1 = list, 2 = set, 3 = hash)
+ *     uint8  type      (0 = string, 1 = list, 2 = set, 3 = hash,
+ *                        4 = sorted set, 5 = stream)
  *     int64  expire_at (ms since epoch, -1 = no expiry)
  *     string key       (uint32 length + bytes)
  *     string value              for strings
  *     uint32 count, then count strings      for lists and sets
  *     uint32 count, then count field+value string pairs for hashes
+ *     uint32 count, then count stream entries (each an "ms-seq"
+ *       string, a field count, then the pairs), then — version 4
+ *       only — uint32 group count and one record per consumer
+ *       group: name string, last-delivered ID "ms-seq" string,
+ *       uint32 consumer count then the consumer names, uint32
+ *       pending count then one pending entry each (ID string,
+ *       consumer string, int64 delivery time, int64 delivery
+ *       count), for streams
  *   and a final uint8 0xFF end marker.
  *
  * Values are C strings, like everywhere else in cinder: embedded NUL

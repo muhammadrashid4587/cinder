@@ -9,7 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define RDB_VERSION 3
+#define RDB_VERSION 4
 #define RDB_MAGIC "CINDER"
 #define RDB_MAGIC_LEN 6
 #define RDB_END 0xFF
@@ -110,6 +110,42 @@ static int save_stream_entry(uint64_t ms, uint64_t seq, char *const *fields,
     return 0;
 }
 
+/* One consumer group being written to the snapshot: its name, its
+   last-delivered ID as a "ms-seq" string, its consumer names, then
+   its pending entries, each as an ID string, a consumer name, and
+   the recorded delivery time and count. */
+static int save_stream_group(const StreamGroup *g, void *arg) {
+    SaveCtx *ctx = arg;
+    char idbuf[48];
+    snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+             (unsigned long long)g->last_ms, (unsigned long long)g->last_seq);
+    if (w_str(ctx->f, g->name) < 0 || w_str(ctx->f, idbuf) < 0 ||
+        w_u32(ctx->f, (uint32_t)g->nconsumers) < 0) {
+        ctx->err = 1;
+        return 1;
+    }
+    for (size_t i = 0; i < g->nconsumers; i++) {
+        if (w_str(ctx->f, g->consumers[i]) < 0) {
+            ctx->err = 1;
+            return 1;
+        }
+    }
+    if (w_u32(ctx->f, (uint32_t)g->npel) < 0) { ctx->err = 1; return 1; }
+    for (size_t i = 0; i < g->npel; i++) {
+        snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                 (unsigned long long)g->pel[i].ms,
+                 (unsigned long long)g->pel[i].seq);
+        if (w_str(ctx->f, idbuf) < 0 ||
+            w_str(ctx->f, g->pel[i].consumer) < 0 ||
+            w_i64(ctx->f, g->pel[i].delivery_time) < 0 ||
+            w_i64(ctx->f, g->pel[i].delivery_count) < 0) {
+            ctx->err = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int save_entry(const Entry *e, void *arg) {
     SaveCtx *ctx = arg;
     if (ctx->err) return 1;
@@ -172,6 +208,12 @@ static int save_entry(const Entry *e, void *arg) {
         Stream *st = e->stream;
         if (w_u32(f, (uint32_t)st->len) < 0) { ctx->err = 1; return 1; }
         if (stream_foreach(st, save_stream_entry, ctx) != 0) return 1;
+        /* Version 4 writes the stream's consumer groups after its
+           entries, so a group survives the snapshot with its
+           cursor, its consumers, and its pending list. */
+        if (w_u32(f, (uint32_t)st->ngroups) < 0) { ctx->err = 1; return 1; }
+        if (stream_group_foreach(st, save_stream_group, ctx) != 0)
+            return 1;
     }
     return 0;
 }
@@ -332,6 +374,32 @@ static int r_str(Reader *r, char **out) {
     return r_str_len(r, out, NULL);
 }
 
+/* Parse a "ms-seq" stream ID string into its parts. Returns 1 on
+   success, 0 when the string is not a well-formed ID (no digits,
+   no dash, trailing junk, or overflow). "0-0" parses fine: it is
+   a legal group cursor. */
+static int parse_stream_id(const char *s, uint64_t *ms_out,
+                           uint64_t *seq_out) {
+    const char *dash = strchr(s, '-');
+    if (!dash || dash == s) return 0;
+    uint64_t ms = 0, seq = 0;
+    for (const char *p = s; p < dash; p++) {
+        if (*p < '0' || *p > '9') return 0;
+        if (ms > (UINT64_MAX - (uint64_t)(*p - '0')) / 10) return 0;
+        ms = ms * 10 + (uint64_t)(*p - '0');
+    }
+    const char *q = dash + 1;
+    if (*q == '\0') return 0;
+    for (; *q; q++) {
+        if (*q < '0' || *q > '9') return 0;
+        if (seq > (UINT64_MAX - (uint64_t)(*q - '0')) / 10) return 0;
+        seq = seq * 10 + (uint64_t)(*q - '0');
+    }
+    *ms_out = ms;
+    *seq_out = seq;
+    return 1;
+}
+
 long long rdb_load(Store *s, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1; /* errno ENOENT when there is no snapshot yet */
@@ -368,9 +436,10 @@ long long rdb_load(Store *s, const char *path) {
     uint32_t version;
     /* Version 1 snapshots (no per-field expiry) still load: their
        hash fields simply come back without a TTL. Version 2 adds
-       per-field expiries; version 3 adds streams. */
+       per-field expiries; version 3 adds streams; version 4 adds
+       stream consumer groups. */
     if (r_u32(&r, &version) < 0 ||
-        (version != 1 && version != 2 && version != 3)) {
+        (version != 1 && version != 2 && version != 3 && version != 4)) {
         free(data);
         errno = EINVAL;
         return -1;
@@ -450,6 +519,96 @@ long long rdb_load(Store *s, const char *path) {
                 free(pairs);
                 free(id);
                 if (bad) { free(key); goto malformed; }
+            }
+            /* Version 4 carries the stream's consumer groups after
+               its entries: name, last-delivered ID, consumer
+               names, then pending entries with their recorded
+               delivery times and counts. Older snapshots have no
+               groups; theirs come back from the AOF replay that
+               follows, as before. An expired stream's groups are
+               still read (to keep the reader aligned) but not
+               restored, like its entries above. */
+            if (version >= 4) {
+                uint32_t ng;
+                if (r_u32(&r, &ng) < 0) { free(key); goto malformed; }
+                for (uint32_t gi = 0; gi < ng; gi++) {
+                    char *gname = NULL, *lastid = NULL;
+                    if (r_str(&r, &gname) < 0) { free(key); goto malformed; }
+                    if (r_str(&r, &lastid) < 0) {
+                        free(gname);
+                        free(key);
+                        goto malformed;
+                    }
+                    uint64_t lms, lseq;
+                    if (!parse_stream_id(lastid, &lms, &lseq)) {
+                        free(lastid);
+                        free(gname);
+                        free(key);
+                        goto malformed;
+                    }
+                    free(lastid);
+                    uint32_t nc;
+                    if (r_u32(&r, &nc) < 0) {
+                        free(gname);
+                        free(key);
+                        goto malformed;
+                    }
+                    /* calloc, so a short read leaves the rest NULL
+                       and the cleanup below stays safe. */
+                    char **cons = calloc(nc ? nc : 1, sizeof(char *));
+                    if (!cons) {
+                        free(gname);
+                        free(key);
+                        goto malformed;
+                    }
+                    int bad = 0;
+                    for (uint32_t ci = 0; ci < nc; ci++)
+                        if (r_str(&r, &cons[ci]) < 0) { bad = 1; break; }
+                    uint32_t np = 0;
+                    StreamPending *pel = NULL;
+                    if (!bad && r_u32(&r, &np) < 0) bad = 1;
+                    if (!bad) {
+                        pel = calloc(np ? np : 1, sizeof(*pel));
+                        if (!pel) bad = 1;
+                    }
+                    for (uint32_t pi = 0; !bad && pi < np; pi++) {
+                        char *pid = NULL, *pcon = NULL;
+                        if (r_str(&r, &pid) < 0) { bad = 1; break; }
+                        uint64_t pms, pseq;
+                        if (!parse_stream_id(pid, &pms, &pseq)) {
+                            free(pid);
+                            bad = 1;
+                            break;
+                        }
+                        free(pid);
+                        if (r_str(&r, &pcon) < 0) { bad = 1; break; }
+                        int64_t dtime, dcount;
+                        if (r_i64(&r, &dtime) < 0 ||
+                            r_i64(&r, &dcount) < 0) {
+                            free(pcon);
+                            bad = 1;
+                            break;
+                        }
+                        pel[pi].ms = pms;
+                        pel[pi].seq = pseq;
+                        pel[pi].consumer = pcon;
+                        pel[pi].delivery_time = dtime;
+                        pel[pi].delivery_count = dcount;
+                    }
+                    if (!bad && !expired &&
+                        store_xgroup_restore(s, key, gname, lms, lseq,
+                                             cons, nc, pel, np) != 0)
+                        bad = 1;
+                    for (uint32_t ci = 0; ci < nc; ci++) free(cons[ci]);
+                    free(cons);
+                    if (pel) {
+                        for (uint32_t pi = 0; pi < np; pi++)
+                            free(pel[pi].consumer);
+                        free(pel);
+                    }
+                    free(gname);
+                    if (bad) { free(key); goto malformed; }
+                }
             }
             if (!expired && expire_at != -1) store_expire(s, key, expire_at);
         } else { /* ENTRY_HASH or ENTRY_ZSET */

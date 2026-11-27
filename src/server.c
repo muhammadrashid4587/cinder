@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.70.0"
+#define CINDER_VERSION "0.71.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2584,8 +2584,8 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            the stream empty when it is missing. Only CREATE exists
            so far; other subcommands are an error. A real write, so
            it is logged to the AOF and replicated, which is also
-           how a group survives a restart (groups are not in RDB
-           snapshots yet). */
+           how a group survives a restart (groups ride in RDB
+           snapshots since 0.71.0, as well as in the AOF). */
         if (argc < 2)
             return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
         if (strcasecmp(argv[1], "CREATE") != 0)
