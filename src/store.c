@@ -3475,3 +3475,151 @@ int store_zrandmember(Store *s, const char *key, long long count,
     *n_out = n;
     return 0;
 }
+
+/* ---------- HyperLogLog ---------- */
+
+/* MurmurHash64A (MurmurHash2, 64-bit): a uniform 64-bit hash of the
+   element, so the register index and the leading-zero count the
+   HyperLogLog derives from it are unbiased. Fixed seed 0, so a
+   PFADD replayed from the AOF or a replication stream rebuilds
+   exactly the same registers. The 8-byte chunks are copied with
+   memcpy, never read unaligned. */
+static uint64_t hll_hash64(const char *data, size_t len) {
+    const uint64_t m = 0xc6a4a7935bd1e995ULL;
+    const int r = 47;
+    uint64_t h = 0x8445d61a4e774912ULL ^ (len * m);
+    size_t nblocks = len / 8;
+    for (size_t i = 0; i < nblocks; i++) {
+        uint64_t k;
+        memcpy(&k, data + i * 8, 8);
+        k *= m;
+        k ^= k >> r;
+        k *= m;
+        h ^= k;
+        h *= m;
+    }
+    const unsigned char *tail = (const unsigned char *)data + nblocks * 8;
+    switch (len & 7) {
+    case 7: h ^= (uint64_t)tail[6] << 48; /* fall through */
+    case 6: h ^= (uint64_t)tail[5] << 40; /* fall through */
+    case 5: h ^= (uint64_t)tail[4] << 32; /* fall through */
+    case 4: h ^= (uint64_t)tail[3] << 24; /* fall through */
+    case 3: h ^= (uint64_t)tail[2] << 16; /* fall through */
+    case 2: h ^= (uint64_t)tail[1] << 8;  /* fall through */
+    case 1: h ^= (uint64_t)tail[0];
+        h *= m;
+    default: break;
+    }
+    h ^= h >> r;
+    h *= m;
+    h ^= h >> r;
+    return h;
+}
+
+/* The position of the first 1-bit in the hash after the register
+   index, 1-based: the top HLL_P bits are the index, the remaining
+   64 - HLL_P bits carry the run of leading zeros. At most
+   64 - HLL_P + 1 (51) when the rest is all zeros. */
+static int hll_rho(uint64_t h) {
+    uint64_t w = h << HLL_P;
+    if (w == 0) return 64 - HLL_P + 1;
+    return __builtin_clzll(w) + 1;
+}
+
+/* The standard HyperLogLog estimate for one register set: the
+   harmonic-mean estimator, linear counting when the raw estimate
+   is small and registers are still empty, and the large-range
+   correction above 2^32 / 30 (unreachable with a 64-bit hash at
+   this scale, kept for the formula's sake). Rounded to the
+   nearest integer: the linear-counting value for a handful of
+   elements lands just under the integer (2.9999 for three
+   distinct elements), and truncating would report one less. */
+static long long hll_estimate(const unsigned char *regs) {
+    double sum = 0;
+    long long zeros = 0;
+    for (size_t i = 0; i < HLL_REGISTERS; i++) {
+        sum += 1.0 / (double)(1ULL << regs[i]);
+        if (regs[i] == 0) zeros++;
+    }
+    double alpha = 0.7213 / (1.0 + 1.079 / (double)HLL_REGISTERS);
+    double est = alpha * (double)HLL_REGISTERS * (double)HLL_REGISTERS / sum;
+    if (est <= 2.5 * (double)HLL_REGISTERS && zeros > 0)
+        est = (double)HLL_REGISTERS * log((double)HLL_REGISTERS / (double)zeros);
+    else if (est > 143165576.5) /* 2^32 / 30 */
+        est = -4294967296.0 * log(1.0 - est / 4294967296.0);
+    return (long long)(est + 0.5);
+}
+
+/* The registers of a stored HyperLogLog value, or NULL when the
+   entry is not a valid one: the caller has already checked the
+   entry exists and holds a string. */
+static unsigned char *hll_regs(Entry *e) {
+    if (e->value_len != HLL_LEN || memcmp(e->value, HLL_MAGIC, 4) != 0)
+        return NULL;
+    return (unsigned char *)e->value + 4;
+}
+
+int store_pfadd(Store *s, const char *key, const char **elems, int nelems,
+                int *changed_out) {
+    Entry *e = store_find(s, key, NULL);
+    unsigned char *regs = NULL;
+    char *buf = NULL;
+    if (e) {
+        if (e->type != ENTRY_STRING) return -1;
+        regs = hll_regs(e);
+        if (!regs) return -3;
+    } else {
+        buf = calloc(1, HLL_LEN);
+        if (!buf) return -2;
+        memcpy(buf, HLL_MAGIC, 4);
+        regs = (unsigned char *)buf + 4;
+    }
+    int changed = 0;
+    for (int i = 0; i < nelems; i++) {
+        uint64_t h = hll_hash64(elems[i], strlen(elems[i]));
+        size_t idx = (size_t)(h >> (64 - HLL_P));
+        int rho = hll_rho(h);
+        if (rho > regs[idx]) {
+            regs[idx] = (unsigned char)rho;
+            changed = 1;
+        }
+    }
+    if (buf) {
+        /* A new key: any element changes a register (rho >= 1 over
+           zeroed registers), so changed is 1 here. */
+        if (!store_set_len(s, key, buf, HLL_LEN, -1)) {
+            free(buf);
+            return -2;
+        }
+        free(buf);
+    } else if (changed) {
+        e->last_access = ++s->clock;
+        entry_touch(s, e);
+    }
+    *changed_out = changed;
+    return 0;
+}
+
+int store_pfcount(Store *s, const char **keys, int nkeys, long long *out) {
+    unsigned char *merged = calloc(HLL_REGISTERS, 1);
+    if (!merged) return -2;
+    for (int k = 0; k < nkeys; k++) {
+        Entry *e = store_find(s, keys[k], NULL);
+        if (!e) continue; /* missing counts as empty */
+        if (e->type != ENTRY_STRING) {
+            free(merged);
+            return -1;
+        }
+        unsigned char *regs = hll_regs(e);
+        if (!regs) {
+            free(merged);
+            return -3;
+        }
+        e->last_access = ++s->clock;
+        for (size_t i = 0; i < HLL_REGISTERS; i++)
+            if (regs[i] > merged[i]) merged[i] = regs[i];
+    }
+    *out = hll_estimate(merged);
+    free(merged);
+    return 0;
+}

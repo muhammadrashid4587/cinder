@@ -2,7 +2,7 @@
 
 A Redis-compatible in-memory key-value store, written in C from scratch.
 Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, lists,
-sets, hashes and sorted sets with TTLs, approximate LRU eviction, and an append-only file for
+sets, hashes, sorted sets and HyperLogLog (`PFADD`/`PFCOUNT`) with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
 flush thread that does the once-a-second AOF sync under `everysec`,
@@ -10,7 +10,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.54.0.
+Version 0.55.0.
 
 ## Why
 
@@ -89,6 +89,8 @@ OK
 | `SSCAN key cursor [MATCH pattern] [COUNT n]` | Cursor-based iteration over a set's members: start at cursor `0`, repeat with the returned cursor until it comes back `0`; each call returns the next cursor and an array of matching members; `MATCH` filters member names with the same glob as `KEYS`, `COUNT` (default 10) is a hint for how many matching members to return per call |
 | `SISMEMBER key member` | `1` if member, `0` if not |
 | `SCARD key` | Set size (`0` when missing) |
+| `PFADD key element [element ...]` | Add elements to the HyperLogLog at `key`, creating it when missing; returns `1` when a register changed, `0` when every element hashed into a register that already held at least that value; a plain string key is an error (`WRONGTYPE Key is not a valid HyperLogLog string value.`), as is any non-string key; preserves the TTL |
+| `PFCOUNT key [key ...]` | Estimate the cardinality of the union of the HyperLogLogs at `key` (or several keys, merged register-wise); a missing key counts as empty (`0` for no keys at all); a plain string or non-string key is an error, as for `PFADD` |
 | `HSET key field value [field value ...]` | Set fields; returns number of new fields (updates return `0` for that field) |
 | `MULTI`, `EXEC`, `DISCARD` | Transactions: `MULTI` queues commands (`+QUEUED` per command, nested `MULTI` is an error), `EXEC` runs the queue in order and returns one reply per command (an error inside the transaction takes its place in the array and the rest still run), `DISCARD` drops the queue; `EXEC`/`DISCARD` without `MULTI` are errors. Queued writes are invisible to other clients until `EXEC` runs, and the commands `EXEC` runs are AOF-logged and replicated individually, never `MULTI`/`EXEC` themselves |
 | `WATCH key [key ...]`, `UNWATCH` | Optimistic locking for `MULTI`/`EXEC`: `WATCH` records the version each key has right now (0 when it does not exist); if any watched key is created, modified, deleted, expired, or flushed away before `EXEC`, `EXEC` aborts with a nil array and the queue never runs. `UNWATCH` clears the watch set, as do `EXEC` and `DISCARD`; `WATCH` inside `MULTI` is an error, while `UNWATCH` inside `MULTI` queues and runs at `EXEC`, as in real Redis. A write that changes nothing (SADD of a member already present, HSET of an identical value) does not invalidate a watch. Limitation: a watched key that did not exist, was created and deleted again before `EXEC`, reads as version 0 again, so the abort is not detected — the version scheme cannot see a create-plus-delete round trip |
@@ -152,7 +154,9 @@ src/
              plus a field-to-index hash table for O(1) lookup)
              and sorted sets (skip list ordered by score then
              member, plus a member-to-node hash table for O(1)
-             lookup)
+             lookup), and HyperLogLogs (a string value with a
+             4-byte magic header and 2^14 one-byte registers,
+             as in Redis — see `store_pfadd`)
   resp.c     RESP parser (array + inline commands) and encoders
   aof.c      append-only log: every mutation is a RESP array, replayed on start;
              fsync policy `always` or `everysec`; under `everysec` a
@@ -381,20 +385,30 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # and `COMMAND` listing it), and `ZREVRANK` checks
             # (highest member ranks 0, lowest ranks last, `nil`
             # for a missing key or member, wrong-type and
-            # wrong-argument errors, and `COMMAND` listing it),
+            # wrong-argument errors, and `COMMAND` listing it), and
+            # HyperLogLog checks (`PFADD` returning 1 for a new key,
+            # 0 for re-adding the same elements and 1 for a new one,
+            # small counts coming back exact, duplicates in one call
+            # counting once, `PFCOUNT` of a missing key returning 0,
+            # a plain string key and a list key both erroring, the
+            # TTL surviving a `PFADD`, a 1000-element estimate within
+            # 5% and a 1500-element union of two overlapping sets
+            # within 5%, a no-op `PFADD` not invalidating a `WATCH`
+            # while a changing one does, and `COMMAND` listing
+            # both), and
             # an AOF
-            # restart test (data, a list, a set, a hash and a sorted set survive a
+            # restart test (data, a list, a set, a hash, a sorted set and a HyperLogLog survive a
             # SHUTDOWN and reload), and everysec-policy checks (INFO
             # reports the policy, the AOF holds the record before any
             # sync, data survives a SIGKILL + restart, unknown policy
             # is a startup error), and RDB snapshot checks (SAVE writes
-            # dump.rdb with all five types, a key whose TTL passed
+            # dump.rdb with all five types and a HyperLogLog, a key whose TTL passed
             # before the save is left out, and a restart with the AOF
             # deleted restores every key from the snapshot alone, with
             # a surviving TTL preserved), and replication checks
-            # (REPLICAOF streams a full sync of all five types with a
-            # surviving TTL, skips a key whose TTL passed first, then
-            # streams live SET/INCR/DEL/LPUSH writes; REPLICAOF NO ONE
+            # (REPLICAOF streams a full sync of all five types and a
+            # HyperLogLog with a surviving TTL, skips a key whose TTL passed first, then
+            # streams live SET/INCR/DEL/LPUSH/PFADD writes; REPLICAOF NO ONE
             # detaches and later writes stop flowing; a replica restart
             # rebuilds the replicated data from its own AOF), and
             # replication offset checks (the primary's master_repl_offset
@@ -1150,3 +1164,20 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       `ZADD`; a real write is all three, and it is listed by
       `COMMAND`. This completes the sorted-set store family
       (`ZUNIONSTORE` / `ZINTERSTORE` / `ZDIFFSTORE`).
+
+- [x] HyperLogLog, first slice (0.55.0): `PFADD` / `PFCOUNT`,
+      as in real Redis. A HyperLogLog is stored as a string value
+      with a 4-byte magic header and 2^14 one-byte registers
+      (MurmurHash64A, fixed seed, so an AOF replay rebuilds exactly
+      the same registers), which is the layout Redis itself uses:
+      `TYPE` would report "string", RDB snapshots carry it as a
+      string, and the replication full sync rebuilds it
+      byte-identically through the string path. `PFADD` returns 1
+      when a register changed and 0 when it did not, preserves the
+      TTL, and a no-op add is not logged, not replicated, and does
+      not invalidate `WATCH`; `PFCOUNT` estimates the cardinality
+      of one key or the union of several (registers merged by
+      maximum), with linear counting for small ranges, and a
+      missing key counts as empty. A plain string key is an error
+      (`WRONGTYPE Key is not a valid HyperLogLog string value.`),
+      as is any non-string key. Not yet shipped: `PFMERGE`.

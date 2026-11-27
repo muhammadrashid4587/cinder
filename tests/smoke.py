@@ -1790,6 +1790,74 @@ def main():
         check("ZDIFFSTORE cleanup", c.cmd("DEL", "dfzset1", "dfzset2", "dfdest", "strdest3", "wtestkey"), 5)
         # Deleted again: the AOF restart below counts exactly 9 keys.
         check("ZMSCORE cleanup", c.cmd("DEL", "mszset"), 1)
+        # HyperLogLog: PFADD / PFCOUNT. A new key takes the elements
+        # and reports 1; re-adding the same elements moves no register
+        # and reports 0; a new element reports 1 again. Small counts
+        # come back exact through linear counting.
+        check("PFADD new", c.cmd("PFADD", "hll", "a", "b", "c"), 1)
+        check("PFCOUNT three", c.cmd("PFCOUNT", "hll"), 3)
+        check("PFADD same", c.cmd("PFADD", "hll", "a", "b", "c"), 0)
+        check("PFADD new element", c.cmd("PFADD", "hll", "d"), 1)
+        check("PFCOUNT four", c.cmd("PFCOUNT", "hll"), 4)
+        check("PFADD dup in one call", c.cmd("PFADD", "hlldup", "a", "a", "a"), 1)
+        check("PFCOUNT dup in one call", c.cmd("PFCOUNT", "hlldup"), 1)
+        check("PFCOUNT missing", c.cmd("PFCOUNT", "ghosthll"), 0)
+        check("PFADD no elements", c.cmd("PFADD", "hll"),
+              ("error", "ERR wrong number of arguments for 'pfadd' command"))
+        check("PFCOUNT no keys", c.cmd("PFCOUNT"),
+              ("error", "ERR wrong number of arguments for 'pfcount' command"))
+        # A plain string is not a HyperLogLog value, and a list is the
+        # usual wrong type; both errors name the problem.
+        check("PFADD plain string", c.cmd("PFADD", "after", "x"),
+              ("error", "ERR WRONGTYPE Key is not a valid HyperLogLog string value."))
+        check("PFCOUNT plain string", c.cmd("PFCOUNT", "after"),
+              ("error", "ERR WRONGTYPE Key is not a valid HyperLogLog string value."))
+        check("PFADD list wrongtype", c.cmd("PFADD", "plist", "x"), wrongtype)
+        check("PFCOUNT list wrongtype", c.cmd("PFCOUNT", "plist"), wrongtype)
+        # PFADD preserves the TTL, as in Redis.
+        check("PFADD TTL setup", c.cmd("EXPIRE", "hll", "100"), 1)
+        check("PFADD TTL add", c.cmd("PFADD", "hll", "e"), 1)
+        check("PFCOUNT five after TTL add", c.cmd("PFCOUNT", "hll"), 5)
+        check("TTL survives PFADD", 99 <= c.cmd("TTL", "hll") <= 100, True)
+        # PFCOUNT over several keys merges the registers, so the
+        # union of two overlapping sets counts each element once.
+        # 1000 distinct elements estimate within 5% (the standard
+        # error at 2^14 registers is under 1%).
+        check("PFADD hll1 thousand",
+              c.cmd("PFADD", "hll1", *["user:%d" % i for i in range(1000)]), 1)
+        check("PFCOUNT hll1 thousand",
+              950 <= c.cmd("PFCOUNT", "hll1") <= 1050, True)
+        check("PFADD hll2 thousand overlap",
+              c.cmd("PFADD", "hll2", *["user:%d" % i for i in range(500, 1500)]), 1)
+        check("PFCOUNT hll2 thousand",
+              950 <= c.cmd("PFCOUNT", "hll2") <= 1050, True)
+        check("PFCOUNT union fifteen hundred",
+              1425 <= c.cmd("PFCOUNT", "hll1", "hll2") <= 1575, True)
+        check("PFCOUNT union with missing", c.cmd("PFCOUNT", "hll1", "ghosthll"),
+              c.cmd("PFCOUNT", "hll1"))
+        check("COMMAND lists PFADD", "PFADD" in c.cmd("COMMAND"), True)
+        check("COMMAND lists PFCOUNT", "PFCOUNT" in c.cmd("COMMAND"), True)
+        # A PFADD that moves no register does not invalidate a WATCH;
+        # one that changes a register does.
+        check("PFADD hllwatch", c.cmd("PFADD", "hllwatch", "a", "b"), 1)
+        check("WATCH hllwatch", c.cmd("WATCH", "hllwatch"), "OK")
+        check("PFADD hllwatch noop", c.cmd("PFADD", "hllwatch", "a", "b"), 0)
+        check("MULTI hllwatch noop", c.cmd("MULTI"), "OK")
+        check("MULTI hllwatch noop SET queued", c.cmd("SET", "wtestkey2", "v1"), "QUEUED")
+        check("EXEC hllwatch noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("wtestkey2 after hllwatch noop EXEC", c.cmd("GET", "wtestkey2"), "v1")
+        check("WATCH hllwatch 2", c.cmd("WATCH", "hllwatch"), "OK")
+        check("PFADD hllwatch change", c.cmd("PFADD", "hllwatch", "c"), 1)
+        check("MULTI hllwatch change", c.cmd("MULTI"), "OK")
+        check("MULTI hllwatch change SET queued", c.cmd("SET", "wtestkey2", "v2"), "QUEUED")
+        check("EXEC hllwatch change watch aborts", c.cmd("EXEC"), None)
+        check("wtestkey2 unchanged after hllwatch abort", c.cmd("GET", "wtestkey2"), "v1")
+        # phll stays: the AOF restart below proves a HyperLogLog
+        # survives a SHUTDOWN and reload. Everything else is cleaned
+        # up so the restart still sees its expected key count.
+        check("PFADD phll", c.cmd("PFADD", "phll", "a", "b", "c"), 1)
+        check("HLL cleanup", c.cmd("DEL", "hll", "hlldup", "hll1", "hll2",
+                                    "hllwatch", "wtestkey2"), 6)
         check("ZREMRANGEBYLEX wrongtype", c.cmd("ZREMRANGEBYLEX", "after", "-", "+"),
               wrongtype)
         check("COMMAND lists ZREMRANGEBYLEX", "ZREMRANGEBYLEX" in c.cmd("COMMAND"), True)
@@ -2120,7 +2188,8 @@ def main():
         check("watch keys cleanup", c.cmd("DEL", "wkey", "wmissing", "wset", "whash"), 4)
         # FLUSHALL invalidates even a watch on a key that never
         # existed; it wipes the dataset, so rebuild the four keys the
-        # AOF restart section below expects (after, plist, pset, phash).
+        # AOF restart section below expects (after, plist, pset, phash),
+        # plus the HyperLogLog phll the restart proves survives.
         check("WATCH wnever", c.cmd("WATCH", "wnever"), "OK")
         check("FLUSHALL watch", c.cmd("FLUSHALL"), "OK")
         check("MULTI flush watch", c.cmd("MULTI"), "OK")
@@ -2138,6 +2207,7 @@ def main():
         check("rebuild pset", c.cmd("SADD", "pset", "x", "y", "z"), 3)
         check("rebuild phash", c.cmd("HSET", "phash", "a", "1", "b", "2"), 2)
         check("rebuild pzset", c.cmd("ZADD", "pzset", "1.5", "x", "2.25", "y", "10", "z"), 3)
+        check("rebuild phll", c.cmd("PFADD", "phll", "a", "b", "c"), 1)
         # A zero-padded string, so the restart proves SETRANGE padding
         # survives an AOF replay byte-for-byte.
         check("rebuild prange", c.cmd("SETRANGE", "prange", "5", "pad"), 8)
@@ -2147,7 +2217,7 @@ def main():
         check("COMMAND lists ZSCORE", "ZSCORE" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZCARD", "ZCARD" in c.cmd("COMMAND"), True)
         # Clean up the transaction keys: the AOF restart below counts
-        # exact keys (9: after, plist, pset, phash, pzset, prange, pfield, punion, pdiff).
+        # exact keys (10: after, plist, pset, phash, pzset, prange, pfield, punion, pdiff, phll).
         # ZINCRBY and ZREM on pzset before the restart, so the AOF
         # replay section below can prove they were logged; the
         # ZREMRANGEBYSCORE removes y (2.25) from pzset the same way.
@@ -2199,6 +2269,7 @@ def main():
         check("AOF replay padded STRLEN", c.cmd("STRLEN", "prange"), 8)
         check("AOF replay padded GETRANGE", c.cmd("GETRANGE", "prange", "0", "4"), "\x00" * 5)
         check("AOF replay bitfield", c.cmd("BITFIELD", "pfield", "GET", "u16", "0"), [16706])
+        check("AOF replay hll", c.cmd("PFCOUNT", "phll"), 3)
         # The replayed PEXPIRE re-arms blinklist's 50 ms TTL from replay
         # time, so it is briefly alive again. The checks above run only
         # a few ms after the restart, so whether the TTL has passed by
@@ -2216,7 +2287,7 @@ def main():
         check("AOF replay expired set gone", c.cmd("SCARD", "blinkset"), 0)
         check("AOF replay expired hash gone", c.cmd("HLEN", "blinkhash"), 0)
         check("AOF replay expired zset gone", c.cmd("ZCARD", "blinkzset"), 0)
-        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 9)
+        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 10)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -2360,6 +2431,7 @@ def main():
         check("rdb SADD", c.cmd("SADD", "snapset", "a", "b"), 2)
         check("rdb HSET", c.cmd("HSET", "snaphash", "f1", "v1", "f2", "v2"), 2)
         check("rdb ZADD", c.cmd("ZADD", "snapzset", "1.5", "a", "2", "b"), 2)
+        check("rdb PFADD", c.cmd("PFADD", "snaphll", "a", "b", "c", "d"), 1)
         check("rdb SET ttl", c.cmd("SET", "snapttl", "v", "EX", "100"), "OK")
         check("rdb SET expiring", c.cmd("SET", "snapgone", "v", "PX", "50"), "OK")
         check("rdb SETRANGE pad", c.cmd("SETRANGE", "snappad", "3", "pad"), 6)
@@ -2388,11 +2460,12 @@ def main():
         check("rdb reload hash", c.cmd("HGETALL", "snaphash"), ["f1", "v1", "f2", "v2"])
         check("rdb reload zset card", c.cmd("ZCARD", "snapzset"), 2)
         check("rdb reload zset score", c.cmd("ZSCORE", "snapzset", "a"), "1.5")
+        check("rdb reload hll", c.cmd("PFCOUNT", "snaphll"), 4)
         check("rdb reload TTL survives", 90000 <= c.cmd("PTTL", "snapttl") <= 100000, True)
         check("rdb reload expired gone", c.cmd("GET", "snapgone"), None)
         check("rdb reload padded GET", c.cmd("GET", "snappad"), "\x00" * 3 + "pad")
         check("rdb reload padded STRLEN", c.cmd("STRLEN", "snappad"), 6)
-        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 7)
+        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 8)
         check("rdb reload SET still works", c.cmd("SET", "afterload", "1"), "OK")
         check("rdb SAVE again", c.cmd("SAVE"), "OK")
         c.cmd("SHUTDOWN")
@@ -2507,7 +2580,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.54.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.55.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -2529,6 +2602,7 @@ def main():
         check("repl SADD", p.cmd("SADD", "repset", "a", "b"), 2)
         check("repl HSET", p.cmd("HSET", "rephash", "f1", "v1", "f2", "v2"), 2)
         check("repl ZADD", p.cmd("ZADD", "repzset", "1.5", "a", "2", "b"), 2)
+        check("repl PFADD", p.cmd("PFADD", "rephll", "a", "b", "c"), 1)
         check("repl SET ttl", p.cmd("SET", "repttl", "v", "EX", "100"), "OK")
         check("repl SET gone soon", p.cmd("SET", "repgone", "v", "PX", "50"), "OK")
         # Bit keys, including values ending in a zero byte, which the
@@ -2560,6 +2634,7 @@ def main():
         check("repl sync hash", r.cmd("HGETALL", "rephash"), ["f1", "v1", "f2", "v2"])
         check("repl sync zset", r.cmd("ZCARD", "repzset"), 2)
         check("repl sync zset score", r.cmd("ZSCORE", "repzset", "a"), "1.5")
+        check("repl sync hll", r.cmd("PFCOUNT", "rephll"), 3)
         check("repl sync TTL survives", 90000 <= r.cmd("PTTL", "repttl") <= 100000, True)
         check("repl sync skips expired key", r.cmd("GET", "repgone"), None)
         check("repl sync bit key trailing NUL", r.cmd("STRLEN", "repbits"), 1)
@@ -2575,6 +2650,7 @@ def main():
         check("repl live DEL", p.cmd("DEL", "repstr"), 1)
         check("repl live LPUSH", p.cmd("LPUSH", "replist", "front"), 4)
         check("repl live ZADD zset2", p.cmd("ZADD", "repz2", "10", "a", "1", "c"), 2)
+        check("repl live PFADD", p.cmd("PFADD", "rephll", "d"), 1)
         check("repl live ZUNIONSTORE", p.cmd("ZUNIONSTORE", "repunion", "2", "repzset", "repz2"), 3)
         check("repl live ZDIFFSTORE", p.cmd("ZDIFFSTORE", "repdiff", "2", "repzset", "repz2"), 1)
         check("repl live ZREMRANGEBYSCORE", p.cmd("ZREMRANGEBYSCORE", "repzset", "1", "2"), 2)
@@ -2593,6 +2669,7 @@ def main():
                 pass
             time.sleep(0.1)
         check("repl streamed writes arrived", streamed, True)
+        check("repl streamed hll", r.cmd("PFCOUNT", "rephll"), 4)
         check("repl streamed zunionstore", r.cmd("ZSCORE", "repunion", "a"), "11.5")
         check("repl streamed zdiffstore", r.cmd("ZSCORE", "repdiff", "b"), "2")
         check("repl streamed list", r.cmd("LRANGE", "replist", "0", "-1"),

@@ -584,4 +584,33 @@ int store_zscan(Store *s, const char *key, unsigned long long cursor,
 typedef int (*zset_foreach_fn)(const char *member, double score, void *arg);
 int zset_foreach(const ZSet *z, zset_foreach_fn fn, void *arg);
 
+/* HyperLogLog (PFADD / PFCOUNT), stored as a string value: a 4-byte
+   magic header followed by 2^14 one-byte registers — the same layout
+   Redis uses, so TYPE reports "string", RDB snapshots carry it as a
+   string, AOF replay re-runs PFADD deterministically, and the
+   replication full sync rebuilds it byte-identically through the
+   string path. A string key that is not a valid HyperLogLog value
+   (wrong length or header) is an error, not a silent overwrite. */
+#define HLL_P 14
+#define HLL_REGISTERS 16384
+#define HLL_MAGIC "HLL1"
+#define HLL_LEN (4 + HLL_REGISTERS)
+/* Add elements to the HyperLogLog at key, creating it when missing.
+   Preserves the key's TTL, as in Redis. Returns 0 on success
+   (*changed_out is 1 when a register changed, 0 when every element
+   hashed into a register that already held at least that value),
+   -1 = key holds a non-string, -2 = out of memory, -3 = key holds a
+   string that is not a valid HyperLogLog value. A call that changes
+   nothing touches neither the version (so WATCH survives it) nor
+   the AOF. */
+int store_pfadd(Store *s, const char *key, const char **elems, int nelems,
+                int *changed_out);
+/* Estimate the cardinality of the union of the HyperLogLogs at
+   keys (element-wise maximum of the registers, then the standard
+   HyperLogLog estimate with linear counting for small ranges).
+   A missing key counts as empty. Returns 0 on success (*out is the
+   estimate), -1 = a key holds a non-string, -2 = out of memory,
+   -3 = a key holds a string that is not a valid HyperLogLog value. */
+int store_pfcount(Store *s, const char **keys, int nkeys, long long *out);
+
 #endif

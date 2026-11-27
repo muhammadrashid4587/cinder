@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.54.0"
+#define CINDER_VERSION "0.55.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1197,6 +1197,39 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         if (n == -1)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         dbuf_int(reply, n);
+        return 0;
+    }
+    if (strcasecmp(cmd, "PFADD") == 0) {
+        if (argc < 3) return dbuf_error(reply, "wrong number of arguments for 'pfadd' command"), 0;
+        int changed = 0;
+        int rc = store_pfadd(g_store, argv[1], (const char **)(argv + 2),
+                             argc - 2, &changed);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == -3)
+            return dbuf_error(reply, "WRONGTYPE Key is not a valid HyperLogLog string value."), 0;
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_int(reply, changed);
+        /* Only a real change is logged and replicated: a PFADD
+           that moves no register changes nothing, like a no-op
+           SADD, so it is not logged, not replicated, and does not
+           invalidate a WATCH. */
+        return changed ? 1 : 0;
+    }
+    if (strcasecmp(cmd, "PFCOUNT") == 0) {
+        if (argc < 2) return dbuf_error(reply, "wrong number of arguments for 'pfcount' command"), 0;
+        long long est = 0;
+        int rc = store_pfcount(g_store, (const char **)(argv + 1),
+                               argc - 1, &est);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == -3)
+            return dbuf_error(reply, "WRONGTYPE Key is not a valid HyperLogLog string value."), 0;
+        dbuf_int(reply, est);
         return 0;
     }
     if (strcasecmp(cmd, "HSET") == 0) {
@@ -2997,6 +3030,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "LINDEX", "LSET", "LINSERT", "LPUSHX", "RPUSHX", "LTRIM",
             "LMOVE",
             "SADD", "SREM", "SMEMBERS", "SSCAN", "SISMEMBER", "SCARD",
+            "PFADD", "PFCOUNT",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",

@@ -1,6 +1,6 @@
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -g -pthread
-LDFLAGS ?=
+LDFLAGS ?= -lm  # HyperLogLog's estimate uses log()
 
 SRC := src/server.c src/store.c src/resp.c src/aof.c src/rdb.c src/threadpool.c
 OBJ := $(SRC:.c=.o)
