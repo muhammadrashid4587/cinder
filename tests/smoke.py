@@ -1999,6 +1999,62 @@ def main():
         check("COMMAND lists GEODIST", "GEODIST" in c.cmd("COMMAND"), True)
         check("COMMAND lists GEOPOS", "GEOPOS" in c.cmd("COMMAND"), True)
         check("COMMAND lists GEOHASH", "GEOHASH" in c.cmd("COMMAND"), True)
+        # GEOSEARCH / GEORADIUS / GEORADIUSBYMEMBER. geos holds
+        # Palermo, Catania and Rome; the centre (15, 37) is about
+        # 56 km from Catania and 190 km from Palermo, and Rome is
+        # far outside 200 km.
+        check("GEOADD geos", c.cmd("GEOADD", "geos", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania", "12.5", "41.9", "Rome"), 3)
+        check("GEOSEARCH byradius ASC", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC"), ["Catania", "Palermo"])
+        check("GEOSEARCH byradius DESC", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "DESC"), ["Palermo", "Catania"])
+        check("GEOSEARCH byradius default order", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), ["Catania", "Palermo"])
+        check("GEOSEARCH byradius 100km", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "100", "km"), ["Catania"])
+        check("GEOSEARCH byradius COUNT 1", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC", "COUNT", "1"), ["Catania"])
+        # COUNT ... ANY takes the first hit in (score, member) order
+        # without sorting: Palermo's geohash score is the smaller one.
+        check("GEOSEARCH byradius COUNT 1 ANY", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "1", "ANY"), ["Palermo"])
+        check("GEOSEARCH withdist", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC", "WITHDIST"), [["Catania", "56.4413"], ["Palermo", "190.4424"]])
+        check("GEOSEARCH withdist withhash withcoord", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC", "WITHDIST", "WITHHASH", "WITHCOORD"),
+              [["Catania", "56.4413", 3479447370796909, ["15.087267458438873", "37.502668423331613"]],
+               ["Palermo", "190.4424", 3479099956230698, ["13.361389338970184", "38.115556395496299"]]])
+        check("GEOSEARCH bybox 400km", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYBOX", "400", "400", "km", "ASC"), ["Catania", "Palermo"])
+        check("GEOSEARCH bybox 120km", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYBOX", "120", "120", "km", "ASC"), ["Catania"])
+        check("GEOSEARCH bybox 100km empty", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYBOX", "100", "100", "km", "ASC"), [])
+        check("GEOSEARCH frommember", c.cmd("GEOSEARCH", "geos", "FROMMEMBER", "Palermo", "BYRADIUS", "200", "km", "ASC", "WITHDIST"), [["Palermo", "0.0000"], ["Catania", "166.2742"]])
+        check("GEOSEARCH frommember missing", c.cmd("GEOSEARCH", "geos", "FROMMEMBER", "Ghost", "BYRADIUS", "200", "km"),
+              ("error", "ERR could not decode requested zset member"))
+        check("GEOSEARCH missing key", c.cmd("GEOSEARCH", "ghostgeo", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), [])
+        check("GEOSEARCH no shape", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37"),
+              ("error", "ERR wrong number of arguments for 'geosearch' command"))
+        check("GEOSEARCH no shape syntax", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "ASC"),
+              ("error", "ERR syntax error"))
+        check("GEOSEARCH bogus option", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "BOGUS"),
+              ("error", "ERR syntax error"))
+        check("GEOSEARCH both froms", c.cmd("GEOSEARCH", "geos", "FROMMEMBER", "Palermo", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"),
+              ("error", "ERR syntax error"))
+        check("GEOSEARCH both sorts", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC", "DESC"),
+              ("error", "ERR syntax error"))
+        check("GEOSEARCH negative radius", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "-5", "km"),
+              ("error", "ERR value is out of range, must be positive"))
+        check("GEOSEARCH bad unit", c.cmd("GEOSEARCH", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "parsecs"),
+              ("error", "ERR unsupported unit provided. please use m, km, ft, mi"))
+        check("GEOSEARCH list wrongtype", c.cmd("GEOSEARCH", "plist", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), wrongtype)
+        check("GEORADIUS", c.cmd("GEORADIUS", "geos", "15", "37", "200", "km", "ASC"), ["Catania", "Palermo"])
+        check("GEORADIUSBYMEMBER", c.cmd("GEORADIUSBYMEMBER", "geos", "Palermo", "200", "km", "ASC"), ["Palermo", "Catania"])
+        check("GEORADIUSBYMEMBER missing", c.cmd("GEORADIUSBYMEMBER", "geos", "Ghost", "200", "km"),
+              ("error", "ERR could not decode requested zset member"))
+        check("GEORADIUS STORE", c.cmd("GEORADIUS", "geos", "15", "37", "200", "km", "STORE", "geodest"), 2)
+        check("GEORADIUS STORE zrange", c.cmd("ZRANGE", "geodest", "0", "-1", "WITHSCORES"), ["Palermo", "3479099956230698", "Catania", "3479447370796909"])
+        check("GEORADIUS STOREDIST", c.cmd("GEORADIUS", "geos", "15", "37", "200", "km", "STOREDIST", "geodist"), 2)
+        check("GEORADIUS STOREDIST zrange", c.cmd("ZRANGE", "geodist", "0", "-1", "WITHSCORES"), ["Catania", "56.441257870156797", "Palermo", "190.44242984775795"])
+        check("GEORADIUS STORE withdist error", c.cmd("GEORADIUS", "geos", "15", "37", "200", "km", "STORE", "geodest", "WITHDIST"),
+              ("error", "ERR STORE option is not compatible with WITHDIST, WITHCOORD and WITHHASH options"))
+        check("GEORADIUS STORE empty", c.cmd("GEORADIUS", "geos", "15", "37", "1", "km", "STORE", "geoempty"), 0)
+        check("GEORADIUS STORE empty creates nothing", c.cmd("EXISTS", "geoempty"), 0)
+        check("GEORADIUS list wrongtype", c.cmd("GEORADIUS", "plist", "15", "37", "200", "km"), wrongtype)
+        check("COMMAND lists GEOSEARCH", "GEOSEARCH" in c.cmd("COMMAND"), True)
+        check("COMMAND lists GEORADIUS", "GEORADIUS" in c.cmd("COMMAND"), True)
+        check("COMMAND lists GEORADIUSBYMEMBER", "GEORADIUSBYMEMBER" in c.cmd("COMMAND"), True)
+        check("GEOSEARCH cleanup", c.cmd("DEL", "geos", "geodest", "geodist"), 3)
         check("GEO cleanup", c.cmd("DEL", "geo", "geo2", "wtestkey4"), 2)
         # phll stays: the AOF restart below proves a HyperLogLog
         # survives a SHUTDOWN and reload — and phll is itself the
@@ -2741,7 +2797,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.58.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.59.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

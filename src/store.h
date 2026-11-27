@@ -2,6 +2,7 @@
 #define CINDER_STORE_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #define ENTRY_STRING 0
 #define ENTRY_LIST 1
@@ -678,5 +679,36 @@ int store_geopos(Store *s, const char *key, const char *member,
    missing or the member's score does not decode, -1 = wrong type. */
 int store_geohash(Store *s, const char *key, const char *member,
                   char out[12]);
+
+/* One GEOSEARCH / GEORADIUS hit: the member name (malloc'd), its
+   distance from the centre in metres, its decoded position (the
+   centre of its geohash cell, as in Redis), and its 52-bit geohash
+   score as an integer. */
+typedef struct {
+    char *member;
+    double dist_m;
+    double lon, lat;
+    uint64_t hash;
+} GeoSearchHit;
+/* Search the geo set at key for the members inside the shape
+   centred at (clon, clat): a circle of radius_m metres when
+   is_box is 0, or a box width_m east-west by height_m north-south
+   (each converted to degrees at the centre's latitude) when
+   is_box is 1. Members whose scores do not decode as geohashes
+   have no position and are skipped, as in Redis. The hits are
+   sorted by distance from the centre — nearest first, or farthest
+   first when sort_desc — with ties broken by member name; when
+   count_any is set the hits instead keep (score, member) order
+   and are not sorted, as with COUNT ... ANY in Redis. count
+   limits the hits returned (-1 for no limit). Returns 0 on
+   success (*hits_out is a malloc'd array of *n_out hits, 0 for a
+   missing key; the caller frees each member and the array),
+   -1 = wrong type, -2 = out of memory. The search is a full scan
+   of the set — Redis prunes by geohash cell, cinder does not —
+   so it costs O(N) in the size of the set. */
+int store_geosearch(Store *s, const char *key, double clon, double clat,
+                    int is_box, double radius_m, double width_m,
+                    double height_m, int sort_desc, long long count,
+                    int count_any, GeoSearchHit **hits_out, size_t *n_out);
 
 #endif

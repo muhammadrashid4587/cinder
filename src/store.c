@@ -3865,3 +3865,129 @@ int store_geohash(Store *s, const char *key, const char *member,
     geo_hash_string(geo_encode_range(lon, lat, -90.0, 90.0), out);
     return 1;
 }
+
+/* ---------- GEOSEARCH / GEORADIUS ----------
+ * The search is a full scan of the set: every member's score is
+ * decoded back to the centre of its geohash cell and tested
+ * against the shape. Redis prunes by geohash cell instead, so
+ * this costs O(N) in the size of the set; the results are the
+ * same, since the test itself is the same haversine distance
+ * (for a circle) or the same degree-box test (for a box). */
+
+struct geo_collect_arg {
+    double clon, clat;
+    int is_box;
+    double radius_m, width_m, height_m;
+    GeoSearchHit *hits;
+    size_t n, cap;
+    int oom;
+};
+
+/* qsort comparators for the collected hits: by distance from the
+   centre, ties broken by member name so the order is deterministic
+   (Redis leaves ties unspecified). */
+static int cmp_geo_hit_asc(const void *a, const void *b) {
+    const GeoSearchHit *x = a, *y = b;
+    if (x->dist_m < y->dist_m) return -1;
+    if (x->dist_m > y->dist_m) return 1;
+    return strcmp(x->member, y->member);
+}
+
+static int cmp_geo_hit_desc(const void *a, const void *b) {
+    const GeoSearchHit *x = a, *y = b;
+    if (x->dist_m > y->dist_m) return -1;
+    if (x->dist_m < y->dist_m) return 1;
+    return strcmp(x->member, y->member);
+}
+
+static int geo_collect_cb(const char *member, double score, void *arg) {
+    struct geo_collect_arg *a = arg;
+    double lon, lat;
+    /* A score that does not decode as a geohash has no position,
+       so the member can never be inside the shape. */
+    if (!geo_decode_score(score, &lon, &lat)) return 0;
+    double dist = geo_distance_m(a->clon, a->clat, lon, lat);
+    int inside;
+    if (a->is_box) {
+        /* The box is width_m east-west by height_m north-south,
+           centred on (clon, clat): a point is inside when its
+           latitude is within height/2 of the centre and its
+           longitude within width/2, each converted to degrees at
+           the centre's latitude (a degree of longitude is
+           cos(latitude) of a degree of latitude). Longitude
+           wraps, so the difference is normalised to [-180, 180]. */
+        double m_per_deg = M_PI * GEO_EARTH_RADIUS / 180.0;
+        double lat_half = (a->height_m / 2.0) / m_per_deg;
+        double lon_half = (a->width_m / 2.0) /
+                          (m_per_deg * cos(a->clat * M_PI / 180.0));
+        double dlat = fabs(lat - a->clat);
+        double dlon = fabs(lon - a->clon);
+        if (dlon > 180.0) dlon = 360.0 - dlon;
+        inside = dlat <= lat_half && dlon <= lon_half;
+    } else {
+        inside = dist <= a->radius_m;
+    }
+    if (!inside) return 0;
+    if (a->n == a->cap) {
+        size_t ncap = a->cap ? a->cap * 2 : 16;
+        GeoSearchHit *grown = realloc(a->hits, ncap * sizeof(*grown));
+        if (!grown) {
+            a->oom = 1;
+            return 1;
+        }
+        a->hits = grown;
+        a->cap = ncap;
+    }
+    char *copy = strdup(member);
+    if (!copy) {
+        a->oom = 1;
+        return 1;
+    }
+    a->hits[a->n].member = copy;
+    a->hits[a->n].dist_m = dist;
+    a->hits[a->n].lon = lon;
+    a->hits[a->n].lat = lat;
+    /* The hash is the stored score as an integer, as in Redis's
+       WITHHASH; the score decoded fine, so it is below 2^64 and
+       the cast is defined. */
+    a->hits[a->n].hash = (uint64_t)score;
+    a->n++;
+    return 0;
+}
+
+int store_geosearch(Store *s, const char *key, double clon, double clat,
+                    int is_box, double radius_m, double width_m,
+                    double height_m, int sort_desc, long long count,
+                    int count_any, GeoSearchHit **hits_out, size_t *n_out) {
+    *hits_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0;
+    if (e->type != ENTRY_ZSET) return -1;
+    e->last_access = ++s->clock;
+    struct geo_collect_arg arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.clon = clon;
+    arg.clat = clat;
+    arg.is_box = is_box;
+    arg.radius_m = radius_m;
+    arg.width_m = width_m;
+    arg.height_m = height_m;
+    zset_foreach(e->zset, geo_collect_cb, &arg);
+    if (arg.oom) {
+        for (size_t i = 0; i < arg.n; i++) free(arg.hits[i].member);
+        free(arg.hits);
+        return -2;
+    }
+    if (!count_any)
+        qsort(arg.hits, arg.n, sizeof(*arg.hits),
+              sort_desc ? cmp_geo_hit_desc : cmp_geo_hit_asc);
+    if (count >= 0 && (unsigned long long)count < (unsigned long long)arg.n) {
+        for (size_t i = (size_t)count; i < arg.n; i++)
+            free(arg.hits[i].member);
+        arg.n = (size_t)count;
+    }
+    *hits_out = arg.hits;
+    *n_out = arg.n;
+    return 0;
+}
