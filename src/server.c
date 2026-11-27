@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.63.0"
+#define CINDER_VERSION "0.64.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1940,6 +1940,62 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         }
         free(hits);
         return 0;
+    }
+    if (strcasecmp(cmd, "XADD") == 0) {
+        /* XADD key [MAXLEN [~] threshold] id field value [field value ...] */
+        if (argc < 5)
+            return dbuf_error(reply, "wrong number of arguments for 'xadd' command"), 0;
+        int i = 2;
+        long long maxlen = -1;
+        if (strcasecmp(argv[i], "MAXLEN") == 0) {
+            if (argc < 6)
+                return dbuf_error(reply, "wrong number of arguments for 'xadd' command"), 0;
+            i++;
+            if (strcmp(argv[i], "~") == 0) {
+                if (argc < 7)
+                    return dbuf_error(reply, "wrong number of arguments for 'xadd' command"), 0;
+                i++;
+            }
+            if (!parse_ll(argv[i], &maxlen) || maxlen < 0)
+                return dbuf_error(reply, "invalid MAXLEN"), 0;
+            i++;
+        }
+        if (argc - i < 3 || ((argc - i) % 2) != 1)
+            return dbuf_error(reply, "wrong number of arguments for 'xadd' command"), 0;
+        char idbuf[48];
+        int rc = store_xadd(g_store, argv[1], argv[i], argv + i + 1,
+                            (argc - i - 1) / 2, maxlen, idbuf);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == -3)
+            return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
+        if (rc == -4)
+            return dbuf_error(reply, "The ID specified in XADD is equal or smaller than the target stream top item"), 0;
+        if (rc == -5)
+            return dbuf_error(reply, "The ID specified in XADD must be greater than 0-0"), 0;
+        /* Rewrite the ID in argv to the resolved one before the
+           caller logs the command: an auto ("*") or partial ID must
+           reach the AOF as the concrete ID it became, as in Redis,
+           or a replay would resolve it again at a later time and the
+           entry would come back with a different ID. The caller
+           frees argv's elements, so the replacement is freed with
+           them; when the strdup fails the original ID stays, and the
+           replay only re-resolves an auto ID. (Replicas still
+           receive the raw bytes, so a replica re-resolves "*" itself;
+           the entry order and contents match, only the ms part of an
+           auto ID can differ there.) */
+        char *resolved = strdup(idbuf);
+        if (resolved) {
+            free(argv[i]);
+            argv[i] = resolved;
+        }
+        if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+        dbuf_bulk(reply, idbuf, strlen(idbuf));
+        /* A real write, so it is logged to the AOF, replicated,
+           and invalidates a WATCH on the key. */
+        return 1;
     }
     if (strcasecmp(cmd, "HSET") == 0) {
         if (argc < 4 || (argc % 2) != 0)
@@ -3924,6 +3980,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HINCRBYFLOAT", "HSCAN",
             "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT",
             "HTTL", "HPTTL", "HPERSIST",
+            "XADD",
             "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZINTER", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",
@@ -4604,6 +4661,34 @@ static int emit_zadd_member(const char *member, double score, void *arg) {
     return 0;
 }
 
+struct xadd_emit_ctx {
+    Dbuf *out;
+    const char *key;
+    char idbuf[48];
+};
+
+/* One stream entry being rebuilt on a replica: a single XADD with
+   the entry's explicit ID, so the replica's stream ends up with the
+   same entries in the same order. */
+static int emit_xadd_entry(uint64_t ms, uint64_t seq, char *const *fields,
+                           char *const *values, size_t nfields, void *arg) {
+    struct xadd_emit_ctx *ctx = arg;
+    snprintf(ctx->idbuf, sizeof(ctx->idbuf), "%llu-%llu",
+             (unsigned long long)ms, (unsigned long long)seq);
+    char **av = malloc((3 + 2 * nfields) * sizeof(char *));
+    if (!av) return 1;
+    av[0] = "XADD";
+    av[1] = (char *)ctx->key;
+    av[2] = ctx->idbuf;
+    for (size_t i = 0; i < nfields; i++) {
+        av[3 + 2 * i] = fields[i];
+        av[4 + 2 * i] = values[i];
+    }
+    emit_resp_cmd(ctx->out, av, 3 + (int)(2 * nfields));
+    free(av);
+    return 0;
+}
+
 static int sync_emit_entry(const Entry *e, void *arg) {
     Dbuf *out = arg;
     long long ttl = e->expire_at > 0 ? e->expire_at - now_ms() : -1;
@@ -4741,6 +4826,11 @@ static int sync_emit_entry(const Entry *e, void *arg) {
         emit_resp_cmd(out, av, 2 + (int)(2 * z->len));
         free(av);
         free(scores);
+    } else if (e->type == ENTRY_STREAM) {
+        Stream *st = e->stream;
+        if (st->len == 0) return 0;
+        struct xadd_emit_ctx emit_ctx = {.out = out, .key = e->key};
+        stream_foreach(st, emit_xadd_entry, &emit_ctx);
     }
     if (ttl > 0) {
         snprintf(ttlbuf, sizeof(ttlbuf), "%lld", ttl);

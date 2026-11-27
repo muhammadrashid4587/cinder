@@ -1125,6 +1125,60 @@ def main():
         check("HGETALL bighash order", c.cmd("HGETALL", "bighash"), big_flat)
         check("HSCAN bighash all", c.cmd("HSCAN", "bighash", "0", "COUNT", "100"),
               ["0", big_flat])
+        # Streams (XADD only): auto, explicit and partial IDs, the
+        # equal-or-smaller and 0-0 errors, wrong-type and wrong-argument
+        # errors, MAXLEN, TTL preservation, and a WATCH invalidated by
+        # a real XADD. There is no read command yet, so the top ID is
+        # probed through the errors a smaller ID produces.
+        check("XADD explicit", c.cmd("XADD", "xstream", "1000-1", "a", "1", "b", "2"), "1000-1")
+        check("XADD partial seq", c.cmd("XADD", "xstream", "1000-*", "a", "2"), "1000-2")
+        check("XADD partial new ms", c.cmd("XADD", "xstream", "2000-*", "a", "3"), "2000-0")
+        auto_id = c.cmd("XADD", "xstream", "*", "a", "4")
+        check("XADD auto id shape",
+              isinstance(auto_id, str) and len(auto_id.split("-")) == 2 and
+              auto_id.split("-")[0].isdigit() and auto_id.split("-")[1].isdigit(),
+              True)
+        check("XADD auto id above 2000", int(auto_id.split("-")[0]) > 2000, True)
+        check("XADD equal id", c.cmd("XADD", "xstream", auto_id, "a", "5"),
+              ("error", "ERR The ID specified in XADD is equal or smaller than the target stream top item"))
+        check("XADD smaller id", c.cmd("XADD", "xstream", "1000-2", "a", "5"),
+              ("error", "ERR The ID specified in XADD is equal or smaller than the target stream top item"))
+        check("XADD zero id", c.cmd("XADD", "xstream2", "0-0", "a", "1"),
+              ("error", "ERR The ID specified in XADD must be greater than 0-0"))
+        check("XADD bad id", c.cmd("XADD", "xstream2", "abc", "a", "1"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XADD bad id no dash", c.cmd("XADD", "xstream2", "1000", "a", "1"),
+              ("error", "ERR Invalid stream ID specified as stream command argument"))
+        check("XADD wrongtype", c.cmd("XADD", "after", "*", "a", "1"), wrongtype)
+        check("XADD no args", c.cmd("XADD", "xstream"),
+              ("error", "ERR wrong number of arguments for 'xadd' command"))
+        check("XADD field without value", c.cmd("XADD", "xstream", "3000-1", "onlyfield"),
+              ("error", "ERR wrong number of arguments for 'xadd' command"))
+        check("XADD MAXLEN", c.cmd("XADD", "xlen", "MAXLEN", "2", "3000-1", "a", "1"), "3000-1")
+        check("XADD MAXLEN 2", c.cmd("XADD", "xlen", "MAXLEN", "2", "3000-2", "a", "2"), "3000-2")
+        check("XADD MAXLEN approx", c.cmd("XADD", "xlen", "MAXLEN", "~", "2", "3000-3", "a", "3"), "3000-3")
+        check("XADD MAXLEN bad", c.cmd("XADD", "xlen", "MAXLEN", "x", "3000-4", "a", "4"),
+              ("error", "ERR invalid MAXLEN"))
+        check("XADD MAXLEN 0 deletes", c.cmd("XADD", "xlen0", "MAXLEN", "0", "100-1", "a", "1"), "100-1")
+        check("XADD MAXLEN 0 gone", c.cmd("EXISTS", "xlen0"), 0)
+        check("XADD MAXLEN 0 re-add", c.cmd("XADD", "xlen0", "100-2", "a", "1"), "100-2")
+        # XADD preserves the key's TTL, as in Redis.
+        check("XADD ttl setup", c.cmd("XADD", "xttl", "100-1", "a", "1"), "100-1")
+        check("EXPIRE xttl", c.cmd("EXPIRE", "xttl", "100"), 1)
+        check("XADD ttl keeps", c.cmd("XADD", "xttl", "100-2", "a", "2"), "100-2")
+        check("TTL after XADD ~", 99 <= c.cmd("TTL", "xttl") <= 100, True)
+        # A real XADD invalidates a WATCH on the key.
+        cx = Client(PORT)
+        check("WATCH xstream", c.cmd("WATCH", "xstream"), "OK")
+        check("other client XADD", cx.cmd("XADD", "xstream", "9999999999999-0", "a", "9"),
+              "9999999999999-0")
+        check("MULTI xadd watch", c.cmd("MULTI"), "OK")
+        check("MULTI xadd SET queued", c.cmd("SET", "xwatchkey", "v1"), "QUEUED")
+        check("EXEC xadd watch aborts", c.cmd("EXEC"), None)
+        check("xwatchkey unchanged after abort", c.cmd("GET", "xwatchkey"), None)
+        cx.close()
+        check("COMMAND lists XADD", "XADD" in c.cmd("COMMAND"), True)
+        check("XADD cleanup", c.cmd("DEL", "xstream", "xstream2", "xlen", "xlen0", "xttl", "xwatchkey"), 4)
         # Sorted sets: add/update, scores, wrong type, TTL, AOF
         # persistence. Members are ordered by (score, member); range
         # commands are not implemented yet.
@@ -2647,6 +2701,10 @@ def main():
         # pgeo stays too: the AOF restart below proves a geo set
         # replays from the AOF with its geohash scores intact.
         check("rebuild pgeo", c.cmd("GEOADD", "pgeo", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"), 2)
+        # pstream stays too: the AOF restart below proves a stream
+        # replays from the AOF with its entries (and top ID) intact.
+        check("rebuild pstream", c.cmd("XADD", "pstream", "1000-1", "f1", "v1", "f2", "v2"), "1000-1")
+        check("rebuild pstream 2", c.cmd("XADD", "pstream", "1000-2", "f1", "v1"), "1000-2")
         # A zero-padded string, so the restart proves SETRANGE padding
         # survives an AOF replay byte-for-byte.
         check("rebuild prange", c.cmd("SETRANGE", "prange", "5", "pad"), 8)
@@ -2656,7 +2714,7 @@ def main():
         check("COMMAND lists ZSCORE", "ZSCORE" in c.cmd("COMMAND"), True)
         check("COMMAND lists ZCARD", "ZCARD" in c.cmd("COMMAND"), True)
         # Clean up the transaction keys: the AOF restart below counts
-        # exact keys (11: after, plist, pset, phash, pzset, prange, pfield, punion, pdiff, phll, pgeo).
+        # exact keys (12: after, plist, pset, phash, pzset, prange, pfield, punion, pdiff, phll, pgeo, pstream).
         # ZINCRBY and ZREM on pzset before the restart, so the AOF
         # replay section below can prove they were logged; the
         # ZREMRANGEBYSCORE removes y (2.25) from pzset the same way.
@@ -2711,6 +2769,12 @@ def main():
         check("AOF replay hll", c.cmd("PFCOUNT", "phll"), 3)
         check("AOF replay geo dist", c.cmd("GEODIST", "pgeo", "Palermo", "Catania"), "166274.1516")
         check("AOF replay geo card", c.cmd("ZCARD", "pgeo"), 2)
+        # The stream's entries survived the replay: an ID at or below
+        # the top still errors, and a higher one appends.
+        check("AOF replay stream top", c.cmd("XADD", "pstream", "1000-2", "f1", "v1"),
+              ("error", "ERR The ID specified in XADD is equal or smaller than the target stream top item"))
+        check("AOF replay stream append", c.cmd("XADD", "pstream", "1000-3", "f1", "v1"), "1000-3")
+        check("AOF replay stream wrongtype", c.cmd("HSET", "pstream", "a", "1"), wrongtype)
         # The replayed PEXPIRE re-arms blinklist's 50 ms TTL from replay
         # time, so it is briefly alive again. The checks above run only
         # a few ms after the restart, so whether the TTL has passed by
@@ -2728,7 +2792,7 @@ def main():
         check("AOF replay expired set gone", c.cmd("SCARD", "blinkset"), 0)
         check("AOF replay expired hash gone", c.cmd("HLEN", "blinkhash"), 0)
         check("AOF replay expired zset gone", c.cmd("ZCARD", "blinkzset"), 0)
-        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 11)
+        check("AOF replay DBSIZE", c.cmd("DBSIZE"), 12)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -2877,6 +2941,9 @@ def main():
         check("rdb SET expiring", c.cmd("SET", "snapgone", "v", "PX", "50"), "OK")
         check("rdb SETRANGE pad", c.cmd("SETRANGE", "snappad", "3", "pad"), 6)
         check("rdb HSET fexp", c.cmd("HSET", "snapfexp", "f1", "v1", "f2", "v2", "f3", "v3"), 3)
+        check("rdb XADD snapstream", c.cmd("XADD", "snapstream", "1000-1", "f1", "v1", "f2", "v2"), "1000-1")
+        check("rdb XADD snapstream 2", c.cmd("XADD", "snapstream", "1000-2", "f1", "v1"), "1000-2")
+        check("rdb SET snapstream ttl", c.cmd("EXPIRE", "snapstream", "100"), 1)
         check("rdb HPEXPIRE fexp gone", c.cmd("HPEXPIRE", "snapfexp", "50", "FIELDS", "1", "f2"), [1])
         check("rdb HEXPIREAT fexp", c.cmd("HEXPIREAT", "snapfexp", str(int(time.time()) + 3600), "FIELDS", "1", "f3"), [1])
         time.sleep(0.1)
@@ -2884,7 +2951,7 @@ def main():
         with open(os.path.join(rdb_dir, "dump.rdb"), "rb") as f:
             snap = f.read()
         check("rdb file magic", snap[:6], b"CINDER")
-        check("rdb file has keys", b"snapstr" in snap and b"snaphash" in snap and b"snapzset" in snap, True)
+        check("rdb file has keys", b"snapstr" in snap and b"snaphash" in snap and b"snapzset" in snap and b"snapstream" in snap, True)
         check("rdb file skips expired key", b"snapgone" not in snap, True)
         c.cmd("SHUTDOWN")
         c.close()
@@ -2907,11 +2974,19 @@ def main():
         check("rdb reload zset card", c.cmd("ZCARD", "snapzset"), 2)
         check("rdb reload zset score", c.cmd("ZSCORE", "snapzset", "a"), "1.5")
         check("rdb reload hll", c.cmd("PFCOUNT", "snaphll"), 4)
+        # The stream's entries and its TTL survived the snapshot: an
+        # ID at or below the top still errors, a higher one appends,
+        # and the TTL is still armed.
+        check("rdb reload stream top", c.cmd("XADD", "snapstream", "1000-2", "f1", "v1"),
+              ("error", "ERR The ID specified in XADD is equal or smaller than the target stream top item"))
+        check("rdb reload stream append", c.cmd("XADD", "snapstream", "1000-3", "f1", "v1"), "1000-3")
+        check("rdb reload stream TTL", 90000 <= c.cmd("PTTL", "snapstream") <= 100000, True)
+        check("rdb reload stream wrongtype", c.cmd("HSET", "snapstream", "a", "1"), wrongtype)
         check("rdb reload TTL survives", 90000 <= c.cmd("PTTL", "snapttl") <= 100000, True)
         check("rdb reload expired gone", c.cmd("GET", "snapgone"), None)
         check("rdb reload padded GET", c.cmd("GET", "snappad"), "\x00" * 3 + "pad")
         check("rdb reload padded STRLEN", c.cmd("STRLEN", "snappad"), 6)
-        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 9)
+        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 10)
         check("rdb reload SET still works", c.cmd("SET", "afterload", "1"), "OK")
         check("rdb SAVE again", c.cmd("SAVE"), "OK")
         c.cmd("SHUTDOWN")
@@ -3026,7 +3101,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.63.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.64.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -3054,6 +3129,8 @@ def main():
         check("repl HSET fexp", p.cmd("HSET", "repfieldttl", "keep", "k", "gone", "g", "timed", "t"), 3)
         check("repl HPEXPIREAT fexp", p.cmd("HPEXPIREAT", "repfieldttl", str(int(time.time() * 1000) + 3600000), "FIELDS", "1", "timed"), [1])
         check("repl HPEXPIRE fexp short", p.cmd("HPEXPIRE", "repfieldttl", "50", "FIELDS", "1", "gone"), [1])
+        check("repl XADD repstream", p.cmd("XADD", "repstream", "1000-1", "f1", "v1", "f2", "v2"), "1000-1")
+        check("repl XADD repstream 2", p.cmd("XADD", "repstream", "1000-2", "f1", "v1"), "1000-2")
         # Bit keys, including values ending in a zero byte, which the
         # full sync rebuilds with a trailing SETBIT.
         check("repl SETBIT trailing NUL", p.cmd("SETBIT", "repbits", "7", "0"), 0)
@@ -3094,10 +3171,16 @@ def main():
         check("repl sync bit key mixed len", r.cmd("STRLEN", "repbits2"), 2)
         check("repl sync bit key mixed bit", r.cmd("GETBIT", "repbits2", "7"), 1)
         check("repl sync bit key mixed count", r.cmd("BITCOUNT", "repbits2"), 1)
+        # The stream's entries rode the full sync: an ID at or below
+        # the top still errors on the replica.
+        check("repl sync stream top", r.cmd("XADD", "repstream", "1000-2", "f1", "v1"),
+              ("error", "ERR The ID specified in XADD is equal or smaller than the target stream top item"))
+        check("repl sync stream wrongtype", r.cmd("HSET", "repstream", "a", "1"), wrongtype)
         check("repl INFO replica role", "role:replica" in r.cmd("INFO"), True)
         check("repl INFO replicas", "connected_replicas:1" in p.cmd("INFO"), True)
         # Live writes stream after the sync.
         check("repl live SET", p.cmd("SET", "newkey", "live"), "OK")
+        check("repl live XADD", p.cmd("XADD", "repstream", "1000-3", "f3", "v3"), "1000-3")
         check("repl live INCR", p.cmd("INCR", "repcounter"), 1)
         check("repl live DEL", p.cmd("DEL", "repstr"), 1)
         check("repl live LPUSH", p.cmd("LPUSH", "replist", "front"), 4)
@@ -3123,6 +3206,9 @@ def main():
             time.sleep(0.1)
         check("repl streamed writes arrived", streamed, True)
         check("repl streamed hll", r.cmd("PFCOUNT", "rephll"), 4)
+        # The live XADD streamed too: the replica's top moved to 1000-3.
+        check("repl streamed XADD top", r.cmd("XADD", "repstream", "1000-3", "f3", "v3"),
+              ("error", "ERR The ID specified in XADD is equal or smaller than the target stream top item"))
         check("repl streamed zunionstore", r.cmd("ZSCORE", "repunion", "a"), "11.5")
         check("repl streamed zdiffstore", r.cmd("ZSCORE", "repdiff", "b"), "2")
         check("repl streamed list", r.cmd("LRANGE", "replist", "0", "-1"),

@@ -36,6 +36,7 @@ static int entry_expired(const Entry *e) {
    store_find, which sits above the definitions of both. */
 static void entry_touch(Store *s, Entry *e);
 static int entry_purge_expired_fields(Store *s, Entry *e, Entry **pp);
+static void stream_free(Stream *st);
 
 Store *store_new(void) {
     Store *s = calloc(1, sizeof(Store));
@@ -656,6 +657,7 @@ static void entry_free(Entry *e) {
     else if (e->type == ENTRY_SET) set_free(e->set);
     else if (e->type == ENTRY_HASH) hash_free(e->hash);
     else if (e->type == ENTRY_ZSET) zset_free(e->zset);
+    else if (e->type == ENTRY_STREAM) stream_free(e->stream);
     else free(e->value);
     free(e);
 }
@@ -1095,6 +1097,10 @@ int store_set_len(Store *s, const char *key, const char *value, size_t vlen,
         } else if (e->type == ENTRY_ZSET) {
             zset_free(e->zset);
             e->zset = NULL;
+            e->type = ENTRY_STRING;
+        } else if (e->type == ENTRY_STREAM) {
+            stream_free(e->stream);
+            e->stream = NULL;
             e->type = ENTRY_STRING;
         }
         free(e->value);
@@ -2058,6 +2064,7 @@ int store_type(Store *s, const char *key) {
     if (e->type == ENTRY_SET) return 3;
     if (e->type == ENTRY_HASH) return 4;
     if (e->type == ENTRY_ZSET) return 5;
+    if (e->type == ENTRY_STREAM) return 6;
     return 1;
 }
 
@@ -4141,5 +4148,201 @@ int store_geosearch(Store *s, const char *key, double clon, double clat,
     }
     *hits_out = arg.hits;
     *n_out = arg.n;
+    return 0;
+}
+
+/* ---------- streams ---------- */
+
+static void stream_entry_free(StreamEntry *en) {
+    for (size_t i = 0; i < en->nfields; i++) {
+        free(en->fields[i]);
+        free(en->values[i]);
+    }
+    free(en->fields);
+    free(en->values);
+    memset(en, 0, sizeof(*en));
+}
+
+static void stream_free(Stream *st) {
+    if (!st) return;
+    for (size_t i = 0; i < st->len; i++) stream_entry_free(&st->entries[i]);
+    free(st->entries);
+    free(st);
+}
+
+static Stream *stream_new(void) {
+    return calloc(1, sizeof(Stream));
+}
+
+/* Strict unsigned parse: digits only, no sign, no overflow. */
+static int stream_parse_u64(const char *s, size_t n, uint64_t *out) {
+    if (n == 0) return 0;
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return 0;
+        if (v > (UINT64_MAX - (uint64_t)(s[i] - '0')) / 10) return 0;
+        v = v * 10 + (uint64_t)(s[i] - '0');
+    }
+    *out = v;
+    return 1;
+}
+
+/* Resolve the ID argument against the stream's top ID. "*" is fully
+   automatic; "ms-seq" is explicit; "ms-*" or "ms-" is partial (the
+   ms is given, the sequence is automatic). On success *ms_out and
+   *seq_out hold the new ID. Returns 0 on success, -3 = not a valid
+   stream ID, -4 = the ID is equal to or smaller than the top ID,
+   -5 = the ID is 0-0. */
+static int stream_resolve_id(const char *id, const Stream *st,
+                             uint64_t *ms_out, uint64_t *seq_out) {
+    uint64_t last_ms = st ? st->last_ms : 0;
+    uint64_t last_seq = st ? st->last_seq : 0;
+    int have_top = st && st->len > 0;
+    if (strcmp(id, "*") == 0) {
+        uint64_t ms = (uint64_t)now_ms();
+        if (have_top && ms <= last_ms) {
+            *ms_out = last_ms;
+            *seq_out = last_seq + 1;
+        } else {
+            *ms_out = ms;
+            *seq_out = 0;
+        }
+        return 0;
+    }
+    const char *dash = strchr(id, '-');
+    if (!dash) return -3;
+    size_t ms_len = (size_t)(dash - id);
+    const char *seq_s = dash + 1;
+    size_t seq_len = strlen(seq_s);
+    uint64_t ms;
+    if (!stream_parse_u64(id, ms_len, &ms)) return -3;
+    if (seq_len == 0 || strcmp(seq_s, "*") == 0) {
+        /* Partial ID: the sequence is automatic for this ms. */
+        if (have_top && ms < last_ms) return -4;
+        if (have_top && ms == last_ms) {
+            *ms_out = ms;
+            *seq_out = last_seq + 1;
+        } else {
+            *ms_out = ms;
+            *seq_out = 0;
+        }
+        return 0;
+    }
+    uint64_t seq;
+    if (!stream_parse_u64(seq_s, seq_len, &seq)) return -3;
+    if (ms == 0 && seq == 0) return -5;
+    if (have_top && (ms < last_ms || (ms == last_ms && seq <= last_seq)))
+        return -4;
+    *ms_out = ms;
+    *seq_out = seq;
+    return 0;
+}
+
+int store_xadd(Store *s, const char *key, const char *id,
+               char *const *pairs, int nfields, long long maxlen,
+               char *id_out) {
+    Entry *e = store_find(s, key, NULL);
+    if (e && e->type != ENTRY_STREAM) return -1;
+    Stream *st = e ? e->stream : NULL;
+    uint64_t ms, seq;
+    int rc = stream_resolve_id(id, st, &ms, &seq);
+    if (rc != 0) return rc;
+    /* Build the entry first, so an OOM leaves the stream untouched. */
+    StreamEntry en;
+    memset(&en, 0, sizeof(en));
+    en.ms = ms;
+    en.seq = seq;
+    en.cap = (size_t)nfields > 0 ? (size_t)nfields : 1;
+    en.fields = malloc(en.cap * sizeof(char *));
+    en.values = malloc(en.cap * sizeof(char *));
+    if (!en.fields || !en.values) {
+        free(en.fields);
+        free(en.values);
+        return -2;
+    }
+    for (int i = 0; i < nfields; i++) {
+        en.fields[i] = strdup(pairs[2 * i]);
+        en.values[i] = strdup(pairs[2 * i + 1]);
+        if (!en.fields[i] || !en.values[i]) {
+            for (int j = 0; j <= i; j++) {
+                free(en.fields[j]);
+                free(en.values[j]);
+            }
+            free(en.fields);
+            free(en.values);
+            return -2;
+        }
+        en.nfields++;
+    }
+    if (!e) {
+        if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+            store_resize(s);
+        e = calloc(1, sizeof(Entry));
+        if (!e) {
+            stream_entry_free(&en);
+            return -2;
+        }
+        e->key = strdup(key);
+        e->stream = stream_new();
+        if (!e->key || !e->stream) {
+            entry_free(e);
+            stream_entry_free(&en);
+            return -2;
+        }
+        e->type = ENTRY_STREAM;
+        e->expire_at = -1;
+        e->last_access = ++s->clock;
+        e->version = ++s->mod_seq;
+        size_t idx = hash_key(key) % s->cap;
+        e->next = s->buckets[idx];
+        s->buckets[idx] = e;
+        s->count++;
+        st = e->stream;
+    }
+    if (st->len == st->cap) {
+        size_t ncap = st->cap ? st->cap * 2 : 8;
+        StreamEntry *nen = realloc(st->entries, ncap * sizeof(*nen));
+        if (!nen) {
+            stream_entry_free(&en);
+            return -2;
+        }
+        st->entries = nen;
+        st->cap = ncap;
+    }
+    st->entries[st->len++] = en;
+    st->last_ms = ms;
+    st->last_seq = seq;
+    /* MAXLEN trims from the front (the oldest entries go first). A
+       trim that empties the stream deletes the key, as in Redis, so
+       a snapshot or a full sync never has to carry an empty stream. */
+    if (maxlen >= 0) {
+        while ((long long)st->len > maxlen) {
+            stream_entry_free(&st->entries[0]);
+            memmove(&st->entries[0], &st->entries[1],
+                    (st->len - 1) * sizeof(*st->entries));
+            st->len--;
+        }
+        if (st->len == 0) {
+            snprintf(id_out, 48, "%llu-%llu",
+                     (unsigned long long)ms, (unsigned long long)seq);
+            store_del(s, key);
+            return 0;
+        }
+    }
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    snprintf(id_out, 48, "%llu-%llu",
+             (unsigned long long)ms, (unsigned long long)seq);
+    return 0;
+}
+
+int stream_foreach(const Stream *st, stream_foreach_fn fn, void *arg) {
+    if (!st) return -1;
+    for (size_t i = 0; i < st->len; i++) {
+        const StreamEntry *en = &st->entries[i];
+        int rc = fn(en->ms, en->seq, en->fields, en->values, en->nfields,
+                    arg);
+        if (rc != 0) return rc;
+    }
     return 0;
 }

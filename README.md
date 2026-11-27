@@ -2,9 +2,10 @@
 
 A Redis-compatible in-memory key-value store, written in C from scratch.
 Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, lists,
-sets, hashes, sorted sets, HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`) and geo
+sets, hashes, sorted sets, HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`), geo
 (`GEOADD`/`GEODIST`/`GEOPOS`/`GEOHASH`/`GEOSEARCH`/`GEOSEARCHSTORE`/`GEORADIUS`/
-`GEORADIUSBYMEMBER`/`GEORADIUS_RO`/`GEORADIUSBYMEMBER_RO`) with TTLs, approximate LRU eviction, and an append-only file for
+`GEORADIUSBYMEMBER`/`GEORADIUS_RO`/`GEORADIUSBYMEMBER_RO`) and streams
+(`XADD` only, for now) with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
 flush thread that does the once-a-second AOF sync under `everysec`,
@@ -12,7 +13,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.63.0.
+Version 0.64.0.
 
 ## Why
 
@@ -121,6 +122,7 @@ OK
 | `HEXPIREAT key seconds [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]`, `HPEXPIREAT key ms [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]` | The same per-field expiry, as an absolute Unix time (seconds / milliseconds); an absolute time already past deletes the field at once and answers `2` per field, with the same per-field replies and conditions as `HEXPIRE` |
 | `HTTL key FIELDS numfields field [field ...]`, `HPTTL key FIELDS numfields field [field ...]` | Remaining TTL of one or more hash fields, in seconds / milliseconds; one integer reply per field: `-1` the field has no expiry, `-2` the key or the field does not exist |
 | `HPERSIST key FIELDS numfields field [field ...]` | Remove the expiry from one or more hash fields; one integer reply per field: `1` an expiry was removed, `-1` the field had none, `-2` the key or the field does not exist |
+| `XADD key [MAXLEN [~] threshold] id field value [field value ...]` | Append one entry to a stream, creating it when missing; the ID is `*` (auto: the current ms, sequence 0, or one past the top ID when the ms is not ahead of it), `ms-seq` (explicit), or `ms-*` / `ms-` (partial: the ms given, the sequence auto-filled); answers the new ID as a bulk string. An ID equal to or smaller than the top ID is an error, as is `0-0` and a malformed ID; `MAXLEN` trims the oldest entries until at most `threshold` remain (`~` trims exactly the same way), and trimming the last entry deletes the key. Preserves the TTL, invalidates a `WATCH`, and is AOF-logged with the resolved ID (so a replay reproduces the exact entries) and replicated; a replica re-resolves `*` itself, so the entry order and contents match there but the ms part of an auto ID can differ. There is no read command yet (`XREAD` / `XRANGE` / `XLEN` are next), so the top ID is only observable through the errors a smaller ID produces |
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZMSCORE key member [member ...]` | Scores of several members at once, in order (`nil` for a missing member, an array of `nil`s when the key is missing) |
@@ -172,7 +174,10 @@ src/
              member, plus a member-to-node hash table for O(1)
              lookup), and HyperLogLogs (a string value with a
              4-byte magic header and 2^14 one-byte registers,
-             as in Redis — see `store_pfadd`)
+             as in Redis — see `store_pfadd`), and streams
+             (append-only entry arrays in ID order, each entry an
+             ID plus field/value pairs, with the top ID cached so
+             the next auto ID needs no scan)
   resp.c     RESP parser (array + inline commands) and encoders
   aof.c      append-only log: every mutation is a RESP array, replayed on start;
              fsync policy `always` or `everysec`; under `everysec` a
@@ -196,11 +201,13 @@ src/
              `aof_deferred_replies`
   rdb.c      RDB-style snapshots: `SAVE` writes the whole dataset (all
              types, TTLs as absolute expiries, hash field TTLs as one
-             absolute expiry per field) to `dump.rdb` in a compact
+             absolute expiry per field, streams as one record per
+             entry with its explicit ID) to `dump.rdb` in a compact
              binary format, atomically via `dump.rdb.tmp` + rename; the
              snapshot is loaded on startup before the AOF is replayed;
-             format version 2, which a version 1 snapshot still loads
-             from (its hash fields just come back without a TTL);
+             format version 3, which version 1 and 2 snapshots still
+             load from (a version 1 snapshot's hash fields just come
+             back without a TTL);
              `rdb_serialize` renders the same bytes to memory so a
              worker thread can write them for `BGSAVE`
   threadpool.c FIFO job queue with N worker threads (`--threads`); jobs
@@ -223,7 +230,7 @@ src/
   second, and always syncs on a clean shutdown or `SAVE`. On startup the file is replayed through the
   same dispatcher live clients use, so the log is the dataset. `SAVE`
   additionally writes a snapshot of the whole dataset to `dump.rdb`
-  (strings, lists, sets, hashes and sorted sets, with TTLs stored as absolute
+  (strings, lists, sets, hashes, sorted sets and streams, with TTLs stored as absolute
   expiries; keys whose TTL already passed are left out), atomically via
   `dump.rdb.tmp`, `fsync`, and rename, so a crash mid-save never leaves
   a torn snapshot. On startup the snapshot is loaded first and the AOF
@@ -260,7 +267,8 @@ src/
 - **Replication**: a replica connects with `REPLICAOF host port` (non-blocking
   connect, `PSYNC` sent when it completes) and the primary streams a full
   sync — `FLUSHALL` plus one rebuild command per key (`SET` with `PX` for
-  TTL'd strings, `RPUSH`/`SADD`/`HSET` for the other types, `PEXPIRE` after
+  TTL'd strings, `RPUSH`/`SADD`/`HSET` for the other types, one `XADD`
+  with an explicit ID per stream entry, `PEXPIRE` after
   the rebuild; keys whose TTL already passed are left out, and a hash
   rebuild carries only its live fields, each with an absolute
   `HPEXPIREAT` when it has a field TTL) — followed by
@@ -524,11 +532,11 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # reports the policy, the AOF holds the record before any
             # sync, data survives a SIGKILL + restart, unknown policy
             # is a startup error), and RDB snapshot checks (SAVE writes
-            # dump.rdb with all five types and a HyperLogLog, a key whose TTL passed
+            # dump.rdb with all six types and a HyperLogLog, a key whose TTL passed
             # before the save is left out, and a restart with the AOF
             # deleted restores every key from the snapshot alone, with
             # a surviving TTL preserved), and replication checks
-            # (REPLICAOF streams a full sync of all five types and a
+            # (REPLICAOF streams a full sync of all six types and a
             # HyperLogLog with a surviving TTL, skips a key whose TTL passed first, then
             # streams live SET/INCR/DEL/LPUSH/PFADD writes; REPLICAOF NO ONE
             # detaches and later writes stop flowing; a replica restart
@@ -555,7 +563,7 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # check (64 clients SET/GET at once, exercising the epoll
             # loop with dozens of ready fds in one epoll_wait batch), and
             # background-save checks (`BGSAVE` with `--threads 2` writes
-            # `dump.rdb` with all five types, skips a key whose TTL passed,
+            # `dump.rdb` with all six types, skips a key whose TTL passed,
             # reports `threads:2` and `last_bgsave_status:ok` in `INFO`, a
             # second `BGSAVE` completes after the first, and a restart
             # with the AOF deleted restores every key from the background
@@ -656,7 +664,16 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # source and destination are the same key, a bad
             # direction error, and wrong-type errors on either
             # key leaving the source untouched; `COMMAND` listing
-            # all four)
+            # all four), and stream checks (`XADD` with explicit,
+            # partial and auto IDs, the equal-or-smaller, `0-0`
+            # and malformed-ID errors, wrong-type and
+            # wrong-argument errors, `MAXLEN` exact and `~`
+            # forms including `MAXLEN 0` deleting the key, the
+            # TTL surviving an `XADD`, a real `XADD` invalidating
+            # a `WATCH`, `COMMAND` listing it, and an AOF restart,
+            # an RDB snapshot and a replication full sync each
+            # carrying a stream's entries and top ID, plus a live
+            # streamed `XADD` landing on the replica)
 ```
 
 ## Roadmap
@@ -1456,3 +1473,17 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       fields just come back without a TTL), and streamed in the
       replication full sync as absolute `HPEXPIREAT`s. All seven
       are listed by `COMMAND`.
+
+- [x] Streams, `XADD` only (0.64.0): append-only streams with
+      `ms-seq` IDs — auto (`*`), explicit (`ms-seq`) and partial
+      (`ms-*` / `ms-`) — plus `MAXLEN [~] threshold`, which trims
+      the oldest entries (and deletes the key when the trim empties
+      it). `XADD` preserves the key's TTL, invalidates a `WATCH`,
+      and is AOF-logged with the resolved ID, carried in RDB
+      snapshots (format version 3; versions 1 and 2 still load)
+      and in the replication full sync as one explicit-ID `XADD`
+      per entry, with live `XADD`s streamed after the sync. A
+      replica re-resolves `*` from the raw bytes it receives, so
+      the entry order and contents match but the ms part of an auto
+      ID can differ there. There is no read command yet: `XREAD` /
+      `XRANGE` / `XLEN` are next.

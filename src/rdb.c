@@ -9,7 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define RDB_VERSION 2
+#define RDB_VERSION 3
 #define RDB_MAGIC "CINDER"
 #define RDB_MAGIC_LEN 6
 #define RDB_END 0xFF
@@ -89,6 +89,27 @@ static int save_zset_member(const char *member, double score, void *arg) {
     return 0;
 }
 
+/* One stream entry being written to the snapshot: its ID as a
+   "ms-seq" string, then the field count and the pairs. */
+static int save_stream_entry(uint64_t ms, uint64_t seq, char *const *fields,
+                             char *const *values, size_t nfields, void *arg) {
+    SaveCtx *ctx = arg;
+    char idbuf[48];
+    snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+             (unsigned long long)ms, (unsigned long long)seq);
+    if (w_str(ctx->f, idbuf) < 0 || w_u32(ctx->f, (uint32_t)nfields) < 0) {
+        ctx->err = 1;
+        return 1;
+    }
+    for (size_t i = 0; i < nfields; i++) {
+        if (w_str(ctx->f, fields[i]) < 0 || w_str(ctx->f, values[i]) < 0) {
+            ctx->err = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int save_entry(const Entry *e, void *arg) {
     SaveCtx *ctx = arg;
     if (ctx->err) return 1;
@@ -147,6 +168,10 @@ static int save_entry(const Entry *e, void *arg) {
         ZSet *z = e->zset;
         if (w_u32(f, (uint32_t)z->len) < 0) { ctx->err = 1; return 1; }
         if (zset_foreach(z, save_zset_member, ctx) != 0) return 1;
+    } else if (e->type == ENTRY_STREAM) {
+        Stream *st = e->stream;
+        if (w_u32(f, (uint32_t)st->len) < 0) { ctx->err = 1; return 1; }
+        if (stream_foreach(st, save_stream_entry, ctx) != 0) return 1;
     }
     return 0;
 }
@@ -342,8 +367,10 @@ long long rdb_load(Store *s, const char *path) {
     r.off = RDB_MAGIC_LEN;
     uint32_t version;
     /* Version 1 snapshots (no per-field expiry) still load: their
-       hash fields simply come back without a TTL. */
-    if (r_u32(&r, &version) < 0 || (version != 1 && version != 2)) {
+       hash fields simply come back without a TTL. Version 2 adds
+       per-field expiries; version 3 adds streams. */
+    if (r_u32(&r, &version) < 0 ||
+        (version != 1 && version != 2 && version != 3)) {
         free(data);
         errno = EINVAL;
         return -1;
@@ -352,7 +379,7 @@ long long rdb_load(Store *s, const char *path) {
         unsigned char type;
         if (r_u8(&r, &type) < 0) goto malformed;
         if (type == RDB_END) break;
-        if (type > ENTRY_ZSET) goto malformed;
+        if (type > ENTRY_STREAM) goto malformed;
         int64_t expire_at;
         char *key = NULL;
         if (r_i64(&r, &expire_at) < 0) goto malformed;
@@ -379,6 +406,52 @@ long long rdb_load(Store *s, const char *path) {
                 free(el);
             }
             if (!expired && expire_at != -1) store_expire(s, key, expire_at);
+        } else if (type == ENTRY_STREAM) {
+            uint32_t n;
+            if (r_u32(&r, &n) < 0) { free(key); goto malformed; }
+            for (uint32_t i = 0; i < n; i++) {
+                char *id = NULL;
+                if (r_str(&r, &id) < 0) { free(key); goto malformed; }
+                uint32_t nf;
+                if (r_u32(&r, &nf) < 0) {
+                    free(id);
+                    free(key);
+                    goto malformed;
+                }
+                /* calloc, so a short read leaves the rest NULL and
+                   the cleanup below stays safe. */
+                char **pairs = calloc(2 * (size_t)nf + 1, sizeof(char *));
+                if (!pairs) {
+                    free(id);
+                    free(key);
+                    goto malformed;
+                }
+                int bad = 0;
+                for (uint32_t j = 0; j < nf; j++) {
+                    if (r_str(&r, &pairs[2 * j]) < 0 ||
+                        r_str(&r, &pairs[2 * j + 1]) < 0) {
+                        bad = 1;
+                        break;
+                    }
+                }
+                if (!bad && !expired) {
+                    /* The IDs in the snapshot are strictly
+                       increasing, so this cannot fail on a file the
+                       writer produced. */
+                    char idbuf[48];
+                    if (store_xadd(s, key, id, pairs, (int)nf, -1,
+                                   idbuf) != 0)
+                        bad = 1;
+                }
+                for (uint32_t j = 0; j < nf; j++) {
+                    free(pairs[2 * j]);
+                    free(pairs[2 * j + 1]);
+                }
+                free(pairs);
+                free(id);
+                if (bad) { free(key); goto malformed; }
+            }
+            if (!expired && expire_at != -1) store_expire(s, key, expire_at);
         } else { /* ENTRY_HASH or ENTRY_ZSET */
             uint32_t n;
             if (r_u32(&r, &n) < 0) { free(key); goto malformed; }
@@ -390,10 +463,10 @@ long long rdb_load(Store *s, const char *path) {
                     free(key);
                     goto malformed;
                 }
-                /* Version 2 hash records carry one absolute field
-                   expiry per pair, after the value. */
+                /* Version 2 and later hash records carry one
+                   absolute field expiry per pair, after the value. */
                 int64_t field_expire = -1;
-                if (type == ENTRY_HASH && version == 2) {
+                if (type == ENTRY_HASH && version >= 2) {
                     if (r_i64(&r, &field_expire) < 0) {
                         free(field);
                         free(val);

@@ -9,6 +9,7 @@
 #define ENTRY_SET 2
 #define ENTRY_HASH 3
 #define ENTRY_ZSET 4
+#define ENTRY_STREAM 5
 
 /* A list value: circular buffer of malloc'd strings, so push/pop at
    either end is O(1) amortised. */
@@ -66,6 +67,27 @@ typedef struct ZSet {
     size_t len;
 } ZSet;
 
+/* One entry of a stream: its ID (ms, seq) plus its field/value
+   pairs, in the order they were given to XADD. */
+typedef struct StreamEntry {
+    uint64_t ms, seq;
+    char **fields;
+    char **values;
+    size_t nfields;
+    size_t cap;
+} StreamEntry;
+
+/* A stream value: entries in insertion (ID) order, plus the top ID
+   (last_ms, last_seq), so the next auto or partial ID is derived
+   without scanning. New entries append at the end; MAXLEN trims
+   from the front. */
+typedef struct Stream {
+    StreamEntry *entries;
+    size_t len;
+    size_t cap;
+    uint64_t last_ms, last_seq;
+} Stream;
+
 typedef struct Entry {
     char *key;
     int type; /* ENTRY_STRING, ENTRY_LIST, ENTRY_SET or ENTRY_HASH */
@@ -80,6 +102,7 @@ typedef struct Entry {
     Set *set; /* set values (type == ENTRY_SET) */
     Hash *hash; /* hash values (type == ENTRY_HASH) */
     ZSet *zset; /* sorted-set values (type == ENTRY_ZSET) */
+    Stream *stream; /* stream values (type == ENTRY_STREAM) */
     long long expire_at; /* ms since epoch, -1 = no expiry */
     unsigned long long last_access; /* logical clock, for approximate LRU */
     unsigned long long version; /* bumped on every real change to this
@@ -280,7 +303,8 @@ unsigned long long store_scan(Store *s, unsigned long long cursor,
 typedef int (*store_foreach_fn)(const Entry *e, void *arg);
 int store_foreach(Store *s, store_foreach_fn fn, void *arg);
 
-/* 0 = no such key, 1 = string, 2 = list, 3 = set, 4 = hash, 5 = zset. */
+/* 0 = no such key, 1 = string, 2 = list, 3 = set, 4 = hash, 5 = zset,
+   6 = stream. */
 int store_type(Store *s, const char *key);
 
 /* Push one element. Returns the new length, -1 = key holds a string,
@@ -751,5 +775,37 @@ int store_geosearch(Store *s, const char *key, double clon, double clat,
                     int is_box, double radius_m, double width_m,
                     double height_m, int sort_desc, long long count,
                     int count_any, GeoSearchHit **hits_out, size_t *n_out);
+
+/* Streams (XADD only for now): a stream is an append-only log of
+   entries, each with an ID "ms-seq" (milliseconds since epoch, then
+   a sequence number within that millisecond) and field/value pairs.
+   The ID argument is "*" (auto: the current ms, sequence 0, or one
+   past the top ID when the ms is not ahead of it), "ms-seq"
+   (explicit), or "ms-*" / "ms-" (partial: the ms given, the sequence
+   auto-filled as for "*"). Appending always changes the key, so it
+   always bumps the version (a WATCH on the key is invalidated) and
+   preserves the key's TTL, as in Redis. When maxlen >= 0, entries
+   are trimmed from the front until at most maxlen remain (the
+   MAXLEN option; "~" is accepted by the caller and trims exactly
+   the same way). Returns 0 on success (*id_out holds the new ID as
+   a "ms-seq" string, at least 48 bytes of room), -1 = the key holds
+   a non-stream value, -2 = out of memory, -3 = the ID is not a
+   valid stream ID, -4 = the ID is equal to or smaller than the top
+   ID, -5 = the ID is 0-0. */
+int store_xadd(Store *s, const char *key, const char *id,
+               char *const *pairs, int nfields, long long maxlen,
+               char *id_out);
+/* Visit every entry of a stream in ID order. Returns 0 on success,
+   -1 = wrong type (or no such key, which the caller can treat the
+   same way: no entries are visited). The callback receives each
+   entry's ID parts and its field/value pairs; returning non-zero
+   stops the iteration and that value is returned. The pairs are
+   owned by the stream and must not be freed or kept past the call.
+   Used by the snapshot writer and the replication emitter, which
+   only need the stream in order. */
+typedef int (*stream_foreach_fn)(uint64_t ms, uint64_t seq,
+                                 char *const *fields, char *const *values,
+                                 size_t nfields, void *arg);
+int stream_foreach(const Stream *st, stream_foreach_fn fn, void *arg);
 
 #endif
