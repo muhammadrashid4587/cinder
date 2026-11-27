@@ -902,6 +902,16 @@ int store_xgroup_destroy(Store *s, const char *key, const char *group);
 long long store_xgroup_delconsumer(Store *s, const char *key,
                                    const char *group,
                                    const char *consumer);
+/* XGROUP CREATECONSUMER: create a consumer on a group, so it
+   exists before it ever reads — as in real Redis, a consumer
+   otherwise comes into being only when it first reads. Returns
+   1 when the consumer was created, 0 when it already existed,
+   -1 = the key holds a non-stream value, -2 = out of memory,
+   -3 = no such key or consumer group. Creating a consumer bumps
+   the version (a WATCH on the key is invalidated); creating one
+   that already exists changes nothing. */
+int store_xgroup_createconsumer(Store *s, const char *key,
+                                const char *group, const char *consumer);
 /* XREADGROUP: deliver entries of one stream to a consumer of a
    group. When new_only is set, the entries after the group's
    cursor, which are added to the PEL (delivery count 1, stamped

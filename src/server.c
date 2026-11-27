@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.74.0"
+#define CINDER_VERSION "0.75.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2593,7 +2593,11 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            pending entries it held (as in real Redis they become
            unclaimable, so claim or acknowledge them first), and
            answers how many pending entries the consumer had, or
-           0 when there was no such consumer. Other subcommands are
+           0 when there was no such consumer. XGROUP CREATECONSUMER
+           key group consumer creates a consumer on a group before
+           it ever reads (a consumer otherwise comes into being
+           only when it first reads) and answers 1, or 0 when the
+           consumer already existed. Other subcommands are
            an error, and SETID's ENTRIESREAD option is not
            supported yet. A real write, so it is logged to the AOF
            and replicated, which is also how a group survives a
@@ -2683,6 +2687,21 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             }
             dbuf_putf(reply, ":%lld\r\n", rc);
             return 1; /* a consumer was deleted, even with no pending entries */
+        }
+        if (strcasecmp(argv[1], "CREATECONSUMER") == 0) {
+            if (argc != 5)
+                return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
+            int rc = store_xgroup_createconsumer(g_store, argv[2], argv[3], argv[4]);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == -2)
+                return dbuf_error(reply, "out of memory"), 0;
+            if (rc == -3) {
+                dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", argv[2], argv[3]);
+                return 0;
+            }
+            dbuf_putf(reply, ":%d\r\n", rc);
+            return rc; /* 1 when a consumer was created, 0 when it already existed */
         }
         return dbuf_error(reply, "Unknown subcommand or wrong number of arguments for 'xgroup'"), 0;
     }

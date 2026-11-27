@@ -14,7 +14,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.74.0.
+Version 0.75.0.
 
 ## Why
 
@@ -132,6 +132,7 @@ OK
 | `XGROUP SETID key group id` | Move an existing consumer group's last-delivered ID to `id`: `$` (the stream's top ID) or an explicit `ms-seq`, so the next `>` read delivers the entries after it — entries already delivered are delivered again. The group's pending list is untouched, so entries already delivered stay pending for their consumers. A missing key or group is a `NOGROUP` error. A real write, so it is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and RDB snapshots; setting the ID the group already holds changes nothing, so it is not logged and does not invalidate a `WATCH`. Limitation: the `ENTRIESREAD` option is not supported yet (cinder does not track a per-group entries-read counter) |
 | `XGROUP DESTROY key group` | Drop a whole consumer group — its cursor, its consumers, and its pending list — and answer `1`, or `0` when there was no such group. The stream and its entries survive, and the group name can be created again. A missing key is a `NOGROUP` error. A real destroy is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and RDB snapshots (the snapshot simply carries no group); destroying a group that does not exist changes nothing, so it is not logged and does not invalidate a `WATCH` |
 | `XGROUP DELCONSUMER key group consumer` | Drop one consumer from a group and, with it, the pending entries it held — as in real Redis those entries become unclaimable, so claim or acknowledge them first — and answer how many pending entries the consumer had (`0` when it had none, or when there was no such consumer). The group, its cursor, the other consumers and their pending entries survive, and the stream is untouched. A missing key or group is a `NOGROUP` error. A real delete is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and RDB snapshots (the snapshot carries the group's consumer list and pending list); deleting a consumer that does not exist changes nothing, so it is not logged and does not invalidate a `WATCH` |
+| `XGROUP CREATECONSUMER key group consumer` | Create a consumer on a group before it ever reads — as in real Redis a consumer otherwise comes into being only when it first reads — and answer `1`, or `0` when the consumer already existed. The consumer holds no pending entries until a `>` read delivers some to it. A missing key or group is a `NOGROUP` error. A real create is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and RDB snapshots (the snapshot carries the group's consumer list); creating a consumer that already exists changes nothing, so it is not logged and does not invalidate a `WATCH` |
 | `XREADGROUP GROUP group consumer [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]` | Read a stream as a consumer of a group, one `[key, [[id, [field, value, ...]], ...]]` element per stream that has any, as in `XREAD`. `>` delivers the entries after the group's cursor, records them in the group's pending list (PEL) with a delivery count and time, and advances the cursor; an explicit ID returns the group's pending entries for this consumer after that ID, without changing delivery state. `$` is not valid here. `COUNT` limits the entries per stream; `BLOCK` waits for new entries instead of answering at once — an empty array when there is nothing and no `BLOCK`, a nil array when a `BLOCK` times out, `BLOCK 0` waits forever (a blocked client parks with no lock held, as with `XREAD`'s `BLOCK`, and a disconnect while parked drops the request; `BLOCK` is refused inside `MULTI`/`EXEC`). A `>` read that delivers entries is AOF-logged and replicated like a write (an AOF replay re-delivers, so delivery counts go up by one per replay, and a replayed `BLOCK` read answers at once); a read that delivers nothing, or a pending-only read, is not logged. A missing key or group is a `NOGROUP` error |
 | `XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME ms-unix-time] [RETRYCOUNT count] [FORCE] [JUSTID]` | Take over pending entries of a group for another consumer, usually because the consumer that held them died: an entry is claimed when it has been idle at least `min-idle-time` since its last delivery, or when `FORCE` is given (which also claims entries that are in the stream but not pending at all, creating a PEL entry for them). A claimed entry is moved to this consumer, its delivery time is set to now (or to `IDLE` ms ago, or to the absolute `TIME` given — `IDLE` and `TIME` cannot be combined) and its delivery count is bumped (or set by `RETRYCOUNT`); `JUSTID` answers only the IDs. A repeated ID in one call is claimed once. A real claim is AOF-logged and replicated like a write (an AOF replay re-claims, so delivery counts go up by one per replay). IDs that are not in the stream (trimmed, or never added), are not idle enough, or are not pending (without `FORCE`) are left out of the reply, where Redis answers nil for them. A missing key or group is a `NOGROUP` error |
 | `XACK key group id [id ...]` | Drop entries from a group's pending list, answering how many were dropped (`0` for an ID that was not pending). A missing key or group is a `NOGROUP` error. A real change, so it is AOF-logged and replicated when it drops anything |
@@ -1654,7 +1655,8 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       cinder does not track a per-group entries-read counter, so
       `XGROUP SETID` with extra arguments is a wrong-number-of-
       arguments error. The remaining `XGROUP` subcommands
-      (`DELCONSUMER`, `CREATECONSUMER`) do not exist yet.
+      (`DELCONSUMER`, `CREATECONSUMER`) arrived in 0.74.0 and
+      0.75.0.
 - [x] `XGROUP DESTROY` for consumer groups (0.73.0): `XGROUP
       DESTROY key group` drops a whole consumer group — its
       cursor, its consumers, and its pending list — and answers
@@ -1666,8 +1668,8 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       through the AOF and through RDB snapshots (a destroyed group
       is simply absent from the snapshot); destroying a group
       that does not exist changes nothing, so it is not logged
-      and does not invalidate a `WATCH`. The remaining `XGROUP`
-      subcommand (`CREATECONSUMER`) does not exist yet.
+      and does not invalidate a `WATCH`. The last `XGROUP`
+      subcommand (`CREATECONSUMER`) arrived in 0.75.0.
 - [x] `XGROUP DELCONSUMER` for consumer groups (0.74.0):
       `XGROUP DELCONSUMER key group consumer` drops one consumer
       from a group and, with it, the pending entries it held, and
@@ -1685,5 +1687,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       carries the group's consumer list and pending list);
       deleting a consumer that does not exist changes nothing, so
       it is not logged and does not invalidate a `WATCH`. The
-      remaining `XGROUP` subcommand (`CREATECONSUMER`) does not
-      exist yet.
+      last `XGROUP` subcommand (`CREATECONSUMER`) arrived in
+      0.75.0.
+- [x] `XGROUP CREATECONSUMER` for consumer groups (0.75.0):
+      `XGROUP CREATECONSUMER key group consumer` creates a
+      consumer on a group before it ever reads — as in real
+      Redis a consumer otherwise comes into being only when it
+      first reads — and answers `1`, or `0` when the consumer
+      already existed. The consumer holds no pending entries
+      until a `>` read delivers some to it. A missing key or
+      group is a `NOGROUP` error. A real create is AOF-logged
+      and replicated and invalidates a `WATCH`, and survives a
+      restart through the AOF and through RDB snapshots (the
+      snapshot carries the group's consumer list); creating a
+      consumer that already exists changes nothing, so it is
+      not logged and does not invalidate a `WATCH`. With it,
+      every `XGROUP` subcommand in real Redis is implemented.

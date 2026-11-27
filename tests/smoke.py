@@ -1572,6 +1572,54 @@ def main():
         check("xdcwatchkey unchanged after abort", c.cmd("GET", "xdcwatchkey"), "v1")
         cs.close()
         check("XGROUP DELCONSUMER cleanup", c.cmd("DEL", "xgdc"), 1)
+        # XGROUP CREATECONSUMER: create a consumer on a group
+        # before it ever reads — as in real Redis a consumer
+        # otherwise comes into being only when it first reads —
+        # and answer 1, or 0 when the consumer already existed.
+        # The pre-created consumer reads normally afterwards.
+        check("XGROUP CREATECONSUMER setup 1", c.cmd("XADD", "xgcc", "1000-1", "a", "1"), "1000-1")
+        check("XGROUP CREATECONSUMER setup 2", c.cmd("XADD", "xgcc", "1000-2", "a", "2"), "1000-2")
+        check("XGROUP CREATECONSUMER create",
+              c.cmd("XGROUP", "CREATE", "xgcc", "gcc", "0"), "OK")
+        check("XGROUP CREATECONSUMER c1", c.cmd("XGROUP", "CREATECONSUMER", "xgcc", "gcc", "c1"), 1)
+        check("XGROUP CREATECONSUMER c1 again", c.cmd("XGROUP", "CREATECONSUMER", "xgcc", "gcc", "c1"), 0)
+        check("XGROUP CREATECONSUMER c2", c.cmd("XGROUP", "CREATECONSUMER", "xgcc", "gcc", "c2"), 1)
+        check("XGROUP CREATECONSUMER read c1",
+              c.cmd("XREADGROUP", "GROUP", "gcc", "c1", "STREAMS", "xgcc", ">"),
+              [["xgcc", [["1000-1", ["a", "1"]], ["1000-2", ["a", "2"]]]]])
+        # c2 was created but never read, so it holds nothing
+        # pending and does not appear in the summary.
+        check("XGROUP CREATECONSUMER pending",
+              c.cmd("XPENDING", "xgcc", "gcc"),
+              [2, "1000-1", "1000-2", [["c1", 2]]])
+        check("XGROUP CREATECONSUMER missing key",
+              c.cmd("XGROUP", "CREATECONSUMER", "nope", "gcc", "c1"),
+              ("error", "ERR NOGROUP No such key 'nope' or consumer group 'gcc'"))
+        check("XGROUP CREATECONSUMER missing group",
+              c.cmd("XGROUP", "CREATECONSUMER", "xgcc", "nogrp", "c1"),
+              ("error", "ERR NOGROUP No such key 'xgcc' or consumer group 'nogrp'"))
+        check("XGROUP CREATECONSUMER wrongtype",
+              c.cmd("XGROUP", "CREATECONSUMER", "after", "gcc", "c1"), wrongtype)
+        check("XGROUP CREATECONSUMER wrong args",
+              c.cmd("XGROUP", "CREATECONSUMER", "xgcc", "gcc"),
+              ("error", "ERR wrong number of arguments for 'xgroup' command"))
+        # A real CREATECONSUMER invalidates a WATCH on the key;
+        # creating a consumer that already exists does not.
+        cs = Client(PORT)
+        check("WATCH xgcc noop", c.cmd("WATCH", "xgcc"), "OK")
+        check("other client CREATECONSUMER dup", cs.cmd("XGROUP", "CREATECONSUMER", "xgcc", "gcc", "c1"), 0)
+        check("MULTI createconsumer noop watch", c.cmd("MULTI"), "OK")
+        check("MULTI createconsumer noop SET queued", c.cmd("SET", "xccwatchkey", "v1"), "QUEUED")
+        check("EXEC createconsumer noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("xccwatchkey after noop", c.cmd("GET", "xccwatchkey"), "v1")
+        check("WATCH xgcc", c.cmd("WATCH", "xgcc"), "OK")
+        check("other client CREATECONSUMER", cs.cmd("XGROUP", "CREATECONSUMER", "xgcc", "gcc", "cnew"), 1)
+        check("MULTI createconsumer watch", c.cmd("MULTI"), "OK")
+        check("MULTI createconsumer SET queued", c.cmd("SET", "xccwatchkey", "v2"), "QUEUED")
+        check("EXEC createconsumer watch aborts", c.cmd("EXEC"), None)
+        check("xccwatchkey unchanged after abort", c.cmd("GET", "xccwatchkey"), "v1")
+        cs.close()
+        check("XGROUP CREATECONSUMER cleanup", c.cmd("DEL", "xgcc", "xccwatchkey"), 2)
         check("XGROUP bad mkstream", c.cmd("XGROUP", "CREATE", "xg", "g3", "0", "FOO"),
               ("error", "ERR syntax error"))
         check("XREADGROUP new",
@@ -3802,7 +3850,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.74.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.75.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

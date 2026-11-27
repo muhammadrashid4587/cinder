@@ -4818,6 +4818,26 @@ long long store_xgroup_delconsumer(Store *s, const char *key,
     return removed;
 }
 
+/* XGROUP CREATECONSUMER: create a consumer on a group, so it
+   exists before it ever reads — as in real Redis, a consumer
+   otherwise comes into being only when it first reads. The
+   consumer holds no pending entries until a `>` read delivers
+   some to it. */
+int store_xgroup_createconsumer(Store *s, const char *key,
+                                const char *group, const char *consumer) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    StreamGroup *g = stream_group_find(e->stream, group);
+    if (!g) return -3;
+    for (size_t i = 0; i < g->nconsumers; i++)
+        if (strcmp(g->consumers[i], consumer) == 0) return 0;
+    if (stream_group_add_consumer(g, consumer) != 0) return -2;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return 1;
+}
+
 int store_xgroup_restore(Store *s, const char *key, const char *group,
                          uint64_t last_ms, uint64_t last_seq,
                          char *const *consumers, size_t nconsumers,
