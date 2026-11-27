@@ -880,6 +880,14 @@ int store_xgroup_create(Store *s, const char *key, const char *group,
    non-stream value, -3 = no such key or consumer group. */
 int store_xgroup_setid(Store *s, const char *key, const char *group,
                        uint64_t ms, uint64_t seq);
+/* XGROUP DESTROY: drop a whole consumer group — its cursor, its
+   consumers and its pending list — from a stream. The stream and
+   its entries survive. Returns 1 when a group was destroyed, 0
+   when there was no such group, -1 = the key holds a non-stream
+   value, -3 = no such key. A real destroy bumps the version (a
+   WATCH on the key is invalidated); destroying a group that does
+   not exist changes nothing. */
+int store_xgroup_destroy(Store *s, const char *key, const char *group);
 /* XREADGROUP: deliver entries of one stream to a consumer of a
    group. When new_only is set, the entries after the group's
    cursor, which are added to the PEL (delivery count 1, stamped

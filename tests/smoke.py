@@ -1442,6 +1442,60 @@ def main():
         check("EXEC setid noop watch runs", c.cmd("EXEC"), ["OK"])
         check("xswatchkey after noop", c.cmd("GET", "xswatchkey"), "v1")
         cs.close()
+        # XGROUP DESTROY: drop a whole consumer group — cursor,
+        # consumers and pending list — and answer 1, or 0 when
+        # there was no such group; the stream and its entries
+        # survive, and the name can be created again. A fresh
+        # stream, so the xg state below is undisturbed.
+        check("XGROUP DESTROY setup 1", c.cmd("XADD", "xgd", "1000-1", "a", "1"), "1000-1")
+        check("XGROUP DESTROY setup 2", c.cmd("XADD", "xgd", "1000-2", "a", "2"), "1000-2")
+        check("XGROUP DESTROY create",
+              c.cmd("XGROUP", "CREATE", "xgd", "gd", "0"), "OK")
+        check("XGROUP DESTROY drain",
+              c.cmd("XREADGROUP", "GROUP", "gd", "c1", "STREAMS", "xgd", ">"),
+              [["xgd", [["1000-1", ["a", "1"]], ["1000-2", ["a", "2"]]]]])
+        check("XGROUP DESTROY pending before",
+              c.cmd("XPENDING", "xgd", "gd"),
+              [2, "1000-1", "1000-2", [["c1", 2]]])
+        check("XGROUP DESTROY", c.cmd("XGROUP", "DESTROY", "xgd", "gd"), 1)
+        check("XGROUP DESTROY stream survives", c.cmd("XLEN", "xgd"), 2)
+        check("XGROUP DESTROY group gone",
+              c.cmd("XREADGROUP", "GROUP", "gd", "c1", "STREAMS", "xgd", ">"),
+              ("error", "ERR NOGROUP No such key 'xgd' or consumer group 'gd'"))
+        check("XGROUP DESTROY again", c.cmd("XGROUP", "DESTROY", "xgd", "gd"), 0)
+        check("XGROUP DESTROY recreate",
+              c.cmd("XGROUP", "CREATE", "xgd", "gd", "0"), "OK")
+        check("XGROUP DESTROY recreate empty pending",
+              c.cmd("XPENDING", "xgd", "gd"),
+              [0, None, None, []])
+        check("XGROUP DESTROY missing key",
+              c.cmd("XGROUP", "DESTROY", "nope", "gd"),
+              ("error", "ERR NOGROUP No such key 'nope' or consumer group 'gd'"))
+        check("XGROUP DESTROY wrongtype",
+              c.cmd("XGROUP", "DESTROY", "after", "gd"), wrongtype)
+        check("XGROUP DESTROY wrong args",
+              c.cmd("XGROUP", "DESTROY", "xgd"),
+              ("error", "ERR wrong number of arguments for 'xgroup' command"))
+        # A real DESTROY invalidates a WATCH on the key;
+        # destroying a group that does not exist does not.
+        check("XGROUP DESTROY destroy", c.cmd("XGROUP", "DESTROY", "xgd", "gd"), 1)
+        cs = Client(PORT)
+        check("WATCH xgd noop", c.cmd("WATCH", "xgd"), "OK")
+        check("other client DESTROY missing", cs.cmd("XGROUP", "DESTROY", "xgd", "gd"), 0)
+        check("MULTI destroy noop watch", c.cmd("MULTI"), "OK")
+        check("MULTI destroy noop SET queued", c.cmd("SET", "xdwatchkey", "v1"), "QUEUED")
+        check("EXEC destroy noop watch runs", c.cmd("EXEC"), ["OK"])
+        check("xdwatchkey after noop", c.cmd("GET", "xdwatchkey"), "v1")
+        check("XGROUP DESTROY recreate 2",
+              c.cmd("XGROUP", "CREATE", "xgd", "gd", "0"), "OK")
+        check("WATCH xgd", c.cmd("WATCH", "xgd"), "OK")
+        check("other client DESTROY", cs.cmd("XGROUP", "DESTROY", "xgd", "gd"), 1)
+        check("MULTI destroy watch", c.cmd("MULTI"), "OK")
+        check("MULTI destroy SET queued", c.cmd("SET", "xdwatchkey", "v2"), "QUEUED")
+        check("EXEC destroy watch aborts", c.cmd("EXEC"), None)
+        check("xdwatchkey unchanged after abort", c.cmd("GET", "xdwatchkey"), "v1")
+        cs.close()
+        check("XGROUP DESTROY cleanup", c.cmd("DEL", "xgd"), 1)
         check("XGROUP bad mkstream", c.cmd("XGROUP", "CREATE", "xg", "g3", "0", "FOO"),
               ("error", "ERR syntax error"))
         check("XREADGROUP new",
@@ -3672,7 +3726,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.72.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.73.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

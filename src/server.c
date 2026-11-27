@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.72.0"
+#define CINDER_VERSION "0.73.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2585,13 +2585,18 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            group id moves an existing group's last-delivered ID
            ("$" for the top ID, or an explicit ms-seq), so the
            next ">" read delivers what comes after it; the pending
-           list is untouched. Other subcommands are an error, and
-           SETID's ENTRIESREAD option is not supported yet. A
-           real write, so it is logged to the AOF and replicated,
-           which is also how a group survives a restart (groups
-           ride in RDB snapshots since 0.71.0, as well as in the
-           AOF). A SETID to the ID the group already holds changes
-           nothing, so it is not logged. */
+           list is untouched. XGROUP DESTROY key group drops a
+           whole group — cursor, consumers and pending list — and
+           answers 1, or 0 when there was no such group; the
+           stream and its entries survive. Other subcommands are
+           an error, and SETID's ENTRIESREAD option is not
+           supported yet. A real write, so it is logged to the AOF
+           and replicated, which is also how a group survives a
+           restart (groups ride in RDB snapshots since 0.71.0, as
+           well as in the AOF). A SETID to the ID the group
+           already holds changes nothing, so it is not logged,
+           and neither is a DESTROY of a group that does not
+           exist. */
         if (argc < 2)
             return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
         if (strcasecmp(argv[1], "CREATE") == 0) {
@@ -2641,6 +2646,19 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             }
             dbuf_simple(reply, "OK");
             return rc; /* 1 when the cursor moved, 0 when it was already there */
+        }
+        if (strcasecmp(argv[1], "DESTROY") == 0) {
+            if (argc != 4)
+                return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
+            int rc = store_xgroup_destroy(g_store, argv[2], argv[3]);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == -3) {
+                dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", argv[2], argv[3]);
+                return 0;
+            }
+            dbuf_putf(reply, ":%d\r\n", rc);
+            return rc; /* 1 when a group was destroyed, 0 when there was none */
         }
         return dbuf_error(reply, "Unknown subcommand or wrong number of arguments for 'xgroup'"), 0;
     }

@@ -4747,6 +4747,34 @@ int store_xgroup_setid(Store *s, const char *key, const char *group,
     return 1;
 }
 
+/* XGROUP DESTROY: drop a whole consumer group — its cursor, its
+   consumers and its pending list — from a stream. The stream and
+   its entries survive. A real destroy bumps the version (a WATCH
+   on the key is invalidated) and the caller logs it; destroying a
+   group that does not exist changes nothing, so it bumps no
+   version and is not logged. Returns 1 when a group was destroyed,
+   0 when there was no such group, -1 = the key holds a non-stream
+   value, -3 = no such key. */
+int store_xgroup_destroy(Store *s, const char *key, const char *group) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    Stream *st = e->stream;
+    size_t idx = st->ngroups;
+    for (size_t i = 0; i < st->ngroups; i++)
+        if (strcmp(st->groups[i].name, group) == 0) { idx = i; break; }
+    if (idx == st->ngroups) return 0;
+    stream_group_free(&st->groups[idx]);
+    /* Compact the array: the freed slot is now zeroed, so shift
+       the tail down over it. */
+    memmove(&st->groups[idx], &st->groups[idx + 1],
+            (st->ngroups - idx - 1) * sizeof(*st->groups));
+    st->ngroups--;
+    e->last_access = ++s->clock;
+    entry_touch(s, e);
+    return 1;
+}
+
 int store_xgroup_restore(Store *s, const char *key, const char *group,
                          uint64_t last_ms, uint64_t last_seq,
                          char *const *consumers, size_t nconsumers,
