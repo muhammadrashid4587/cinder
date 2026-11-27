@@ -3,7 +3,7 @@
 A Redis-compatible in-memory key-value store, written in C from scratch.
 Single-threaded, `epoll`-based event loop for commands, RESP protocol, strings, lists,
 sets, hashes, sorted sets, HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`) and geo
-(`GEOADD`/`GEODIST`/`GEOPOS`/`GEOHASH`/`GEOSEARCH`/`GEORADIUS`/
+(`GEOADD`/`GEODIST`/`GEOPOS`/`GEOHASH`/`GEOSEARCH`/`GEOSEARCHSTORE`/`GEORADIUS`/
 `GEORADIUSBYMEMBER`) with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
@@ -12,7 +12,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.59.0.
+Version 0.60.0.
 
 ## Why
 
@@ -99,6 +99,7 @@ OK
 | `GEOPOS key member [member ...]` | The position of each member as a `[longitude, latitude]` array, each coordinate a bulk string with `%.17g` precision (the centres of their geohash cells, as in Redis); a missing member — or one whose score does not decode as a geohash (NaN, negative, 2^64 or more, or exactly 0) — answers a null array, and a missing key answers one null array per member; a member of a plain sorted set decodes whatever score it holds, as in Redis |
 | `GEOHASH key member [member ...]` | The 11-character base32 geohash string of each member's position (`sqc8b49rny0` for Palermo, `sqdtr74hyu0` for Catania, as in real Redis); the score is decoded to the centre of its geohash cell and re-encoded over the standard ranges (longitude [-180, 180], latitude [-90, 90]), because the stored hash uses latitude [-85.05112878, 85.05112878] instead, and the last character is always `0` (52 bits cannot fill the 55 an 11-character string holds); `nil` for a missing member or one whose score does not decode, and a missing key answers one `nil` per member |
 | `GEOSEARCH key <FROMMEMBER member \| FROMLONLAT longitude latitude> <BYRADIUS radius <m \| km \| ft \| mi> \| BYBOX width height <m \| km \| ft \| mi>> [ASC \| DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]` | The members inside the circle or the box around the centre (the box is `width` east-west by `height` north-south, each converted to degrees at the centre's latitude); distances are haversine over the decoded cell centres, as in Redis, and the search is a full scan of the set — Redis prunes by geohash cell, cinder does not, so it costs O(N) in the size of the set. `ASC` / `DESC` sort by distance (nearest-first is also the default when neither is given; Redis leaves the order unspecified without them), `COUNT` limits the hits (without `ANY` it sorts first, with `ANY` it takes the first N in (score, member) order), `WITHDIST` adds the distance in the shape's unit as a `%.4f` bulk string, `WITHHASH` adds the 52-bit geohash score as an integer, `WITHCOORD` adds the `[longitude, latitude]` cell centre, in that order after the member; a missing key answers an empty array, a missing `FROMMEMBER` member is an error (`could not decode requested zset member`), and members whose scores do not decode as geohashes are skipped |
+| `GEOSEARCHSTORE destination source <FROMMEMBER member \| FROMLONLAT longitude latitude> <BYRADIUS radius <m \| km \| ft \| mi> \| BYBOX width height <m \| km \| ft \| mi>> [ASC \| DESC] [COUNT count [ANY]] [STOREDIST]` | The same search as `GEOSEARCH`, stored at the destination as a sorted set instead of returned: the hits keep their 52-bit geohash scores, or with `STOREDIST` their distances in the shape's unit, and the command answers the number of members stored. The destination is overwritten whatever it held and its TTL is cleared, an empty result deletes it, and the destination may be the source key itself; the `WITH*` options are not accepted here, as in Redis |
 | `GEORADIUS key longitude latitude radius <m \| km \| ft \| mi> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC \| DESC] [STORE key \| STOREDIST key]`, `GEORADIUSBYMEMBER key member radius <m \| km \| ft \| mi> [same options]` | The legacy radius search, as in Redis: the same search as `GEOSEARCH` with a positional centre (`GEORADIUSBYMEMBER` takes the centre from a member), plus `STORE` (stores the hits at the destination with their geohash scores) and `STOREDIST` (stores them with their distances in the radius unit as scores) — either overwrites the destination whatever it held and clears its TTL, an empty result deletes it, and the destination may be the source key itself; `STORE` / `STOREDIST` answer the number of members stored and cannot be combined with the `WITH*` options |
 | `HSET key field value [field value ...]` | Set fields; returns number of new fields (updates return `0` for that field) |
 | `MULTI`, `EXEC`, `DISCARD` | Transactions: `MULTI` queues commands (`+QUEUED` per command, nested `MULTI` is an error), `EXEC` runs the queue in order and returns one reply per command (an error inside the transaction takes its place in the array and the rest still run), `DISCARD` drops the queue; `EXEC`/`DISCARD` without `MULTI` are errors. Queued writes are invisible to other clients until `EXEC` runs, and the commands `EXEC` runs are AOF-logged and replicated individually, never `MULTI`/`EXEC` themselves |
@@ -441,7 +442,8 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # set holds, while a member with a `0` or negative
             # score answers `nil`; wrong-type and wrong-argument
             # errors, and `COMMAND` listing both), and
-            # `GEOSEARCH` / `GEORADIUS` / `GEORADIUSBYMEMBER`
+            # `GEOSEARCH` / `GEOSEARCHSTORE` / `GEORADIUS` /
+            # `GEORADIUSBYMEMBER`
             # checks (`GEOSEARCH` by radius and by box around
             # (15, 37), nearest-first by default and with `ASC` /
             # `DESC`, `COUNT` and `COUNT ... ANY` (the `ANY` form
@@ -450,12 +452,18 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
             # after the member, `FROMMEMBER` starting from Palermo
             # itself at `0.0000`, a missing member and a missing
             # key, bad options and units, and wrong-type errors;
+            # `GEOSEARCHSTORE` storing the hits with geohash scores
+            # or distances (`STOREDIST`), by radius, by box, and
+            # from a member, `COUNT` limiting to the nearest hit,
+            # `WITHDIST` erroring, the destination's TTL cleared on
+            # overwrite, an empty result deleting the destination,
+            # the destination allowed to be the source key itself,
+            # and wrong-type errors; `COMMAND` listing all four;
             # `GEORADIUS` and `GEORADIUSBYMEMBER` answering the
             # same search, and `GEORADIUS ... STORE` / `STOREDIST`
             # storing the hits with geohash scores / distances,
             # an empty result creating nothing, and `STORE` with a
-            # `WITH*` option erroring; `COMMAND` listing all
-            # three), and
+            # `WITH*` option erroring), and
             # an AOF
             # restart test (data, a list, a set, a hash, a sorted set,
             # a HyperLogLog and a geo set survive a SHUTDOWN and reload),
@@ -1323,3 +1331,20 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       `GEOSEARCHSTORE` or `GEORADIUS_RO` / `GEORADIUSBYMEMBER_RO`
       yet, and `GEOADD` still takes no `NX` / `XX` / `CH`
       options.
+
+- [x] Geo, fourth slice (0.60.0): `GEOSEARCHSTORE`, as in real
+      Redis. It runs the same `GEOSEARCH` search — centre from a
+      member (`FROMMEMBER`) or coordinates (`FROMLONLAT`), circle
+      (`BYRADIUS`) or box (`BYBOX`), `ASC` / `DESC` sorting,
+      `COUNT [ANY]` limiting — and writes the hits to a
+      destination sorted set instead of returning them, answering
+      the number of members stored. The hits keep their 52-bit
+      geohash scores, or with `STOREDIST` their distances in the
+      shape's unit; the destination is overwritten whatever it
+      held and its TTL is cleared, an empty result deletes it, and
+      the destination may be the source key itself. The `WITH*`
+      options are a syntax error here, as in Redis. The write is
+      logged to the AOF and replicated like any other write, and
+      replays deterministically. Limitation: no `GEORADIUS_RO` /
+      `GEORADIUSBYMEMBER_RO` yet, and `GEOADD` still takes no `NX`
+      / `XX` / `CH` options.

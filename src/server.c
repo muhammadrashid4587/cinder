@@ -39,7 +39,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.59.0"
+#define CINDER_VERSION "0.60.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -1390,17 +1390,20 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         }
         return 0;
     }
-    /* ---------- GEOSEARCH / GEORADIUS / GEORADIUSBYMEMBER ----------
-     * The three search commands share one option block and one
+    /* ---------- GEOSEARCH / GEOSEARCHSTORE / GEORADIUS / GEORADIUSBYMEMBER ----------
+     * The search commands share one option block and one
      * search routine (store_geosearch). GEOSEARCH takes its centre
      * and shape as keywords (FROMMEMBER / FROMLONLAT, BYRADIUS /
-     * BYBOX) and returns the members; GEORADIUS and
-     * GEORADIUSBYMEMBER take the centre positionally and may also
-     * STORE / STOREDIST the result, as in Redis. Results are
-     * nearest-first by default — Redis leaves the order unspecified
-     * without ASC / DESC — and COUNT without ANY sorts first,
-     * while COUNT ... ANY takes the first N hits in (score, member)
-     * order without sorting. */
+     * BYBOX) and returns the members; GEOSEARCHSTORE takes a
+     * destination first (destination source ...) and stores the
+     * hits there instead of returning them, with STOREDIST
+     * storing the distances rather than the geohash scores, and
+     * no WITH* options; GEORADIUS and GEORADIUSBYMEMBER take the
+     * centre positionally and may also STORE / STOREDIST the
+     * result, as in Redis. Results are nearest-first by default —
+     * Redis leaves the order unspecified without ASC / DESC — and
+     * COUNT without ANY sorts first, while COUNT ... ANY takes
+     * the first N hits in (score, member) order without sorting. */
     /* Options shared by the three search commands: the centre, the
        shape, the sort and limit, the WITH* flags, and (GEORADIUS
        only) where to store the result. */
@@ -1416,16 +1419,24 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         const char *store_key; /* NULL = return the members */
         int store_dist;        /* STORE (geohash scores) or STOREDIST (distances) */
     };
-    if (strcasecmp(cmd, "GEOSEARCH") == 0) {
-        if (argc < 6)
-            return dbuf_error(reply, "wrong number of arguments for 'geosearch' command"), 0;
+    if (strcasecmp(cmd, "GEOSEARCH") == 0 || strcasecmp(cmd, "GEOSEARCHSTORE") == 0) {
+        /* GEOSEARCHSTORE is GEOSEARCH with a destination first
+           (destination source ...), storing the hits instead of
+           returning them; the same branch parses both. */
+        int is_store = strcasecmp(cmd, "GEOSEARCHSTORE") == 0;
+        const char *src_key = is_store ? argv[2] : argv[1];
+        if (argc < (is_store ? 8 : 6))
+            return dbuf_error(reply, is_store
+                ? "wrong number of arguments for 'geosearchstore' command"
+                : "wrong number of arguments for 'geosearch' command"), 0;
         struct geo_search_opts o;
         memset(&o, 0, sizeof(o));
         o.count = -1;
         o.unit_factor = 1.0;
+        o.store_key = is_store ? argv[1] : NULL;
         const char *from_member = NULL;
         int have_from = 0, have_shape = 0, sort_given = 0;
-        int i = 2;
+        int i = is_store ? 3 : 2;
         /* A helper for the keyword loop: the centre and the shape
            are parsed here, the trailing options below. */
         while (i < argc) {
@@ -1532,21 +1543,30 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
                     return dbuf_error(reply, "syntax error"), 0;
                 o.withhash = 1;
                 i += 1;
+            } else if (strcasecmp(argv[i], "STOREDIST") == 0) {
+                if (!is_store || o.store_dist)
+                    return dbuf_error(reply, "syntax error"), 0;
+                o.store_dist = 1;
+                i += 1;
             } else {
                 return dbuf_error(reply, "syntax error"), 0;
             }
         }
         if (!have_from || !have_shape)
             return dbuf_error(reply, "syntax error"), 0;
+        /* GEOSEARCHSTORE stores the hits; the WITH* options are
+           for returning them, so they are a syntax error here. */
+        if (is_store && (o.withcoord || o.withdist || o.withhash))
+            return dbuf_error(reply, "syntax error"), 0;
         /* Resolve a FROMMEMBER centre: the member's decoded
            position, or an error when it has none — a missing
            member, or one whose score does not decode. */
         if (from_member) {
-            int t = store_type(g_store, argv[1]);
+            int t = store_type(g_store, src_key);
             if (t != 0 && t != 5)
                 return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
             double lon, lat;
-            int rc = store_geopos(g_store, argv[1], from_member, &lon, &lat);
+            int rc = store_geopos(g_store, src_key, from_member, &lon, &lat);
             if (rc == -1)
                 return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
             if (rc == 0)
@@ -1554,12 +1574,12 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             o.clon = lon;
             o.clat = lat;
         }
-        int t = store_type(g_store, argv[1]);
+        int t = store_type(g_store, src_key);
         if (t != 0 && t != 5)
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         GeoSearchHit *hits = NULL;
         size_t n = 0;
-        int rc = store_geosearch(g_store, argv[1], o.clon, o.clat,
+        int rc = store_geosearch(g_store, src_key, o.clon, o.clat,
                                  o.is_box, o.radius_m, o.width_m,
                                  o.height_m, o.sort_desc, o.count,
                                  o.count_any, &hits, &n);
@@ -1567,6 +1587,42 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
         if (rc == -2)
             return dbuf_error(reply, "out of memory"), 0;
+        if (is_store) {
+            /* The destination is overwritten whatever it held, and
+               its TTL is cleared with it, as in Redis; an empty
+               result deletes it instead of leaving an empty set.
+               The hits were collected before the delete, so the
+               destination may be the source key itself. STOREDIST
+               stores the distances in the shape's unit as scores;
+               otherwise the hits keep their 52-bit geohash scores. */
+            int dest_exists = store_type(g_store, o.store_key) != 0;
+            if (n == 0 && !dest_exists) {
+                free(hits);
+                dbuf_int(reply, 0);
+                return 0;
+            }
+            store_del(g_store, o.store_key);
+            for (size_t k = 0; k < n; k++) {
+                double score = o.store_dist
+                    ? hits[k].dist_m * o.unit_factor
+                    : (double)hits[k].hash;
+                long long zrc = store_zadd(g_store, o.store_key,
+                                           hits[k].member, score);
+                free(hits[k].member);
+                if (zrc == -2) {
+                    for (size_t j = k + 1; j < n; j++)
+                        free(hits[j].member);
+                    free(hits);
+                    return dbuf_error(reply, "out of memory"), 0;
+                }
+            }
+            free(hits);
+            if (g_max_entries) store_evict_lru(g_store, g_max_entries);
+            dbuf_int(reply, (long long)n);
+            /* A real write, so it is logged to the AOF, replicated,
+               and invalidates a WATCH on the destination. */
+            return 1;
+        }
         int with_any = o.withcoord || o.withdist || o.withhash;
         dbuf_array_header(reply, (long long)n);
         for (size_t k = 0; k < n; k++) {
@@ -3611,7 +3667,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "SADD", "SREM", "SMEMBERS", "SSCAN", "SISMEMBER", "SCARD",
             "PFADD", "PFCOUNT", "PFMERGE",
             "GEOADD", "GEODIST", "GEOPOS", "GEOHASH",
-            "GEOSEARCH", "GEORADIUS", "GEORADIUSBYMEMBER",
+            "GEOSEARCH", "GEOSEARCHSTORE", "GEORADIUS", "GEORADIUSBYMEMBER",
             "HSET", "HGET", "HDEL", "HEXISTS", "HLEN", "HGETALL",
             "HMGET", "HSETNX", "HINCRBY", "HKEYS", "HVALS",
             "HINCRBYFLOAT", "HSCAN",

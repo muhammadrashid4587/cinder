@@ -2046,6 +2046,33 @@ def main():
         check("GEORADIUS STORE zrange", c.cmd("ZRANGE", "geodest", "0", "-1", "WITHSCORES"), ["Palermo", "3479099956230698", "Catania", "3479447370796909"])
         check("GEORADIUS STOREDIST", c.cmd("GEORADIUS", "geos", "15", "37", "200", "km", "STOREDIST", "geodist"), 2)
         check("GEORADIUS STOREDIST zrange", c.cmd("ZRANGE", "geodist", "0", "-1", "WITHSCORES"), ["Catania", "56.441257870156797", "Palermo", "190.44242984775795"])
+        # GEOSEARCHSTORE writes the same search to a destination
+        # sorted set, as in real Redis: geohash scores by default,
+        # distances in the shape's unit with STOREDIST.
+        check("GEOSEARCHSTORE", c.cmd("GEOSEARCHSTORE", "gsdest", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC"), 2)
+        check("GEOSEARCHSTORE zrange", c.cmd("ZRANGE", "gsdest", "0", "-1", "WITHSCORES"), ["Palermo", "3479099956230698", "Catania", "3479447370796909"])
+        check("GEOSEARCHSTORE STOREDIST", c.cmd("GEOSEARCHSTORE", "gsdist", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "STOREDIST"), 2)
+        check("GEOSEARCHSTORE STOREDIST zrange", c.cmd("ZRANGE", "gsdist", "0", "-1", "WITHSCORES"), ["Catania", "56.441257870156797", "Palermo", "190.44242984775795"])
+        check("GEOSEARCHSTORE bybox", c.cmd("GEOSEARCHSTORE", "gsdest", "geos", "FROMLONLAT", "15", "37", "BYBOX", "400", "400", "km"), 2)
+        check("GEOSEARCHSTORE frommember", c.cmd("GEOSEARCHSTORE", "gsdest", "geos", "FROMMEMBER", "Palermo", "BYRADIUS", "200", "km"), 2)
+        check("GEOSEARCHSTORE count", c.cmd("GEOSEARCHSTORE", "gsdest", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "COUNT", "1"), 1)
+        check("GEOSEARCHSTORE count one", c.cmd("ZRANGE", "gsdest", "0", "-1"), ["Catania"])
+        check("GEOSEARCHSTORE withdist error", c.cmd("GEOSEARCHSTORE", "gsdest", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "WITHDIST"),
+              ("error", "ERR syntax error"))
+        check("GEOSEARCHSTORE TTL setup", c.cmd("EXPIRE", "gsdest", "100"), 1)
+        check("GEOSEARCHSTORE overwrites TTL", c.cmd("GEOSEARCHSTORE", "gsdest", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), 2)
+        check("GEOSEARCHSTORE TTL cleared", c.cmd("TTL", "gsdest"), -1)
+        check("GEOSEARCHSTORE empty", c.cmd("GEOSEARCHSTORE", "gsdest", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "km"), 0)
+        check("GEOSEARCHSTORE empty deletes dest", c.cmd("EXISTS", "gsdest"), 0)
+        check("GEOSEARCHSTORE empty missing dest", c.cmd("GEOSEARCHSTORE", "gsnew", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "1", "km"), 0)
+        check("GEOSEARCHSTORE empty missing dest gone", c.cmd("EXISTS", "gsnew"), 0)
+        check("GEOSEARCHSTORE refill", c.cmd("GEOSEARCHSTORE", "gsdest", "geos", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), 2)
+        # The destination may be the source key itself.
+        check("GEOSEARCHSTORE self setup", c.cmd("GEOADD", "gsself", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania", "12.5", "41.9", "Rome"), 3)
+        check("GEOSEARCHSTORE self", c.cmd("GEOSEARCHSTORE", "gsself", "gsself", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), 2)
+        check("GEOSEARCHSTORE self members", c.cmd("ZRANGE", "gsself", "0", "-1"), ["Palermo", "Catania"])
+        check("GEOSEARCHSTORE list wrongtype", c.cmd("GEOSEARCHSTORE", "gsdest", "plist", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"), wrongtype)
+        check("COMMAND lists GEOSEARCHSTORE", "GEOSEARCHSTORE" in c.cmd("COMMAND"), True)
         check("GEORADIUS STORE withdist error", c.cmd("GEORADIUS", "geos", "15", "37", "200", "km", "STORE", "geodest", "WITHDIST"),
               ("error", "ERR STORE option is not compatible with WITHDIST, WITHCOORD and WITHHASH options"))
         check("GEORADIUS STORE empty", c.cmd("GEORADIUS", "geos", "15", "37", "1", "km", "STORE", "geoempty"), 0)
@@ -2054,7 +2081,7 @@ def main():
         check("COMMAND lists GEOSEARCH", "GEOSEARCH" in c.cmd("COMMAND"), True)
         check("COMMAND lists GEORADIUS", "GEORADIUS" in c.cmd("COMMAND"), True)
         check("COMMAND lists GEORADIUSBYMEMBER", "GEORADIUSBYMEMBER" in c.cmd("COMMAND"), True)
-        check("GEOSEARCH cleanup", c.cmd("DEL", "geos", "geodest", "geodist"), 3)
+        check("GEOSEARCH cleanup", c.cmd("DEL", "geos", "geodest", "geodist", "gsdest", "gsdist", "gsself"), 6)
         check("GEO cleanup", c.cmd("DEL", "geo", "geo2", "wtestkey4"), 2)
         # phll stays: the AOF restart below proves a HyperLogLog
         # survives a SHUTDOWN and reload — and phll is itself the
@@ -2797,7 +2824,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.59.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.60.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
