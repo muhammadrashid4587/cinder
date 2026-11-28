@@ -14,7 +14,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.75.0.
+Version 0.76.0.
 
 ## Why
 
@@ -137,6 +137,7 @@ OK
 | `XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME ms-unix-time] [RETRYCOUNT count] [FORCE] [JUSTID]` | Take over pending entries of a group for another consumer, usually because the consumer that held them died: an entry is claimed when it has been idle at least `min-idle-time` since its last delivery, or when `FORCE` is given (which also claims entries that are in the stream but not pending at all, creating a PEL entry for them). A claimed entry is moved to this consumer, its delivery time is set to now (or to `IDLE` ms ago, or to the absolute `TIME` given — `IDLE` and `TIME` cannot be combined) and its delivery count is bumped (or set by `RETRYCOUNT`); `JUSTID` answers only the IDs. A repeated ID in one call is claimed once. A real claim is AOF-logged and replicated like a write (an AOF replay re-claims, so delivery counts go up by one per replay). IDs that are not in the stream (trimmed, or never added), are not idle enough, or are not pending (without `FORCE`) are left out of the reply, where Redis answers nil for them. A missing key or group is a `NOGROUP` error |
 | `XACK key group id [id ...]` | Drop entries from a group's pending list, answering how many were dropped (`0` for an ID that was not pending). A missing key or group is a `NOGROUP` error. A real change, so it is AOF-logged and replicated when it drops anything |
 | `XPENDING key group [start end count [consumer]]` | Inspect a group's pending list: with no range, the summary — how many entries are pending, the lowest and highest pending IDs (`nil` when the list is empty), and a per-consumer count of pending entries; with `start end count` (and optionally one `consumer`), the pending entries in that ID range, each as `[id, consumer, idle-ms, deliveries]`, where `idle-ms` is the milliseconds since the entry was last delivered and `deliveries` is how many times it has been delivered. Bounds are `-` / `+` / `ms` / `ms-seq`, as in `XRANGE`, and `count` must be a positive integer. A missing key or group is a `NOGROUP` error. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
+| `XINFO CONSUMERS key group` | Inspect a group's consumers, one entry per consumer in the order the consumers first read (or were created), each as a flat `[name, pending, idle, inactive]` array — RESP2 has no map type, so maps come back as flat key/value arrays, as in real Redis. `pending` is how many of the group's pending entries the consumer holds, `idle` is the milliseconds since the consumer last attempted to interact (an `XREADGROUP` or `XCLAIM`, whether or not it got anything back), and `inactive` is the milliseconds since it last successfully read (an `XREADGROUP` that delivered entries); a consumer created by `XGROUP CREATECONSUMER` starts with both at its creation time. A missing key or group is a `NOGROUP` error. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica. Limitation: the `STREAM` and `GROUPS` subcommands are not implemented yet, and a consumer's idle/inactive times are not carried in RDB snapshots — a restored consumer reads as just seen, at load time |
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZMSCORE key member [member ...]` | Scores of several members at once, in order (`nil` for a missing member, an array of `nil`s when the key is missing) |
@@ -1703,3 +1704,25 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       consumer that already exists changes nothing, so it is
       not logged and does not invalidate a `WATCH`. With it,
       every `XGROUP` subcommand in real Redis is implemented.
+- [x] `XINFO CONSUMERS` for consumer groups (0.76.0): `XINFO
+      CONSUMERS key group` answers one entry per consumer, in
+      the order the consumers first read (or were created), each
+      as a flat `[name, pending, idle, inactive]` array, as real
+      Redis answers it over RESP2. `pending` is how many of the
+      group's pending entries the consumer holds; `idle` is the
+      milliseconds since the consumer last attempted to interact
+      (an `XREADGROUP` or `XCLAIM`, whether or not it got
+      anything back) and `inactive` the milliseconds since it
+      last successfully read (an `XREADGROUP` that delivered
+      entries). Each consumer now carries its own seen and active
+      times, stamped at creation and refreshed by reads and
+      claims; a snapshot restores the consumer names but not the
+      times, so a restored consumer reads as just seen, at load
+      time, and the snapshot format stays version 4. A missing
+      key or group is a `NOGROUP` error. Read-only, so no AOF,
+      RDB, or replication change was needed, and it is safe to
+      run on a replica. Limitation: the `STREAM` and `GROUPS`
+      subcommands are not implemented yet — cinder does not track
+      the per-group entries-read counter or the stream's
+      entries-added and max-deleted-entry-id that they would
+      report.

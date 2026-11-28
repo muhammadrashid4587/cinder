@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.75.0"
+#define CINDER_VERSION "0.76.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2999,6 +2999,53 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         stream_pending_info_free(infos, n);
         return 0;
     }
+    if (strcasecmp(cmd, "XINFO") == 0) {
+        /* XINFO CONSUMERS key group: one entry per consumer, in
+           the order the consumers first read (or were created),
+           each as a flat [name, pending, idle, inactive] array —
+           RESP2 has no map type, so maps come back as flat
+           key/value arrays, as in real Redis. `idle` is the ms
+           since the consumer last attempted to interact (an
+           XREADGROUP or XCLAIM), `inactive` the ms since it last
+           successfully read (an XREADGROUP that delivered
+           entries). Read-only, so nothing is logged or
+           replicated, and it is safe to run on a replica. STREAM
+           and GROUPS are not implemented yet. */
+        if (argc != 3 && argc != 4)
+            return dbuf_error(reply, "wrong number of arguments for 'xinfo' command"), 0;
+        if (strcasecmp(argv[1], "CONSUMERS") != 0) {
+            dbuf_putf(reply, "-ERR unknown subcommand '%s'. Try XINFO HELP.\r\n", argv[1]);
+            return 0;
+        }
+        if (argc != 4)
+            return dbuf_error(reply, "wrong number of arguments for 'xinfo' command"), 0;
+        StreamConsumerInfo *infos = NULL;
+        size_t n = 0;
+        int rc = store_xinfo_consumers(g_store, argv[2], argv[3],
+                                       &infos, &n);
+        if (rc == -1)
+            return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+        if (rc == -2)
+            return dbuf_error(reply, "out of memory"), 0;
+        if (rc == -3) {
+            dbuf_putf(reply, "-ERR NOGROUP No such key '%s' or consumer group '%s'\r\n", argv[2], argv[3]);
+            return 0;
+        }
+        dbuf_array_header(reply, (long long)n);
+        for (size_t k = 0; k < n; k++) {
+            dbuf_array_header(reply, 8);
+            dbuf_bulk(reply, "name", 4);
+            dbuf_bulk(reply, infos[k].consumer, strlen(infos[k].consumer));
+            dbuf_bulk(reply, "pending", 7);
+            dbuf_int(reply, infos[k].pending);
+            dbuf_bulk(reply, "idle", 4);
+            dbuf_int(reply, infos[k].idle_ms);
+            dbuf_bulk(reply, "inactive", 8);
+            dbuf_int(reply, infos[k].inactive_ms);
+        }
+        stream_consumer_info_free(infos, n);
+        return 0;
+    }
     if (strcasecmp(cmd, "HSET") == 0) {
         if (argc < 4 || (argc % 2) != 0)
             return dbuf_error(reply, "wrong number of arguments for 'hset' command"), 0;
@@ -4983,7 +5030,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             "HEXPIRE", "HPEXPIRE", "HEXPIREAT", "HPEXPIREAT",
             "HTTL", "HPTTL", "HPERSIST",
             "XADD", "XRANGE", "XREVRANGE", "XLEN", "XREAD",
-            "XGROUP", "XREADGROUP", "XACK", "XPENDING", "XCLAIM",
+            "XGROUP", "XREADGROUP", "XACK", "XPENDING", "XCLAIM", "XINFO",
             "ZADD", "ZSCORE", "ZMSCORE", "ZDIFF", "ZUNION", "ZINTER", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", "ZCARD", "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE",
             "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZLEXCOUNT", "ZREM",
             "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",

@@ -88,6 +88,22 @@ typedef struct StreamPending {
     long long delivery_count;
 } StreamPending;
 
+/* One consumer of a group: its name, when it last attempted to
+   interact with the server (an XREADGROUP or XCLAIM, whether or
+   not it got anything back), and when it last successfully read
+   (an XREADGROUP that delivered entries). XINFO CONSUMERS reports
+   the time since each of those as `idle` and `inactive`. A
+   consumer created by XGROUP CREATECONSUMER starts with both at
+   its creation time; one created by a first read starts with both
+   at that read. The times are not carried in RDB snapshots — a
+   restored consumer reads as just seen, at load time — because
+   they are observations of a live client, not stream state. */
+typedef struct StreamConsumer {
+    char *name; /* owned */
+    long long seen_time; /* ms since epoch */
+    long long active_time; /* ms since epoch */
+} StreamConsumer;
+
 /* A consumer group on a stream: its name, the last ID delivered
    (the cursor `>` reads from), the consumers that have read from
    it, and its pending entries list (PEL). Consumers come into
@@ -95,7 +111,7 @@ typedef struct StreamPending {
 typedef struct StreamGroup {
     char *name; /* owned */
     uint64_t last_ms, last_seq;
-    char **consumers; /* owned names */
+    StreamConsumer *consumers; /* owned, in creation order */
     size_t nconsumers, cap_consumers;
     StreamPending *pel;
     size_t npel, cap_pel;
@@ -986,6 +1002,25 @@ int store_xpending_summary(Store *s, const char *key, const char *group,
                            uint64_t *max_seq,
                            StreamConsumerCount **counts_out,
                            size_t *ncounts_out);
+/* XINFO CONSUMERS: one consumer as the command reports it — its
+   name, how many of the group's pending entries it holds, and
+   how long (ms) since it last interacted (`idle`) and last
+   successfully read (`inactive`). The names are copies owned by
+   the caller; free them with stream_consumer_info_free. */
+typedef struct StreamConsumerInfo {
+    char *consumer; /* owned */
+    long long pending;
+    long long idle_ms;
+    long long inactive_ms;
+} StreamConsumerInfo;
+void stream_consumer_info_free(StreamConsumerInfo *infos, size_t n);
+/* XINFO CONSUMERS: the consumers of a group, in the order they
+   first read (or were created), each with its pending count and
+   its idle/inactive times measured from a single "now", so the
+   values are consistent with each other. Same return codes as
+   store_xpending_summary, and likewise a read. */
+int store_xinfo_consumers(Store *s, const char *key, const char *group,
+                          StreamConsumerInfo **infos_out, size_t *n_out);
 /* XPENDING range: the pending entries with IDs in [start, end]
    inclusive, in ID order, at most count of them (count < 0 means
    no limit), optionally only those delivered to `consumer` (NULL

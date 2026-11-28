@@ -125,7 +125,7 @@ static int save_stream_group(const StreamGroup *g, void *arg) {
         return 1;
     }
     for (size_t i = 0; i < g->nconsumers; i++) {
-        if (w_str(ctx->f, g->consumers[i]) < 0) {
+        if (w_str(ctx->f, g->consumers[i].name) < 0) {
             ctx->err = 1;
             return 1;
         }

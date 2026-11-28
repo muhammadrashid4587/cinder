@@ -1620,6 +1620,85 @@ def main():
         check("xccwatchkey unchanged after abort", c.cmd("GET", "xccwatchkey"), "v1")
         cs.close()
         check("XGROUP CREATECONSUMER cleanup", c.cmd("DEL", "xgcc", "xccwatchkey"), 2)
+        # XINFO CONSUMERS: one entry per consumer, in the order the
+        # consumers first read (or were created), each as [name,
+        # pending, idle, inactive] — idle is the ms since the
+        # consumer last attempted to interact (an XREADGROUP or
+        # XCLAIM), inactive the ms since it last successfully
+        # read. The times are ms since a live event, so only
+        # their shape is pinned here; the sleep below proves they
+        # grow while the consumers sit idle.
+        check("XINFO CONSUMERS setup 1", c.cmd("XADD", "xic", "1000-1", "a", "1"), "1000-1")
+        check("XINFO CONSUMERS setup 2", c.cmd("XADD", "xic", "1000-2", "a", "2"), "1000-2")
+        check("XINFO CONSUMERS setup 3", c.cmd("XADD", "xic", "1000-3", "a", "3"), "1000-3")
+        check("XINFO CONSUMERS group", c.cmd("XGROUP", "CREATE", "xic", "gic", "0"), "OK")
+        check("XINFO CONSUMERS c1 precreate", c.cmd("XGROUP", "CREATECONSUMER", "xic", "gic", "c1"), 1)
+        check("XINFO CONSUMERS c2 precreate", c.cmd("XGROUP", "CREATECONSUMER", "xic", "gic", "c2"), 1)
+        check("XINFO CONSUMERS read c1",
+              c.cmd("XREADGROUP", "GROUP", "gic", "c1", "STREAMS", "xic", ">"),
+              [["xic", [["1000-1", ["a", "1"]], ["1000-2", ["a", "2"]], ["1000-3", ["a", "3"]]]]])
+        # c1 holds all 3 pending, c2 was created but never read, so
+        # it holds none.
+        def xinfo_norm(reply):
+            if not isinstance(reply, list):
+                return reply
+            out = []
+            for row in reply:
+                if not isinstance(row, list) or len(row) != 8:
+                    return reply
+                d = dict(zip(row[::2], row[1::2]))
+                if not (isinstance(d.get("idle"), int) and
+                        isinstance(d.get("inactive"), int)):
+                    return reply
+                if (d["idle"] < 0 or d["inactive"] < 0 or
+                        d["idle"] > 60000 or d["inactive"] > 60000):
+                    return reply
+                out.append(["name", d["name"], "pending", d["pending"],
+                            "idle", 0, "inactive", 0])
+            return out
+        check("XINFO CONSUMERS",
+              xinfo_norm(c.cmd("XINFO", "CONSUMERS", "xic", "gic")),
+              [["name", "c1", "pending", 3, "idle", 0, "inactive", 0],
+               ["name", "c2", "pending", 0, "idle", 0, "inactive", 0]])
+        # Both times grow while the consumers sit idle: 120 ms
+        # after c1's read, every idle and inactive is past 100.
+        time.sleep(0.12)
+        info = c.cmd("XINFO", "CONSUMERS", "xic", "gic")
+        check("XINFO CONSUMERS idle grows",
+              isinstance(info, list) and len(info) == 2 and all(
+                  isinstance(row, list) and len(row) == 8 and
+                  isinstance(row[5], int) and isinstance(row[7], int) and
+                  row[5] >= 100 and row[7] >= 100 for row in info),
+              True)
+        # A claim moves a pending entry to the claiming consumer,
+        # and an ack drops it — XINFO tracks both.
+        check("XINFO CONSUMERS claim",
+              c.cmd("XCLAIM", "xic", "gic", "c2", "0", "1000-1"),
+              [["1000-1", ["a", "1"]]])
+        check("XINFO CONSUMERS after claim",
+              xinfo_norm(c.cmd("XINFO", "CONSUMERS", "xic", "gic")),
+              [["name", "c1", "pending", 2, "idle", 0, "inactive", 0],
+               ["name", "c2", "pending", 1, "idle", 0, "inactive", 0]])
+        check("XINFO CONSUMERS ack", c.cmd("XACK", "xic", "gic", "1000-1", "1000-2", "1000-3"), 3)
+        check("XINFO CONSUMERS after ack",
+              xinfo_norm(c.cmd("XINFO", "CONSUMERS", "xic", "gic")),
+              [["name", "c1", "pending", 0, "idle", 0, "inactive", 0],
+               ["name", "c2", "pending", 0, "idle", 0, "inactive", 0]])
+        check("XINFO CONSUMERS missing key",
+              c.cmd("XINFO", "CONSUMERS", "nope", "gic"),
+              ("error", "ERR NOGROUP No such key 'nope' or consumer group 'gic'"))
+        check("XINFO CONSUMERS missing group",
+              c.cmd("XINFO", "CONSUMERS", "xic", "nogrp"),
+              ("error", "ERR NOGROUP No such key 'xic' or consumer group 'nogrp'"))
+        check("XINFO CONSUMERS wrongtype",
+              c.cmd("XINFO", "CONSUMERS", "after", "gic"), wrongtype)
+        check("XINFO CONSUMERS wrong args",
+              c.cmd("XINFO", "CONSUMERS", "xic"),
+              ("error", "ERR wrong number of arguments for 'xinfo' command"))
+        check("XINFO STREAM not implemented",
+              c.cmd("XINFO", "STREAM", "xic"),
+              ("error", "ERR unknown subcommand 'STREAM'. Try XINFO HELP."))
+        check("XINFO CONSUMERS cleanup", c.cmd("DEL", "xic"), 1)
         check("XGROUP bad mkstream", c.cmd("XGROUP", "CREATE", "xg", "g3", "0", "FOO"),
               ("error", "ERR syntax error"))
         check("XREADGROUP new",
@@ -3705,6 +3784,14 @@ def main():
         check("rdb reload group pending deliveries", pend[0][3], 2)
         check("rdb reload group empty pending", c.cmd("XPENDING", "snapstream", "g2"),
               [0, None, None, []])
+        # The consumers came back too: alice holds nothing pending
+        # (her one entry was acked, the other claimed away) and
+        # bob holds the one pending entry; their idle/inactive
+        # times restarted at the load, so only the shape is pinned.
+        check("rdb reload XINFO CONSUMERS",
+              xinfo_norm(c.cmd("XINFO", "CONSUMERS", "snapstream", "g1")),
+              [["name", "alice", "pending", 0, "idle", 0, "inactive", 0],
+               ["name", "bob", "pending", 1, "idle", 0, "inactive", 0]])
         check("rdb reload group exists",
               c.cmd("XGROUP", "CREATE", "snapstream", "g1", "0"),
               ("error", "ERR BUSYGROUP Consumer Group name already exists"))
@@ -3850,7 +3937,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.75.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.76.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

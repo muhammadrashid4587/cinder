@@ -4167,7 +4167,7 @@ static void stream_entry_free(StreamEntry *en) {
    consumer name on each pending entry. */
 static void stream_group_free(StreamGroup *g) {
     free(g->name);
-    for (size_t i = 0; i < g->nconsumers; i++) free(g->consumers[i]);
+    for (size_t i = 0; i < g->nconsumers; i++) free(g->consumers[i].name);
     free(g->consumers);
     for (size_t i = 0; i < g->npel; i++) free(g->pel[i].consumer);
     free(g->pel);
@@ -4592,21 +4592,51 @@ static StreamGroup *stream_group_find(Stream *st, const char *name) {
 }
 
 /* Record a consumer on a group if it is not there already (a
-   no-op when it is). Returns 0 on success, -1 = out of memory. */
+   no-op when it is). A new consumer starts with its seen and
+   active times at now, so XINFO CONSUMERS reports it as just
+   interacted with and just read. Returns 0 on success, -1 = out
+   of memory. */
 static int stream_group_add_consumer(StreamGroup *g, const char *consumer) {
     for (size_t i = 0; i < g->nconsumers; i++)
-        if (strcmp(g->consumers[i], consumer) == 0) return 0;
+        if (strcmp(g->consumers[i].name, consumer) == 0) return 0;
     if (g->nconsumers == g->cap_consumers) {
         size_t ncap = g->cap_consumers ? g->cap_consumers * 2 : 4;
-        char **ncon = realloc(g->consumers, ncap * sizeof(*ncon));
+        StreamConsumer *ncon =
+            realloc(g->consumers, ncap * sizeof(*ncon));
         if (!ncon) return -1;
         g->consumers = ncon;
         g->cap_consumers = ncap;
     }
-    g->consumers[g->nconsumers] = strdup(consumer);
-    if (!g->consumers[g->nconsumers]) return -1;
+    long long now = now_ms();
+    g->consumers[g->nconsumers].name = strdup(consumer);
+    if (!g->consumers[g->nconsumers].name) return -1;
+    g->consumers[g->nconsumers].seen_time = now;
+    g->consumers[g->nconsumers].active_time = now;
     g->nconsumers++;
     return 0;
+}
+
+/* The consumer with this name on a group, or NULL. */
+static StreamConsumer *stream_group_find_consumer(StreamGroup *g,
+                                                  const char *consumer) {
+    for (size_t i = 0; i < g->nconsumers; i++)
+        if (strcmp(g->consumers[i].name, consumer) == 0)
+            return &g->consumers[i];
+    return NULL;
+}
+
+/* Mark a consumer as having just interacted with the server — an
+   XREADGROUP or XCLAIM attempt — and, when it actually got
+   entries back (`active`), as having just successfully read. A
+   consumer that does not exist yet is left alone: the add that
+   creates it stamps both times with now. */
+static void stream_group_consumer_seen(StreamGroup *g, const char *consumer,
+                                       int active) {
+    StreamConsumer *c = stream_group_find_consumer(g, consumer);
+    if (!c) return;
+    long long now = now_ms();
+    c->seen_time = now;
+    if (active) c->active_time = now;
 }
 
 /* The PEL entry for this ID, or NULL when the entry is not
@@ -4792,7 +4822,7 @@ long long store_xgroup_delconsumer(Store *s, const char *key,
     if (!g) return -3;
     size_t cidx = g->nconsumers;
     for (size_t i = 0; i < g->nconsumers; i++)
-        if (strcmp(g->consumers[i], consumer) == 0) { cidx = i; break; }
+        if (strcmp(g->consumers[i].name, consumer) == 0) { cidx = i; break; }
     if (cidx == g->nconsumers) return -4;
     /* Drop the consumer's pending entries first, counting them,
        then the consumer's name. PEL entries are in ID order, so
@@ -4809,7 +4839,7 @@ long long store_xgroup_delconsumer(Store *s, const char *key,
         }
     }
     g->npel = w;
-    free(g->consumers[cidx]);
+    free(g->consumers[cidx].name);
     memmove(&g->consumers[cidx], &g->consumers[cidx + 1],
             (g->nconsumers - cidx - 1) * sizeof(*g->consumers));
     g->nconsumers--;
@@ -4831,7 +4861,7 @@ int store_xgroup_createconsumer(Store *s, const char *key,
     StreamGroup *g = stream_group_find(e->stream, group);
     if (!g) return -3;
     for (size_t i = 0; i < g->nconsumers; i++)
-        if (strcmp(g->consumers[i], consumer) == 0) return 0;
+        if (strcmp(g->consumers[i].name, consumer) == 0) return 0;
     if (stream_group_add_consumer(g, consumer) != 0) return -2;
     e->last_access = ++s->clock;
     entry_touch(s, e);
@@ -4877,6 +4907,12 @@ int store_xreadgroup(Store *s, const char *key, const char *group,
     StreamGroup *g = stream_group_find(st, group);
     if (!g) return -3;
     e->last_access = ++s->clock;
+    /* The consumer attempted to interact, whether or not the read
+       returns anything — XINFO CONSUMERS reports the time since
+       this as `idle`. A consumer that does not exist yet is
+       created below with both times at now, so the touch is a
+       no-op for it here. */
+    stream_group_consumer_seen(g, consumer, 0);
     /* Collect the entries first, so a copy failure leaves the
        group untouched; delivery tracking is applied after the
        scan, only for the entries actually returned. */
@@ -4933,6 +4969,10 @@ int store_xreadgroup(Store *s, const char *key, const char *group,
         stream_entries_free(arg.entries, arg.n);
         return -2;
     }
+    /* The read delivered entries, so the consumer successfully
+       read — XINFO CONSUMERS reports the time since this as
+       `inactive`. */
+    stream_group_consumer_seen(g, consumer, 1);
     *entries_out = arg.entries;
     *n_out = arg.n;
     return 0;
@@ -5033,6 +5073,11 @@ int store_xclaim(Store *s, const char *key, const char *group,
     if (!g) return -3;
     e->last_access = ++s->clock;
     long long now = now_ms();
+    /* The consumer attempted to interact — XINFO CONSUMERS
+       reports the time since this as `idle`. A claim is not a
+       read, so `inactive` (time since the last successful read)
+       is left alone. */
+    stream_group_consumer_seen(g, consumer, 0);
     /* Pass 1: decide which IDs are claimable and copy their entries,
        so a copy failure leaves the group untouched; the claims are
        applied in pass 2, only for the entries actually returned. */
@@ -5140,7 +5185,7 @@ int store_xpending_summary(Store *s, const char *key, const char *group,
     for (size_t ci = 0; ci < g->nconsumers; ci++) {
         long long c = 0;
         for (size_t i = 0; i < g->npel; i++)
-            if (strcmp(g->pel[i].consumer, g->consumers[ci]) == 0) c++;
+            if (strcmp(g->pel[i].consumer, g->consumers[ci].name) == 0) c++;
         if (c == 0) continue;
         if (n == cap) {
             size_t ncap = cap ? cap * 2 : 4;
@@ -5153,7 +5198,7 @@ int store_xpending_summary(Store *s, const char *key, const char *group,
             counts = nc;
             cap = ncap;
         }
-        counts[n].consumer = strdup(g->consumers[ci]);
+        counts[n].consumer = strdup(g->consumers[ci].name);
         if (!counts[n].consumer) {
             stream_consumer_counts_free(counts, n);
             return -2;
@@ -5218,6 +5263,53 @@ int store_xpending_range(Store *s, const char *key, const char *group,
     }
     *infos_out = infos;
     *n_out = n;
+    return 0;
+}
+
+void stream_consumer_info_free(StreamConsumerInfo *infos, size_t n) {
+    if (!infos) return;
+    for (size_t i = 0; i < n; i++) free(infos[i].consumer);
+    free(infos);
+}
+
+int store_xinfo_consumers(Store *s, const char *key, const char *group,
+                          StreamConsumerInfo **infos_out, size_t *n_out) {
+    *infos_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    Stream *st = e->stream;
+    StreamGroup *g = stream_group_find(st, group);
+    if (!g) return -3;
+    e->last_access = ++s->clock;
+    /* One "now" for the whole reply, so the idle and inactive
+       times are consistent with each other. */
+    long long now = now_ms();
+    StreamConsumerInfo *infos =
+        calloc(g->nconsumers ? g->nconsumers : 1, sizeof(*infos));
+    if (!infos) return -2;
+    for (size_t i = 0; i < g->nconsumers; i++) {
+        infos[i].consumer = strdup(g->consumers[i].name);
+        if (!infos[i].consumer) {
+            stream_consumer_info_free(infos, i);
+            return -2;
+        }
+        long long pending = 0;
+        for (size_t j = 0; j < g->npel; j++)
+            if (strcmp(g->pel[j].consumer, g->consumers[i].name) == 0)
+                pending++;
+        infos[i].pending = pending;
+        /* A time in the future (a clock step, or a snapshot
+           restored with times from another machine) reads as 0,
+           as XPENDING's idle does. */
+        long long idle = now - g->consumers[i].seen_time;
+        long long inactive = now - g->consumers[i].active_time;
+        infos[i].idle_ms = idle < 0 ? 0 : idle;
+        infos[i].inactive_ms = inactive < 0 ? 0 : inactive;
+    }
+    *infos_out = infos;
+    *n_out = g->nconsumers;
     return 0;
 }
 
