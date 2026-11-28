@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.76.0"
+#define CINDER_VERSION "0.77.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -783,6 +783,20 @@ static void xreadgroup_block_free(XReadGroupBlock *b) {
     free(b->argv);
     b->argv = NULL;
     b->argc = 0;
+}
+
+/* One stream entry as a RESP array: [id, [field, value, ...]]. */
+static void dbuf_stream_entry(Dbuf *reply, const StreamEntry *en) {
+    char idbuf[48];
+    snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+             (unsigned long long)en->ms, (unsigned long long)en->seq);
+    dbuf_array_header(reply, 2);
+    dbuf_bulk(reply, idbuf, strlen(idbuf));
+    dbuf_array_header(reply, (long long)(en->nfields * 2));
+    for (size_t f = 0; f < en->nfields; f++) {
+        dbuf_bulk(reply, en->fields[f], strlen(en->fields[f]));
+        dbuf_bulk(reply, en->values[f], strlen(en->values[f]));
+    }
 }
 
 static int dispatch(char **argv, int argc, Dbuf *reply) {
@@ -3000,19 +3014,120 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
         return 0;
     }
     if (strcasecmp(cmd, "XINFO") == 0) {
-        /* XINFO CONSUMERS key group: one entry per consumer, in
-           the order the consumers first read (or were created),
-           each as a flat [name, pending, idle, inactive] array —
+        /* XINFO STREAM key: the stream at a glance — its length,
+           last-generated ID, the highest ID trimmed away by
+           MAXLEN (0-0 when nothing was trimmed), how many entries
+           were ever added, how many consumer groups it has, and
+           its first and last entries (nil when it is empty).
+           XINFO GROUPS key: one entry per consumer group, in
+           creation order, each as a flat [name, consumers,
+           pending, last-delivered-id, entries-read] array —
+           `entries-read` is how many new entries the group has
+           read (a pending re-read does not count) and is nil for
+           a group that has never read, as in Redis 7.0. XINFO
+           CONSUMERS key group: one entry per consumer, in the
+           order the consumers first read (or were created), each
+           as a flat [name, pending, idle, inactive] array —
            RESP2 has no map type, so maps come back as flat
            key/value arrays, as in real Redis. `idle` is the ms
            since the consumer last attempted to interact (an
            XREADGROUP or XCLAIM), `inactive` the ms since it last
            successfully read (an XREADGROUP that delivered
-           entries). Read-only, so nothing is logged or
-           replicated, and it is safe to run on a replica. STREAM
-           and GROUPS are not implemented yet. */
-        if (argc != 3 && argc != 4)
+           entries). A stream here is a flat array, not a radix
+           tree, so there are no radix-tree-keys/nodes fields to
+           report, as real Redis has. STREAM errors on a missing
+           key, as in real Redis; GROUPS answers an empty array
+           for one. All three are read-only, so nothing is logged
+           or replicated, and they are safe to run on a replica. */
+        if (argc < 2 || argc > 4)
             return dbuf_error(reply, "wrong number of arguments for 'xinfo' command"), 0;
+        if (strcasecmp(argv[1], "HELP") == 0) {
+            if (argc != 2)
+                return dbuf_error(reply, "wrong number of arguments for 'xinfo' command"), 0;
+            const char *lines[] = {
+                "XINFO <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "CONSUMERS <key> <group>",
+                "GROUPS <key>",
+                "STREAM <key>",
+                "HELP",
+            };
+            dbuf_array_header(reply, 5);
+            for (int i = 0; i < 5; i++)
+                dbuf_bulk(reply, lines[i], strlen(lines[i]));
+            return 0;
+        }
+        if (strcasecmp(argv[1], "STREAM") == 0) {
+            if (argc != 3)
+                return dbuf_error(reply, "wrong number of arguments for 'xinfo' command"), 0;
+            StreamInfo info;
+            int rc = store_xinfo_stream(g_store, argv[2], &info);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == -2)
+                return dbuf_error(reply, "out of memory"), 0;
+            if (rc == -3) {
+                dbuf_putf(reply, "-ERR no such key '%s'\r\n", argv[2]);
+                return 0;
+            }
+            char idbuf[48];
+            dbuf_array_header(reply, 14);
+            dbuf_bulk(reply, "length", 6);
+            dbuf_int(reply, info.length);
+            dbuf_bulk(reply, "last-generated-id", 17);
+            snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                     (unsigned long long)info.last_ms,
+                     (unsigned long long)info.last_seq);
+            dbuf_bulk(reply, idbuf, strlen(idbuf));
+            dbuf_bulk(reply, "max-deleted-entry-id", 20);
+            snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                     (unsigned long long)info.max_del_ms,
+                     (unsigned long long)info.max_del_seq);
+            dbuf_bulk(reply, idbuf, strlen(idbuf));
+            dbuf_bulk(reply, "entries-added", 13);
+            dbuf_int(reply, (long long)info.entries_added);
+            dbuf_bulk(reply, "groups", 6);
+            dbuf_int(reply, info.ngroups);
+            dbuf_bulk(reply, "first-entry", 11);
+            if (info.length > 0) dbuf_stream_entry(reply, &info.first);
+            else dbuf_null(reply);
+            dbuf_bulk(reply, "last-entry", 10);
+            if (info.length > 0) dbuf_stream_entry(reply, &info.last);
+            else dbuf_null(reply);
+            stream_info_free(&info);
+            return 0;
+        }
+        if (strcasecmp(argv[1], "GROUPS") == 0) {
+            if (argc != 3)
+                return dbuf_error(reply, "wrong number of arguments for 'xinfo' command"), 0;
+            StreamGroupInfo *infos = NULL;
+            size_t n = 0;
+            int rc = store_xinfo_groups(g_store, argv[2], &infos, &n);
+            if (rc == -1)
+                return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
+            if (rc == -2)
+                return dbuf_error(reply, "out of memory"), 0;
+            dbuf_array_header(reply, (long long)n);
+            for (size_t k = 0; k < n; k++) {
+                char idbuf[48];
+                dbuf_array_header(reply, 10);
+                dbuf_bulk(reply, "name", 4);
+                dbuf_bulk(reply, infos[k].name, strlen(infos[k].name));
+                dbuf_bulk(reply, "consumers", 9);
+                dbuf_int(reply, infos[k].consumers);
+                dbuf_bulk(reply, "pending", 7);
+                dbuf_int(reply, infos[k].pending);
+                dbuf_bulk(reply, "last-delivered-id", 17);
+                snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
+                         (unsigned long long)infos[k].last_ms,
+                         (unsigned long long)infos[k].last_seq);
+                dbuf_bulk(reply, idbuf, strlen(idbuf));
+                dbuf_bulk(reply, "entries-read", 12);
+                if (infos[k].entries_read < 0) dbuf_null(reply);
+                else dbuf_int(reply, infos[k].entries_read);
+            }
+            stream_group_info_free(infos, n);
+            return 0;
+        }
         if (strcasecmp(argv[1], "CONSUMERS") != 0) {
             dbuf_putf(reply, "-ERR unknown subcommand '%s'. Try XINFO HELP.\r\n", argv[1]);
             return 0;

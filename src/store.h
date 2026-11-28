@@ -107,10 +107,14 @@ typedef struct StreamConsumer {
 /* A consumer group on a stream: its name, the last ID delivered
    (the cursor `>` reads from), the consumers that have read from
    it, and its pending entries list (PEL). Consumers come into
-   being when they first read, as in Redis. */
+   being when they first read, as in Redis. `entries_read` counts
+   the new entries the group has read (an XREADGROUP with `>`);
+   a pending re-read does not count. -1 means the group has never
+   read, which XINFO GROUPS reports as nil, as in Redis 7.0. */
 typedef struct StreamGroup {
     char *name; /* owned */
     uint64_t last_ms, last_seq;
+    long long entries_read; /* -1 = never read */
     StreamConsumer *consumers; /* owned, in creation order */
     size_t nconsumers, cap_consumers;
     StreamPending *pel;
@@ -121,12 +125,18 @@ typedef struct StreamGroup {
    (last_ms, last_seq), so the next auto or partial ID is derived
    without scanning. New entries append at the end; MAXLEN trims
    from the front. Consumer groups live on the stream too, so
-   deleting the key (or trimming it empty) drops them with it. */
+   deleting the key (or trimming it empty) drops them with it.
+   `entries_added` counts every entry ever added, including ones
+   since trimmed away; `max_del_ms/max_del_seq` is the highest ID
+   trimmed away by MAXLEN (0-0 when nothing was ever trimmed) —
+   both are what XINFO STREAM reports. */
 typedef struct Stream {
     StreamEntry *entries;
     size_t len;
     size_t cap;
     uint64_t last_ms, last_seq;
+    unsigned long long entries_added;
+    uint64_t max_del_ms, max_del_seq;
     StreamGroup *groups;
     size_t ngroups, cap_groups;
 } Stream;
@@ -1021,6 +1031,60 @@ void stream_consumer_info_free(StreamConsumerInfo *infos, size_t n);
    store_xpending_summary, and likewise a read. */
 int store_xinfo_consumers(Store *s, const char *key, const char *group,
                           StreamConsumerInfo **infos_out, size_t *n_out);
+/* XINFO STREAM: the stream at a glance — its length, last-generated
+   ID, highest ID trimmed away by MAXLEN, how many entries were ever
+   added, how many consumer groups it has, and copies of its first
+   and last entries (empty when the stream has no entries). The
+   copies are owned by the caller; free them with stream_info_free
+   (safe to call even when the stream was empty). Returns 0 on
+   success, -1 = the key holds a non-stream value, -2 = out of
+   memory, -3 = no such key. A read, so it changes nothing but the
+   key's last_access. */
+typedef struct StreamInfo {
+    long long length;
+    uint64_t last_ms, last_seq;
+    uint64_t max_del_ms, max_del_seq;
+    unsigned long long entries_added;
+    long long ngroups;
+    StreamEntry first; /* valid when length > 0 */
+    StreamEntry last;
+} StreamInfo;
+void stream_info_free(StreamInfo *info);
+int store_xinfo_stream(Store *s, const char *key, StreamInfo *info_out);
+/* XINFO GROUPS: one entry per consumer group, in creation order —
+   its name, how many consumers it has, how many entries are
+   pending, its last-delivered ID, and how many new entries it has
+   read (-1 = never read: nil in the reply). The names are copies
+   owned by the caller; free them with stream_group_info_free. A
+   missing key answers an empty array, as in real Redis. Returns 0
+   on success, -1 = the key holds a non-stream value, -2 = out of
+   memory. A read, so it changes nothing but the key's
+   last_access. */
+typedef struct StreamGroupInfo {
+    char *name; /* owned */
+    long long consumers;
+    long long pending;
+    uint64_t last_ms, last_seq;
+    long long entries_read; /* -1 = never read */
+} StreamGroupInfo;
+void stream_group_info_free(StreamGroupInfo *infos, size_t n);
+int store_xinfo_groups(Store *s, const char *key,
+                       StreamGroupInfo **infos_out, size_t *n_out);
+/* Make sure a stream key exists, creating an empty one when it
+   does not. Used by the snapshot loader, which must restore a
+   stream's groups even when the snapshot carries no entries for
+   it (a stream created empty by XGROUP CREATE MKSTREAM). Returns
+   0 on success, -1 = the key holds a non-stream value, -2 = out
+   of memory. */
+int store_stream_ensure(Store *s, const char *key);
+/* Set a stream's entries-added and max-deleted-entry-id counters,
+   as a snapshot recorded them. Used by the snapshot loader, after
+   it replays the entries (which counts only the entries the
+   snapshot carries). Returns 0 on success, -1 = the key holds a
+   non-stream value, -3 = no such key. */
+int store_stream_set_counters(Store *s, const char *key,
+                              unsigned long long entries_added,
+                              uint64_t max_ms, uint64_t max_seq);
 /* XPENDING range: the pending entries with IDs in [start, end]
    inclusive, in ID order, at most count of them (count < 0 means
    no limit), optionally only those delivered to `consumer` (NULL
@@ -1058,17 +1122,20 @@ typedef int (*stream_group_foreach_fn)(const StreamGroup *g, void *arg);
 int stream_group_foreach(const Stream *st, stream_group_foreach_fn fn,
                          void *arg);
 /* Restore one consumer group exactly as a snapshot recorded it:
-   name, last-delivered ID, consumer names, and pending entries
-   with their recorded delivery times and counts (not "now", so a
-   reloaded group reports the same idle times and delivery counts
-   it had when saved). Used by the RDB loader; the stream must
-   already exist and the group must not. Returns 0 on success,
-   -1 = the key holds a non-stream value, -2 = out of memory,
-   -3 = the group already exists, -4 = the stream does not exist.
-   A duplicate pending ID in the snapshot is treated as out of
-   memory (-2): it cannot occur in a file the writer produced. */
+   name, last-delivered ID, how many new entries it has read (-1 =
+   never read: nil in XINFO GROUPS), consumer names, and pending
+   entries with their recorded delivery times and counts (not
+   "now", so a reloaded group reports the same idle times and
+   delivery counts it had when saved). Used by the RDB loader; the
+   stream must already exist and the group must not. Returns 0 on
+   success, -1 = the key holds a non-stream value, -2 = out of
+   memory, -3 = the group already exists, -4 = the stream does
+   not exist. A duplicate pending ID in the snapshot is treated
+   as out of memory (-2): it cannot occur in a file the writer
+   produced. */
 int store_xgroup_restore(Store *s, const char *key, const char *group,
                          uint64_t last_ms, uint64_t last_seq,
+                         long long entries_read,
                          char *const *consumers, size_t nconsumers,
                          const StreamPending *pel, size_t npel);
 

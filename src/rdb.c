@@ -9,7 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define RDB_VERSION 4
+#define RDB_VERSION 5
 #define RDB_MAGIC "CINDER"
 #define RDB_MAGIC_LEN 6
 #define RDB_END 0xFF
@@ -111,15 +111,17 @@ static int save_stream_entry(uint64_t ms, uint64_t seq, char *const *fields,
 }
 
 /* One consumer group being written to the snapshot: its name, its
-   last-delivered ID as a "ms-seq" string, its consumer names, then
-   its pending entries, each as an ID string, a consumer name, and
-   the recorded delivery time and count. */
+   last-delivered ID as a "ms-seq" string, how many new entries it
+   has read (-1 = never read), its consumer names, then its pending
+   entries, each as an ID string, a consumer name, and the recorded
+   delivery time and count. */
 static int save_stream_group(const StreamGroup *g, void *arg) {
     SaveCtx *ctx = arg;
     char idbuf[48];
     snprintf(idbuf, sizeof(idbuf), "%llu-%llu",
              (unsigned long long)g->last_ms, (unsigned long long)g->last_seq);
     if (w_str(ctx->f, g->name) < 0 || w_str(ctx->f, idbuf) < 0 ||
+        w_i64(ctx->f, g->entries_read) < 0 ||
         w_u32(ctx->f, (uint32_t)g->nconsumers) < 0) {
         ctx->err = 1;
         return 1;
@@ -208,9 +210,22 @@ static int save_entry(const Entry *e, void *arg) {
         Stream *st = e->stream;
         if (w_u32(f, (uint32_t)st->len) < 0) { ctx->err = 1; return 1; }
         if (stream_foreach(st, save_stream_entry, ctx) != 0) return 1;
-        /* Version 4 writes the stream's consumer groups after its
-           entries, so a group survives the snapshot with its
-           cursor, its consumers, and its pending list. */
+        /* Version 5 writes the stream's entries-added count and
+           its max-deleted-entry-id after its entries, so a
+           snapshot keeps the counters a MAXLEN trim would
+           otherwise lose. Version 4 writes the stream's consumer
+           groups after its entries, so a group survives the
+           snapshot with its cursor, its read count, its
+           consumers, and its pending list. */
+        if (w_i64(f, (int64_t)st->entries_added) < 0) {
+            ctx->err = 1;
+            return 1;
+        }
+        char delbuf[48];
+        snprintf(delbuf, sizeof(delbuf), "%llu-%llu",
+                 (unsigned long long)st->max_del_ms,
+                 (unsigned long long)st->max_del_seq);
+        if (w_str(f, delbuf) < 0) { ctx->err = 1; return 1; }
         if (w_u32(f, (uint32_t)st->ngroups) < 0) { ctx->err = 1; return 1; }
         if (stream_group_foreach(st, save_stream_group, ctx) != 0)
             return 1;
@@ -437,9 +452,14 @@ long long rdb_load(Store *s, const char *path) {
     /* Version 1 snapshots (no per-field expiry) still load: their
        hash fields simply come back without a TTL. Version 2 adds
        per-field expiries; version 3 adds streams; version 4 adds
-       stream consumer groups. */
+       stream consumer groups; version 5 adds the stream's
+       entries-added and max-deleted-entry-id counters and each
+       group's entries-read count. A version 4 snapshot's streams
+       come back with entries-added equal to the entries the
+       snapshot carries and their groups never having read. */
     if (r_u32(&r, &version) < 0 ||
-        (version != 1 && version != 2 && version != 3 && version != 4)) {
+        (version != 1 && version != 2 && version != 3 && version != 4 &&
+         version != 5)) {
         free(data);
         errno = EINVAL;
         return -1;
@@ -520,17 +540,64 @@ long long rdb_load(Store *s, const char *path) {
                 free(id);
                 if (bad) { free(key); goto malformed; }
             }
+            /* Version 5 carries the stream's entries-added count
+               and max-deleted-entry-id after its entries. The
+               entries just replayed counted only the entries the
+               snapshot carries, so the recorded counters overwrite
+               them below; a version 4 snapshot has no counters to
+               read, and its streams come back with entries-added
+               equal to their entry count. An expired stream's
+               counters are still read (to keep the reader aligned)
+               but not restored, like its entries above. */
+            int64_t entries_added = -1;
+            uint64_t mdms = 0, mdseq = 0;
+            if (version >= 5) {
+                if (r_i64(&r, &entries_added) < 0 || entries_added < 0) {
+                    free(key);
+                    goto malformed;
+                }
+                char *maxdel = NULL;
+                if (r_str(&r, &maxdel) < 0) {
+                    free(key);
+                    goto malformed;
+                }
+                if (!parse_stream_id(maxdel, &mdms, &mdseq)) {
+                    free(maxdel);
+                    free(key);
+                    goto malformed;
+                }
+                free(maxdel);
+            }
             /* Version 4 carries the stream's consumer groups after
-               its entries: name, last-delivered ID, consumer
-               names, then pending entries with their recorded
-               delivery times and counts. Older snapshots have no
-               groups; theirs come back from the AOF replay that
-               follows, as before. An expired stream's groups are
-               still read (to keep the reader aligned) but not
-               restored, like its entries above. */
+               its entries: name, last-delivered ID, entries-read
+               (version 5), consumer names, then pending entries
+               with their recorded delivery times and counts. Older
+               snapshots have no groups; theirs come back from the
+               AOF replay that follows, as before. An expired
+               stream's groups are still read (to keep the reader
+               aligned) but not restored, like its entries above.
+               A stream the snapshot carries no entries for (one
+               created empty by XGROUP CREATE MKSTREAM) has no
+               stream yet from the replay, so it is created here
+               before its groups are restored — without this, its
+               groups would fail to load. */
             if (version >= 4) {
                 uint32_t ng;
                 if (r_u32(&r, &ng) < 0) { free(key); goto malformed; }
+                if (!expired && ng > 0 &&
+                    store_stream_ensure(s, key) != 0) {
+                    free(key);
+                    goto malformed;
+                }
+                if (!expired && version >= 5) {
+                    int src = store_stream_set_counters(
+                        s, key, (unsigned long long)entries_added,
+                        mdms, mdseq);
+                    if (src != 0 && src != -3) {
+                        free(key);
+                        goto malformed;
+                    }
+                }
                 for (uint32_t gi = 0; gi < ng; gi++) {
                     char *gname = NULL, *lastid = NULL;
                     if (r_str(&r, &gname) < 0) { free(key); goto malformed; }
@@ -547,6 +614,18 @@ long long rdb_load(Store *s, const char *path) {
                         goto malformed;
                     }
                     free(lastid);
+                    /* Version 5 carries how many new entries the
+                       group has read, right after its cursor; an
+                       older snapshot's groups never read, as far as
+                       the snapshot knows, so they restore as -1. */
+                    int64_t eread = -1;
+                    if (version >= 5) {
+                        if (r_i64(&r, &eread) < 0 || eread < -1) {
+                            free(gname);
+                            free(key);
+                            goto malformed;
+                        }
+                    }
                     uint32_t nc;
                     if (r_u32(&r, &nc) < 0) {
                         free(gname);
@@ -597,6 +676,7 @@ long long rdb_load(Store *s, const char *path) {
                     }
                     if (!bad && !expired &&
                         store_xgroup_restore(s, key, gname, lms, lseq,
+                                             eread,
                                              cons, nc, pel, np) != 0)
                         bad = 1;
                     for (uint32_t ci = 0; ci < nc; ci++) free(cons[ci]);

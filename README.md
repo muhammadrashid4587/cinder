@@ -6,7 +6,7 @@ sets, hashes, sorted sets, HyperLogLog (`PFADD`/`PFCOUNT`/`PFMERGE`), geo
 (`GEOADD`/`GEODIST`/`GEOPOS`/`GEOHASH`/`GEOSEARCH`/`GEOSEARCHSTORE`/`GEORADIUS`/
 `GEORADIUSBYMEMBER`/`GEORADIUS_RO`/`GEORADIUSBYMEMBER_RO`) and streams
 (`XADD` / `XRANGE` / `XREVRANGE` / `XLEN` / `XREAD` / `XGROUP` /
-`XREADGROUP` / `XACK` / `XPENDING` / `XCLAIM`) with TTLs, approximate LRU eviction, and an append-only file for
+`XREADGROUP` / `XACK` / `XPENDING` / `XCLAIM` / `XINFO`) with TTLs, approximate LRU eviction, and an append-only file for
 durability, plus a small worker thread pool (`--threads`, default 1)
 that runs background saves (`BGSAVE`) off the event loop, and a dedicated
 flush thread that does the once-a-second AOF sync under `everysec`,
@@ -14,7 +14,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.76.0.
+Version 0.77.0.
 
 ## Why
 
@@ -137,7 +137,9 @@ OK
 | `XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME ms-unix-time] [RETRYCOUNT count] [FORCE] [JUSTID]` | Take over pending entries of a group for another consumer, usually because the consumer that held them died: an entry is claimed when it has been idle at least `min-idle-time` since its last delivery, or when `FORCE` is given (which also claims entries that are in the stream but not pending at all, creating a PEL entry for them). A claimed entry is moved to this consumer, its delivery time is set to now (or to `IDLE` ms ago, or to the absolute `TIME` given — `IDLE` and `TIME` cannot be combined) and its delivery count is bumped (or set by `RETRYCOUNT`); `JUSTID` answers only the IDs. A repeated ID in one call is claimed once. A real claim is AOF-logged and replicated like a write (an AOF replay re-claims, so delivery counts go up by one per replay). IDs that are not in the stream (trimmed, or never added), are not idle enough, or are not pending (without `FORCE`) are left out of the reply, where Redis answers nil for them. A missing key or group is a `NOGROUP` error |
 | `XACK key group id [id ...]` | Drop entries from a group's pending list, answering how many were dropped (`0` for an ID that was not pending). A missing key or group is a `NOGROUP` error. A real change, so it is AOF-logged and replicated when it drops anything |
 | `XPENDING key group [start end count [consumer]]` | Inspect a group's pending list: with no range, the summary — how many entries are pending, the lowest and highest pending IDs (`nil` when the list is empty), and a per-consumer count of pending entries; with `start end count` (and optionally one `consumer`), the pending entries in that ID range, each as `[id, consumer, idle-ms, deliveries]`, where `idle-ms` is the milliseconds since the entry was last delivered and `deliveries` is how many times it has been delivered. Bounds are `-` / `+` / `ms` / `ms-seq`, as in `XRANGE`, and `count` must be a positive integer. A missing key or group is a `NOGROUP` error. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
-| `XINFO CONSUMERS key group` | Inspect a group's consumers, one entry per consumer in the order the consumers first read (or were created), each as a flat `[name, pending, idle, inactive]` array — RESP2 has no map type, so maps come back as flat key/value arrays, as in real Redis. `pending` is how many of the group's pending entries the consumer holds, `idle` is the milliseconds since the consumer last attempted to interact (an `XREADGROUP` or `XCLAIM`, whether or not it got anything back), and `inactive` is the milliseconds since it last successfully read (an `XREADGROUP` that delivered entries); a consumer created by `XGROUP CREATECONSUMER` starts with both at its creation time. A missing key or group is a `NOGROUP` error. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica. Limitation: the `STREAM` and `GROUPS` subcommands are not implemented yet, and a consumer's idle/inactive times are not carried in RDB snapshots — a restored consumer reads as just seen, at load time |
+| `XINFO CONSUMERS key group` | Inspect a group's consumers, one entry per consumer in the order the consumers first read (or were created), each as a flat `[name, pending, idle, inactive]` array — RESP2 has no map type, so maps come back as flat key/value arrays, as in real Redis. `pending` is how many of the group's pending entries the consumer holds, `idle` is the milliseconds since the consumer last attempted to interact (an `XREADGROUP` or `XCLAIM`, whether or not it got anything back), and `inactive` is the milliseconds since it last successfully read (an `XREADGROUP` that delivered entries); a consumer created by `XGROUP CREATECONSUMER` starts with both at its creation time. A missing key or group is a `NOGROUP` error. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica. Limitation: a consumer's idle/inactive times are not carried in RDB snapshots — a restored consumer reads as just seen, at load time |
+| `XINFO STREAM key` | Inspect a stream: its `length`, `last-generated-id`, `max-deleted-entry-id` (the highest ID a `MAXLEN` trim took away, `0-0` when nothing was trimmed), `entries-added` (every entry ever added, including trimmed ones), `groups` (how many consumer groups it has), and its `first-entry` and `last-entry` (nil when it is empty), each as `[id, [field, value, ...]]`. A missing key is an error (`ERR no such key`), as in real Redis. A stream here is a flat array, not a radix tree, so there are no `radix-tree-keys`/`radix-tree-nodes` fields to report. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
+| `XINFO GROUPS key` | Inspect a stream's consumer groups, one entry per group in creation order, each as a flat `[name, consumers, pending, last-delivered-id, entries-read]` array. `entries-read` is how many new entries the group has read (a pending re-read does not count) and is nil for a group that has never read, as in Redis 7.0. A missing key answers an empty array, as in real Redis. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
 | `ZADD key [NX \| XX] [GT \| LT] [CH] [INCR] score member [score member ...]` | Add members with scores; returns number of newly added members (updating a member's score returns `0` for that member; re-adding a member with its current score changes nothing). `NX` only adds new members, `XX` only updates existing ones, `GT`/`LT` only update when the new score is greater/smaller than the current one (new members are still added), `CH` counts changed members instead of only new ones, `INCR` acts like `ZINCRBY` for a single member and returns the new score (nil when a condition blocks the update). `NX` conflicts with `XX`, `GT` and `LT`; `GT` conflicts with `LT`; `INCR` takes exactly one pair; an increment that yields NaN is an error |
 | `ZSCORE key member` | Member's score (`nil` when missing) |
 | `ZMSCORE key member [member ...]` | Scores of several members at once, in order (`nil` for a missing member, an array of `nil`s when the key is missing) |
@@ -222,10 +224,13 @@ src/
              entries) to `dump.rdb` in a compact
              binary format, atomically via `dump.rdb.tmp` + rename; the
              snapshot is loaded on startup before the AOF is replayed;
-             format version 4, which version 1, 2, and 3 snapshots
+             format version 5, which version 1, 2, 3, and 4 snapshots
              still load from (a version 1 snapshot's hash fields just
-             come back without a TTL, and a version 3 snapshot's
-             streams just come back without their groups);
+             come back without a TTL, a version 3 snapshot's
+             streams just come back without their groups, and a
+             version 4 snapshot's streams come back with
+             entries-added equal to the entries the snapshot carries
+             and their groups never having read);
              `rdb_serialize` renders the same bytes to memory so a
              worker thread can write them for `BGSAVE`
   threadpool.c FIFO job queue with N worker threads (`--threads`); jobs
@@ -1726,3 +1731,37 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       the per-group entries-read counter or the stream's
       entries-added and max-deleted-entry-id that they would
       report.
+- [x] `XINFO STREAM` and `XINFO GROUPS` for consumer groups
+      (0.77.0): `XINFO STREAM key` answers a flat
+      `[length, last-generated-id, max-deleted-entry-id,
+      entries-added, groups, first-entry, last-entry]` array, as
+      real Redis answers it over RESP2, and `XINFO GROUPS key`
+      answers one flat `[name, consumers, pending,
+      last-delivered-id, entries-read]` array per group, in
+      creation order. Every `XADD` now counts towards the
+      stream's entries-added (including entries a `MAXLEN` trim
+      takes away again, whose highest ID becomes the
+      max-deleted-entry-id), and every `XREADGROUP` with `>`
+      counts towards the group's entries-read (a pending re-read
+      does not); a group that never read reports entries-read as
+      nil, as in Redis 7.0. `STREAM` errors on a missing key, as
+      in real Redis; `GROUPS` answers an empty array for one. The
+      snapshot format is now version 5: a stream's record carries
+      its entries-added and max-deleted-entry-id, and each group
+      its entries-read, so all three survive a restart; version
+      1, 2, 3, and 4 snapshots still load (a version 4
+      snapshot's streams come back with entries-added equal to
+      the entries the snapshot carries and their groups never
+      having read). The loader also creates an empty stream
+      before restoring its groups, so a stream created empty by
+      `XGROUP CREATE MKSTREAM` now survives a snapshot — before,
+      the loader called the snapshot corrupt and dropped the
+      whole snapshot. `XINFO HELP` lists the four
+      subcommands. Both are read-only, so no AOF or replication
+      change was needed, and they are safe to run on a replica.
+      Limitation: a stream is a flat array, not a radix tree, so
+      `XINFO STREAM` has no `radix-tree-keys`/`radix-tree-nodes`
+      fields; a full sync rebuilds a replica's streams from
+      `XADD`s only, so its groups (and their entries-read) come
+      back only through the live command stream, not a fresh
+      full sync.

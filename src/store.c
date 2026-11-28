@@ -4325,11 +4325,20 @@ int store_xadd(Store *s, const char *key, const char *id,
     st->entries[st->len++] = en;
     st->last_ms = ms;
     st->last_seq = seq;
+    /* Every entry ever added counts, including ones a MAXLEN trim
+       below takes away again — that is what XINFO STREAM reports
+       as entries-added. */
+    st->entries_added++;
     /* MAXLEN trims from the front (the oldest entries go first). A
        trim that empties the stream deletes the key, as in Redis, so
        a snapshot or a full sync never has to carry an empty stream. */
     if (maxlen >= 0) {
         while ((long long)st->len > maxlen) {
+            /* The entries leave in ID order, so the last one
+               trimmed is the highest ID trimmed away — that is
+               what XINFO STREAM reports as max-deleted-entry-id. */
+            st->max_del_ms = st->entries[0].ms;
+            st->max_del_seq = st->entries[0].seq;
             stream_entry_free(&st->entries[0]);
             memmove(&st->entries[0], &st->entries[1],
                     (st->len - 1) * sizeof(*st->entries));
@@ -4756,6 +4765,9 @@ int store_xgroup_create(Store *s, const char *key, const char *group,
     if (!g->name) return -2;
     g->last_ms = ms;
     g->last_seq = seq;
+    /* -1: the group has never read, so XINFO GROUPS reports its
+       entries-read as nil until a `>` read delivers something. */
+    g->entries_read = -1;
     st->ngroups++;
     e->last_access = ++s->clock;
     entry_touch(s, e);
@@ -4870,6 +4882,7 @@ int store_xgroup_createconsumer(Store *s, const char *key,
 
 int store_xgroup_restore(Store *s, const char *key, const char *group,
                          uint64_t last_ms, uint64_t last_seq,
+                         long long entries_read,
                          char *const *consumers, size_t nconsumers,
                          const StreamPending *pel, size_t npel) {
     /* Create the group with its recorded cursor first; the checks
@@ -4883,6 +4896,10 @@ int store_xgroup_restore(Store *s, const char *key, const char *group,
     if (rc != 0) return rc;
     Entry *e = store_find(s, key, NULL);
     StreamGroup *g = stream_group_find(e->stream, group);
+    /* The recorded read count, or -1 for a group that never read
+       (a snapshot older than the counter keeps nil, as in Redis
+       for a group created before 7.0). */
+    g->entries_read = entries_read;
     for (size_t i = 0; i < nconsumers; i++)
         if (stream_group_add_consumer(g, consumers[i]) != 0) return -2;
     for (size_t i = 0; i < npel; i++) {
@@ -4953,7 +4970,10 @@ int store_xreadgroup(Store *s, const char *key, const char *group,
     }
     if (new_only) {
         /* Deliver: PEL entries for what is returned, the cursor
-           moved to the last ID delivered. */
+           moved to the last ID delivered. A `>` read is the only
+           thing that counts towards the group's entries-read: a
+           pending re-read below does not. The first delivery
+           moves the counter from -1 (never read) to the count. */
         for (size_t i = 0; i < arg.n; i++) {
             if (stream_pel_deliver(g, arg.entries[i].ms,
                                    arg.entries[i].seq, consumer) != 0) {
@@ -4963,6 +4983,8 @@ int store_xreadgroup(Store *s, const char *key, const char *group,
         }
         g->last_ms = arg.entries[arg.n - 1].ms;
         g->last_seq = arg.entries[arg.n - 1].seq;
+        if (g->entries_read < 0) g->entries_read = 0;
+        g->entries_read += (long long)arg.n;
         entry_touch(s, e);
     }
     if (stream_group_add_consumer(g, consumer) != 0) {
@@ -5310,6 +5332,143 @@ int store_xinfo_consumers(Store *s, const char *key, const char *group,
     }
     *infos_out = infos;
     *n_out = g->nconsumers;
+    return 0;
+}
+
+/* Copy one stream entry, field/value pairs included, into a
+   zeroed destination. Returns 0 on success, -1 = out of memory
+   (the destination is left zeroed). */
+static int stream_entry_dup(StreamEntry *dst, const StreamEntry *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->ms = src->ms;
+    dst->seq = src->seq;
+    dst->cap = src->nfields ? src->nfields : 1;
+    dst->fields = malloc(dst->cap * sizeof(char *));
+    dst->values = malloc(dst->cap * sizeof(char *));
+    if (!dst->fields || !dst->values) {
+        free(dst->fields);
+        free(dst->values);
+        memset(dst, 0, sizeof(*dst));
+        return -1;
+    }
+    for (size_t i = 0; i < src->nfields; i++) {
+        dst->fields[i] = strdup(src->fields[i]);
+        dst->values[i] = strdup(src->values[i]);
+        if (!dst->fields[i] || !dst->values[i]) {
+            for (size_t j = 0; j <= i; j++) {
+                free(dst->fields[j]);
+                free(dst->values[j]);
+            }
+            free(dst->fields);
+            free(dst->values);
+            memset(dst, 0, sizeof(*dst));
+            return -1;
+        }
+        dst->nfields++;
+    }
+    return 0;
+}
+
+int store_xinfo_stream(Store *s, const char *key, StreamInfo *info_out) {
+    memset(info_out, 0, sizeof(*info_out));
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    Stream *st = e->stream;
+    e->last_access = ++s->clock;
+    info_out->length = (long long)st->len;
+    info_out->last_ms = st->last_ms;
+    info_out->last_seq = st->last_seq;
+    info_out->max_del_ms = st->max_del_ms;
+    info_out->max_del_seq = st->max_del_seq;
+    info_out->entries_added = st->entries_added;
+    info_out->ngroups = (long long)st->ngroups;
+    if (st->len == 0) return 0;
+    if (stream_entry_dup(&info_out->first, &st->entries[0]) != 0)
+        return -2;
+    if (stream_entry_dup(&info_out->last,
+                         &st->entries[st->len - 1]) != 0) {
+        stream_entry_free(&info_out->first);
+        return -2;
+    }
+    return 0;
+}
+
+void stream_info_free(StreamInfo *info) {
+    if (!info) return;
+    stream_entry_free(&info->first);
+    stream_entry_free(&info->last);
+}
+
+int store_xinfo_groups(Store *s, const char *key,
+                       StreamGroupInfo **infos_out, size_t *n_out) {
+    *infos_out = NULL;
+    *n_out = 0;
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return 0; /* no such key: an empty array, as in Redis */
+    if (e->type != ENTRY_STREAM) return -1;
+    Stream *st = e->stream;
+    e->last_access = ++s->clock;
+    StreamGroupInfo *infos =
+        calloc(st->ngroups ? st->ngroups : 1, sizeof(*infos));
+    if (!infos) return -2;
+    for (size_t i = 0; i < st->ngroups; i++) {
+        StreamGroup *g = &st->groups[i];
+        infos[i].name = strdup(g->name);
+        if (!infos[i].name) {
+            stream_group_info_free(infos, i);
+            return -2;
+        }
+        infos[i].consumers = (long long)g->nconsumers;
+        infos[i].pending = (long long)g->npel;
+        infos[i].last_ms = g->last_ms;
+        infos[i].last_seq = g->last_seq;
+        infos[i].entries_read = g->entries_read;
+    }
+    *infos_out = infos;
+    *n_out = st->ngroups;
+    return 0;
+}
+
+void stream_group_info_free(StreamGroupInfo *infos, size_t n) {
+    if (!infos) return;
+    for (size_t i = 0; i < n; i++) free(infos[i].name);
+    free(infos);
+}
+
+int store_stream_ensure(Store *s, const char *key) {
+    Entry *e = store_find(s, key, NULL);
+    if (e) return e->type == ENTRY_STREAM ? 0 : -1;
+    if (s->count * LOAD_FACTOR_DEN > s->cap * LOAD_FACTOR_NUM)
+        store_resize(s);
+    e = calloc(1, sizeof(Entry));
+    if (!e) return -2;
+    e->key = strdup(key);
+    e->stream = stream_new();
+    if (!e->key || !e->stream) {
+        entry_free(e);
+        return -2;
+    }
+    e->type = ENTRY_STREAM;
+    e->expire_at = -1;
+    e->last_access = ++s->clock;
+    e->version = ++s->mod_seq;
+    size_t idx = hash_key(key) % s->cap;
+    e->next = s->buckets[idx];
+    s->buckets[idx] = e;
+    s->count++;
+    return 0;
+}
+
+int store_stream_set_counters(Store *s, const char *key,
+                              unsigned long long entries_added,
+                              uint64_t max_ms, uint64_t max_seq) {
+    Entry *e = store_find(s, key, NULL);
+    if (!e) return -3;
+    if (e->type != ENTRY_STREAM) return -1;
+    e->stream->entries_added = entries_added;
+    e->stream->max_del_ms = max_ms;
+    e->stream->max_del_seq = max_seq;
     return 0;
 }
 

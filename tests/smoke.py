@@ -1695,9 +1695,80 @@ def main():
         check("XINFO CONSUMERS wrong args",
               c.cmd("XINFO", "CONSUMERS", "xic"),
               ("error", "ERR wrong number of arguments for 'xinfo' command"))
-        check("XINFO STREAM not implemented",
-              c.cmd("XINFO", "STREAM", "xic"),
-              ("error", "ERR unknown subcommand 'STREAM'. Try XINFO HELP."))
+        # XINFO STREAM and XINFO GROUPS: the stream at a glance and
+        # one entry per group. entries-read counts only `>` reads
+        # (a pending re-read does not count) and is nil for a group
+        # that never read; entries-added counts every entry ever
+        # added, including ones a MAXLEN trim took away, and
+        # max-deleted-entry-id is the highest ID trimmed.
+        check("XINFO STREAM setup 1", c.cmd("XADD", "xis", "1000-1", "a", "1"), "1000-1")
+        check("XINFO STREAM setup 2", c.cmd("XADD", "xis", "1000-2", "a", "2"), "1000-2")
+        check("XINFO STREAM setup 3", c.cmd("XADD", "xis", "1000-3", "a", "3"), "1000-3")
+        check("XINFO STREAM group g1", c.cmd("XGROUP", "CREATE", "xis", "g1", "0"), "OK")
+        check("XINFO STREAM group g2", c.cmd("XGROUP", "CREATE", "xis", "g2", "0"), "OK")
+        check("XINFO STREAM read g1",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "COUNT", "2", "STREAMS", "xis", ">"),
+              [["xis", [["1000-1", ["a", "1"]], ["1000-2", ["a", "2"]]]]])
+        check("XINFO STREAM",
+              c.cmd("XINFO", "STREAM", "xis"),
+              ["length", 3, "last-generated-id", "1000-3",
+               "max-deleted-entry-id", "0-0", "entries-added", 3,
+               "groups", 2,
+               "first-entry", ["1000-1", ["a", "1"]],
+               "last-entry", ["1000-3", ["a", "3"]]])
+        check("XINFO GROUPS",
+              c.cmd("XINFO", "GROUPS", "xis"),
+              [["name", "g1", "consumers", 1, "pending", 2,
+                "last-delivered-id", "1000-2", "entries-read", 2],
+               ["name", "g2", "consumers", 0, "pending", 0,
+                "last-delivered-id", "0-0", "entries-read", None]])
+        # A pending re-read delivers the same entries again but
+        # does not count towards entries-read.
+        check("XINFO GROUPS pending re-read",
+              c.cmd("XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "xis", "0"),
+              [["xis", [["1000-1", ["a", "1"]], ["1000-2", ["a", "2"]]]]])
+        check("XINFO GROUPS entries-read unchanged",
+              c.cmd("XINFO", "GROUPS", "xis")[0][9], 2)
+        # A MAXLEN trim takes the oldest entries away: the length
+        # drops, entries-added stays, and the highest trimmed ID
+        # becomes the max-deleted-entry-id.
+        check("XINFO STREAM trim add", c.cmd("XADD", "xis", "MAXLEN", "2", "1000-4", "a", "4"), "1000-4")
+        check("XINFO STREAM after trim",
+              c.cmd("XINFO", "STREAM", "xis"),
+              ["length", 2, "last-generated-id", "1000-4",
+               "max-deleted-entry-id", "1000-2", "entries-added", 4,
+               "groups", 2,
+               "first-entry", ["1000-3", ["a", "3"]],
+               "last-entry", ["1000-4", ["a", "4"]]])
+        check("XINFO STREAM missing key",
+              c.cmd("XINFO", "STREAM", "nope"),
+              ("error", "ERR no such key 'nope'"))
+        check("XINFO STREAM wrongtype",
+              c.cmd("XINFO", "STREAM", "after"), wrongtype)
+        check("XINFO GROUPS missing key", c.cmd("XINFO", "GROUPS", "nope"), [])
+        check("XINFO GROUPS no groups setup", c.cmd("XADD", "xisng", "1000-1", "a", "1"), "1000-1")
+        check("XINFO GROUPS no groups", c.cmd("XINFO", "GROUPS", "xisng"), [])
+        check("XINFO GROUPS wrongtype",
+              c.cmd("XINFO", "GROUPS", "after"), wrongtype)
+        check("XINFO HELP",
+              c.cmd("XINFO", "HELP"),
+              ["XINFO <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+               "CONSUMERS <key> <group>", "GROUPS <key>", "STREAM <key>", "HELP"])
+        check("XINFO unknown subcommand",
+              c.cmd("XINFO", "BOGUS", "xis"),
+              ("error", "ERR unknown subcommand 'BOGUS'. Try XINFO HELP."))
+        check("XINFO STREAM wrong args",
+              c.cmd("XINFO", "STREAM"),
+              ("error", "ERR wrong number of arguments for 'xinfo' command"))
+        # An empty stream (created by MKSTREAM, nothing added yet)
+        # reports nil first and last entries and a 0-0 top ID.
+        check("XINFO STREAM empty group", c.cmd("XGROUP", "CREATE", "xisempty", "ge", "0", "MKSTREAM"), "OK")
+        check("XINFO STREAM empty",
+              c.cmd("XINFO", "STREAM", "xisempty"),
+              ["length", 0, "last-generated-id", "0-0",
+               "max-deleted-entry-id", "0-0", "entries-added", 0,
+               "groups", 1, "first-entry", None, "last-entry", None])
+        check("XINFO STREAM cleanup", c.cmd("DEL", "xis", "xisng", "xisempty"), 3)
         check("XINFO CONSUMERS cleanup", c.cmd("DEL", "xic"), 1)
         check("XGROUP bad mkstream", c.cmd("XGROUP", "CREATE", "xg", "g3", "0", "FOO"),
               ("error", "ERR syntax error"))
@@ -3741,6 +3812,10 @@ def main():
         check("rdb XPENDING pre-save", c.cmd("XPENDING", "snapstream", "g1"),
               [1, "1000-2", "1000-2", [["bob", 1]]])
         check("rdb XGROUP empty", c.cmd("XGROUP", "CREATE", "snapstream", "g2", "$"), "OK")
+        # An empty stream with a group: the snapshot carries no
+        # entries for it, so the loader must still bring the
+        # stream and its group back.
+        check("rdb XGROUP empty stream", c.cmd("XGROUP", "CREATE", "snapempty", "ge", "0", "MKSTREAM"), "OK")
         time.sleep(0.1)
         check("rdb SAVE", c.cmd("SAVE"), "OK")
         with open(os.path.join(rdb_dir, "dump.rdb"), "rb") as f:
@@ -3792,6 +3867,32 @@ def main():
               xinfo_norm(c.cmd("XINFO", "CONSUMERS", "snapstream", "g1")),
               [["name", "alice", "pending", 0, "idle", 0, "inactive", 0],
                ["name", "bob", "pending", 1, "idle", 0, "inactive", 0]])
+        # The snapshot carried the stream's counters and the
+        # groups' read counts: two entries were ever added, g1
+        # read both of them, g2 never read.
+        check("rdb reload XINFO STREAM",
+              c.cmd("XINFO", "STREAM", "snapstream"),
+              ["length", 2, "last-generated-id", "1000-2",
+               "max-deleted-entry-id", "0-0", "entries-added", 2,
+               "groups", 2,
+               "first-entry", ["1000-1", ["f1", "v1", "f2", "v2"]],
+               "last-entry", ["1000-2", ["f1", "v1"]]])
+        check("rdb reload XINFO GROUPS",
+              c.cmd("XINFO", "GROUPS", "snapstream"),
+              [["name", "g1", "consumers", 2, "pending", 1,
+                "last-delivered-id", "1000-2", "entries-read", 2],
+               ["name", "g2", "consumers", 0, "pending", 0,
+                "last-delivered-id", "1000-2", "entries-read", None]])
+        # The empty stream and its group came back too.
+        check("rdb reload empty stream group",
+              c.cmd("XINFO", "GROUPS", "snapempty"),
+              [["name", "ge", "consumers", 0, "pending", 0,
+                "last-delivered-id", "0-0", "entries-read", None]])
+        check("rdb reload empty stream",
+              c.cmd("XINFO", "STREAM", "snapempty"),
+              ["length", 0, "last-generated-id", "0-0",
+               "max-deleted-entry-id", "0-0", "entries-added", 0,
+               "groups", 1, "first-entry", None, "last-entry", None])
         check("rdb reload group exists",
               c.cmd("XGROUP", "CREATE", "snapstream", "g1", "0"),
               ("error", "ERR BUSYGROUP Consumer Group name already exists"))
@@ -3817,12 +3918,20 @@ def main():
               c.cmd("XREADGROUP", "GROUP", "g2", "alice", "STREAMS", "snapstream", ">"),
               [["snapstream", [["1000-3", ["f1", "v1"]]]]])
         check("rdb reload group ack new", c.cmd("XACK", "snapstream", "g1", "1000-3"), 1)
+        # Both groups' read counts kept counting after the reload:
+        # g1 read one more entry (3 total), g2 read its first (1).
+        check("rdb reload XINFO GROUPS after reads",
+              c.cmd("XINFO", "GROUPS", "snapstream"),
+              [["name", "g1", "consumers", 2, "pending", 1,
+                "last-delivered-id", "1000-3", "entries-read", 3],
+               ["name", "g2", "consumers", 1, "pending", 1,
+                "last-delivered-id", "1000-3", "entries-read", 1]])
         check("rdb reload stream wrongtype", c.cmd("HSET", "snapstream", "a", "1"), wrongtype)
         check("rdb reload TTL survives", 90000 <= c.cmd("PTTL", "snapttl") <= 100000, True)
         check("rdb reload expired gone", c.cmd("GET", "snapgone"), None)
         check("rdb reload padded GET", c.cmd("GET", "snappad"), "\x00" * 3 + "pad")
         check("rdb reload padded STRLEN", c.cmd("STRLEN", "snappad"), 6)
-        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 10)
+        check("rdb reload DBSIZE", c.cmd("DBSIZE"), 11)
         check("rdb reload SET still works", c.cmd("SET", "afterload", "1"), "OK")
         check("rdb SAVE again", c.cmd("SAVE"), "OK")
         c.cmd("SHUTDOWN")
@@ -3937,7 +4046,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.76.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.77.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
