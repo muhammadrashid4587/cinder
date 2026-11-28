@@ -1442,6 +1442,47 @@ def main():
         check("EXEC setid noop watch runs", c.cmd("EXEC"), ["OK"])
         check("xswatchkey after noop", c.cmd("GET", "xswatchkey"), "v1")
         cs.close()
+        # XGROUP SETID ENTRIESREAD: set the group's entries-read
+        # counter as well as (or instead of moving) its cursor.
+        # The counter shows up in XINFO GROUPS, and a SETID that
+        # changes only the counter is still a real write.
+        check("XGROUP SETID entriesread",
+              c.cmd("XGROUP", "SETID", "xgs", "gs", "1000-2", "ENTRIESREAD", "7"), "OK")
+        check("XGROUP SETID entriesread visible",
+              c.cmd("XINFO", "GROUPS", "xgs")[0][9], 7)
+        check("XGROUP SETID entriesread new cursor",
+              c.cmd("XGROUP", "SETID", "xgs", "gs", "1000-1", "ENTRIESREAD", "2"), "OK")
+        check("XGROUP SETID entriesread cursor+count",
+              c.cmd("XINFO", "GROUPS", "xgs"),
+              [["name", "gs", "consumers", 1, "pending", 3,
+                "last-delivered-id", "1000-1", "entries-read", 2]])
+        check("XGROUP SETID entriesread zero",
+              c.cmd("XGROUP", "SETID", "xgs", "gs", "1000-1", "ENTRIESREAD", "0"), "OK")
+        check("XGROUP SETID entriesread zero visible",
+              c.cmd("XINFO", "GROUPS", "xgs")[0][9], 0)
+        check("XGROUP SETID entriesread bad option",
+              c.cmd("XGROUP", "SETID", "xgs", "gs", "1000-1", "FOO", "2"),
+              ("error", "ERR syntax error"))
+        check("XGROUP SETID entriesread not int",
+              c.cmd("XGROUP", "SETID", "xgs", "gs", "1000-1", "ENTRIESREAD", "abc"),
+              ("error", "ERR value is not an integer or out of range"))
+        check("XGROUP SETID entriesread negative",
+              c.cmd("XGROUP", "SETID", "xgs", "gs", "1000-1", "ENTRIESREAD", "-1"),
+              ("error", "ERR entries-read must be >= 0"))
+        check("XGROUP SETID entriesread missing value",
+              c.cmd("XGROUP", "SETID", "xgs", "gs", "1000-1", "ENTRIESREAD"),
+              ("error", "ERR wrong number of arguments for 'xgroup' command"))
+        # A SETID that changes only the counter invalidates a
+        # WATCH on the key, like a cursor move does.
+        cs = Client(PORT)
+        check("WATCH xgs entriesread", c.cmd("WATCH", "xgs"), "OK")
+        check("other client SETID entriesread only",
+              cs.cmd("XGROUP", "SETID", "xgs", "gs", "1000-1", "ENTRIESREAD", "9"), "OK")
+        check("MULTI entriesread watch", c.cmd("MULTI"), "OK")
+        check("MULTI entriesread SET queued", c.cmd("SET", "xswatchkey", "v2"), "QUEUED")
+        check("EXEC entriesread watch aborts", c.cmd("EXEC"), None)
+        check("xswatchkey unchanged after abort", c.cmd("GET", "xswatchkey"), "v1")
+        cs.close()
         # XGROUP DESTROY: drop a whole consumer group — cursor,
         # consumers and pending list — and answer 1, or 0 when
         # there was no such group; the stream and its entries
@@ -3812,6 +3853,13 @@ def main():
         check("rdb XPENDING pre-save", c.cmd("XPENDING", "snapstream", "g1"),
               [1, "1000-2", "1000-2", [["bob", 1]]])
         check("rdb XGROUP empty", c.cmd("XGROUP", "CREATE", "snapstream", "g2", "$"), "OK")
+        # SETID ENTRIESREAD sets a counter the snapshot must
+        # carry: g1 read two entries, so give it 9; g2 never read,
+        # so its nil becomes 4.
+        check("rdb XGROUP SETID entriesread g1",
+              c.cmd("XGROUP", "SETID", "snapstream", "g1", "1000-2", "ENTRIESREAD", "9"), "OK")
+        check("rdb XGROUP SETID entriesread g2",
+              c.cmd("XGROUP", "SETID", "snapstream", "g2", "1000-2", "ENTRIESREAD", "4"), "OK")
         # An empty stream with a group: the snapshot carries no
         # entries for it, so the loader must still bring the
         # stream and its group back.
@@ -3868,8 +3916,9 @@ def main():
               [["name", "alice", "pending", 0, "idle", 0, "inactive", 0],
                ["name", "bob", "pending", 1, "idle", 0, "inactive", 0]])
         # The snapshot carried the stream's counters and the
-        # groups' read counts: two entries were ever added, g1
-        # read both of them, g2 never read.
+        # groups' read counts: two entries were ever added, and
+        # the SETID-set counts (9 for g1, 4 for g2) came back,
+        # not the counts the reads produced (2 and nil).
         check("rdb reload XINFO STREAM",
               c.cmd("XINFO", "STREAM", "snapstream"),
               ["length", 2, "last-generated-id", "1000-2",
@@ -3880,9 +3929,9 @@ def main():
         check("rdb reload XINFO GROUPS",
               c.cmd("XINFO", "GROUPS", "snapstream"),
               [["name", "g1", "consumers", 2, "pending", 1,
-                "last-delivered-id", "1000-2", "entries-read", 2],
+                "last-delivered-id", "1000-2", "entries-read", 9],
                ["name", "g2", "consumers", 0, "pending", 0,
-                "last-delivered-id", "1000-2", "entries-read", None]])
+                "last-delivered-id", "1000-2", "entries-read", 4]])
         # The empty stream and its group came back too.
         check("rdb reload empty stream group",
               c.cmd("XINFO", "GROUPS", "snapempty"),
@@ -3919,13 +3968,14 @@ def main():
               [["snapstream", [["1000-3", ["f1", "v1"]]]]])
         check("rdb reload group ack new", c.cmd("XACK", "snapstream", "g1", "1000-3"), 1)
         # Both groups' read counts kept counting after the reload:
-        # g1 read one more entry (3 total), g2 read its first (1).
+        # g1 read one more entry (10 total, from the SETID-set 9),
+        # g2 read its first (5 total, from the SETID-set 4).
         check("rdb reload XINFO GROUPS after reads",
               c.cmd("XINFO", "GROUPS", "snapstream"),
               [["name", "g1", "consumers", 2, "pending", 1,
-                "last-delivered-id", "1000-3", "entries-read", 3],
+                "last-delivered-id", "1000-3", "entries-read", 10],
                ["name", "g2", "consumers", 1, "pending", 1,
-                "last-delivered-id", "1000-3", "entries-read", 1]])
+                "last-delivered-id", "1000-3", "entries-read", 5]])
         check("rdb reload stream wrongtype", c.cmd("HSET", "snapstream", "a", "1"), wrongtype)
         check("rdb reload TTL survives", 90000 <= c.cmd("PTTL", "snapttl") <= 100000, True)
         check("rdb reload expired gone", c.cmd("GET", "snapgone"), None)
@@ -3934,6 +3984,40 @@ def main():
         check("rdb reload DBSIZE", c.cmd("DBSIZE"), 11)
         check("rdb reload SET still works", c.cmd("SET", "afterload", "1"), "OK")
         check("rdb SAVE again", c.cmd("SAVE"), "OK")
+        c.cmd("SHUTDOWN")
+        c.close()
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    # A SETID with ENTRIESREAD is logged with the full command, so
+    # an AOF replay restores the counter a group had — including a
+    # counter a group got without ever reading.
+    setid_dir = "/tmp/cinder-smoke-setid"
+    proc = start_server(data_dir=setid_dir)
+    try:
+        c = Client(PORT)
+        check("setid AOF XADD 1", c.cmd("XADD", "ss", "1000-1", "a", "1"), "1000-1")
+        check("setid AOF XADD 2", c.cmd("XADD", "ss", "1000-2", "a", "2"), "1000-2")
+        check("setid AOF XGROUP", c.cmd("XGROUP", "CREATE", "ss", "sg", "0"), "OK")
+        check("setid AOF SETID entriesread",
+              c.cmd("XGROUP", "SETID", "ss", "sg", "1000-1", "ENTRIESREAD", "6"), "OK")
+        c.cmd("SHUTDOWN")
+        c.close()
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+    proc = start_server(data_dir=setid_dir, fresh=False)
+    try:
+        c = Client(PORT)
+        check("setid AOF replay XINFO GROUPS",
+              c.cmd("XINFO", "GROUPS", "ss"),
+              [["name", "sg", "consumers", 0, "pending", 0,
+                "last-delivered-id", "1000-1", "entries-read", 6]])
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)
@@ -4046,7 +4130,7 @@ def main():
         check("bench reports GET", "| `GET` |" in bench.stdout, True)
         check("bench reports pipelined", "| `SET-pipelined` |" in bench.stdout, True)
         c = Client(PORT)
-        check("bench INFO version", "0.77.0" in c.cmd("INFO"), True)
+        check("bench INFO version", "0.78.0" in c.cmd("INFO"), True)
         c.cmd("SHUTDOWN")
         c.close()
         proc.wait(timeout=5)

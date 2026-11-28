@@ -898,14 +898,18 @@ int store_xgroup_create(Store *s, const char *key, const char *group,
    (ms, seq), so the next `>` read delivers what comes after it.
    The pending list is untouched: entries already delivered stay
    pending for their consumers, and entries after the new cursor
-   are delivered again on the next `>` read. A set to the ID the
-   group already holds changes nothing, so it bumps no version
-   (a WATCH on the key survives it) and the caller need not log
-   it; a real move bumps the version. Returns 1 when the cursor
-   moved, 0 when it was already that ID, -1 = the key holds a
-   non-stream value, -3 = no such key or consumer group. */
+   are delivered again on the next `>` read. `entries_read` sets
+   the group's entries-read counter (-1 leaves it unchanged, as
+   when the ENTRIESREAD option was not given); a group that never
+   read reports nil until it reads or a SETID sets it. A set that
+   changes neither the cursor nor the counter changes nothing, so
+   it bumps no version (a WATCH on the key survives it) and the
+   caller need not log it; a real change bumps the version.
+   Returns 1 when something changed, 0 when nothing did, -1 = the
+   key holds a non-stream value, -3 = no such key or consumer
+   group. */
 int store_xgroup_setid(Store *s, const char *key, const char *group,
-                       uint64_t ms, uint64_t seq);
+                       uint64_t ms, uint64_t seq, long long entries_read);
 /* XGROUP DESTROY: drop a whole consumer group — its cursor, its
    consumers and its pending list — from a stream. The stream and
    its entries survive. Returns 1 when a group was destroyed, 0

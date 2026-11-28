@@ -40,7 +40,7 @@
 #include "store.h"
 #include "threadpool.h"
 
-#define CINDER_VERSION "0.77.0"
+#define CINDER_VERSION "0.78.0"
 #define INBUF_CAP 65536
 
 static Store *g_store;
@@ -2596,10 +2596,16 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            so only entries added later are delivered), "0" (from
            the beginning) or an explicit ms-seq; MKSTREAM creates
            the stream empty when it is missing. XGROUP SETID key
-           group id moves an existing group's last-delivered ID
-           ("$" for the top ID, or an explicit ms-seq), so the
-           next ">" read delivers what comes after it; the pending
-           list is untouched. XGROUP DESTROY key group drops a
+           group id [ENTRIESREAD entries-read] moves an existing
+           group's last-delivered ID ("$" for the top ID, or an
+           explicit ms-seq), so the next ">" read delivers what
+           comes after it; the pending list is untouched. The
+           optional ENTRIESREAD sets the group's entries-read
+           counter (a non-negative integer) as well, so a group
+           rebuilt from a snapshot or a replica can be given the
+           count it had; without it the counter is unchanged, and
+           a group that never read still reports nil. XGROUP
+           DESTROY key group drops a
            whole group — cursor, consumers and pending list — and
            answers 1, or 0 when there was no such group; the
            stream and its entries survive. XGROUP DELCONSUMER key
@@ -2612,13 +2618,15 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
            it ever reads (a consumer otherwise comes into being
            only when it first reads) and answers 1, or 0 when the
            consumer already existed. Other subcommands are
-           an error, and SETID's ENTRIESREAD option is not
-           supported yet. A real write, so it is logged to the AOF
+           an error. A real write, so it is logged to the AOF
            and replicated, which is also how a group survives a
            restart (groups ride in RDB snapshots since 0.71.0, as
-           well as in the AOF). A SETID to the ID the group
-           already holds changes nothing, so it is not logged,
-           and neither is a DESTROY of a group that does not
+           well as in the AOF); the entries-read counter rides
+           along in version 5 snapshots, and a SETID that sets it
+           is logged with the full command, so a replay restores
+           it too. A SETID that changes neither the cursor nor
+           the counter changes nothing, so it is not logged, and
+           neither is a DESTROY of a group that does not
            exist. */
         if (argc < 2)
             return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
@@ -2651,8 +2659,17 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             return 1;
         }
         if (strcasecmp(argv[1], "SETID") == 0) {
-            if (argc != 5)
+            if (argc != 5 && argc != 7)
                 return dbuf_error(reply, "wrong number of arguments for 'xgroup' command"), 0;
+            long long entries_read = -1;
+            if (argc == 7) {
+                if (strcasecmp(argv[5], "ENTRIESREAD") != 0)
+                    return dbuf_error(reply, "syntax error"), 0;
+                if (!parse_ll(argv[6], &entries_read))
+                    return dbuf_error(reply, "value is not an integer or out of range"), 0;
+                if (entries_read < 0)
+                    return dbuf_error(reply, "entries-read must be >= 0"), 0;
+            }
             uint64_t ms, seq;
             if (strcmp(argv[4], "$") == 0) {
                 if (store_stream_top(g_store, argv[2], &ms, &seq) != 0)
@@ -2660,7 +2677,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
             } else if (stream_parse_bound(argv[4], 0, &ms, &seq) != 0) {
                 return dbuf_error(reply, "Invalid stream ID specified as stream command argument"), 0;
             }
-            int rc = store_xgroup_setid(g_store, argv[2], argv[3], ms, seq);
+            int rc = store_xgroup_setid(g_store, argv[2], argv[3], ms, seq, entries_read);
             if (rc == -1)
                 return dbuf_error(reply, "WRONGTYPE Operation against a key holding the wrong kind of value"), 0;
             if (rc == -3) {
@@ -2668,7 +2685,7 @@ static int dispatch(char **argv, int argc, Dbuf *reply) {
                 return 0;
             }
             dbuf_simple(reply, "OK");
-            return rc; /* 1 when the cursor moved, 0 when it was already there */
+            return rc; /* 1 when the cursor or the counter changed, 0 when neither did */
         }
         if (strcasecmp(argv[1], "DESTROY") == 0) {
             if (argc != 4)

@@ -14,7 +14,7 @@ so a slow disk never stalls the loop. No dependencies
 beyond libc. Real `redis-cli` and any RESP
 client library can talk to it.
 
-Version 0.77.0.
+Version 0.78.0.
 
 ## Why
 
@@ -129,7 +129,7 @@ OK
 | `XLEN key` | Number of entries in a stream (`0` when missing); read-only |
 | `XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]` | The entries after each ID, one `[key, [[id, [field, value, ...]], ...]]` element per stream that has any (streams with nothing new are left out); IDs are `ms-seq`, a bare `ms` (the whole millisecond: entries after `ms-0`), or `$` (the stream's top ID at read time, resolved once, so only entries added after the read qualify); `>` is an error (it needs `XREADGROUP`, below). `COUNT` limits the entries per stream; `BLOCK` waits for new entries instead of answering at once — an empty array when there is nothing and no `BLOCK`, a nil array when a `BLOCK` times out, `BLOCK 0` waits forever. A blocked client parks with no lock held (the loop re-checks it every iteration, so it wakes within one iteration of the `XADD` that releases it, and a disconnect while parked drops the request) and sends nothing more until its read is answered, so its `EPOLLIN` interest is dropped while it waits. `BLOCK` is refused inside `MULTI`/`EXEC`; a plain `XREAD` queues and runs at `EXEC`. Read-only, so no AOF, RDB, or replication change was needed, and it is safe to run on a replica |
 | `XGROUP CREATE key group id [MKSTREAM]` | Create a consumer group on a stream, starting at `id`: `$` (the top ID at creation, so only entries added later are delivered), `0` (from the beginning) or an explicit `ms-seq`; `MKSTREAM` creates the stream empty when it is missing. An existing group name is a `BUSYGROUP` error, a missing stream without `MKSTREAM` is an error. A real write, so it is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and, since 0.71.0, through RDB snapshots too |
-| `XGROUP SETID key group id` | Move an existing consumer group's last-delivered ID to `id`: `$` (the stream's top ID) or an explicit `ms-seq`, so the next `>` read delivers the entries after it — entries already delivered are delivered again. The group's pending list is untouched, so entries already delivered stay pending for their consumers. A missing key or group is a `NOGROUP` error. A real write, so it is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and RDB snapshots; setting the ID the group already holds changes nothing, so it is not logged and does not invalidate a `WATCH`. Limitation: the `ENTRIESREAD` option is not supported yet (cinder does not track a per-group entries-read counter) |
+| `XGROUP SETID key group id [ENTRIESREAD entries-read]` | Move an existing consumer group's last-delivered ID to `id`: `$` (the stream's top ID) or an explicit `ms-seq`, so the next `>` read delivers the entries after it — entries already delivered are delivered again. The group's pending list is untouched, so entries already delivered stay pending for their consumers. The optional `ENTRIESREAD` sets the group's entries-read counter (a non-negative integer) as well; without it the counter is unchanged, and a group that never read still reports nil. A missing key or group is a `NOGROUP` error. A real write, so it is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and RDB snapshots; a set that changes neither the ID nor the counter changes nothing, so it is not logged and does not invalidate a `WATCH`. |
 | `XGROUP DESTROY key group` | Drop a whole consumer group — its cursor, its consumers, and its pending list — and answer `1`, or `0` when there was no such group. The stream and its entries survive, and the group name can be created again. A missing key is a `NOGROUP` error. A real destroy is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and RDB snapshots (the snapshot simply carries no group); destroying a group that does not exist changes nothing, so it is not logged and does not invalidate a `WATCH` |
 | `XGROUP DELCONSUMER key group consumer` | Drop one consumer from a group and, with it, the pending entries it held — as in real Redis those entries become unclaimable, so claim or acknowledge them first — and answer how many pending entries the consumer had (`0` when it had none, or when there was no such consumer). The group, its cursor, the other consumers and their pending entries survive, and the stream is untouched. A missing key or group is a `NOGROUP` error. A real delete is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and RDB snapshots (the snapshot carries the group's consumer list and pending list); deleting a consumer that does not exist changes nothing, so it is not logged and does not invalidate a `WATCH` |
 | `XGROUP CREATECONSUMER key group consumer` | Create a consumer on a group before it ever reads — as in real Redis a consumer otherwise comes into being only when it first reads — and answer `1`, or `0` when the consumer already existed. The consumer holds no pending entries until a `>` read delivers some to it. A missing key or group is a `NOGROUP` error. A real create is AOF-logged and replicated, invalidates a `WATCH`, and survives a restart through the AOF and RDB snapshots (the snapshot carries the group's consumer list); creating a consumer that already exists changes nothing, so it is not logged and does not invalidate a `WATCH` |
@@ -1656,13 +1656,10 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       survives a restart through the AOF and through RDB snapshots
       (the cursor is part of the group the snapshot carries); a set
       to the ID the group already holds changes nothing, so it is
-      not logged and does not invalidate a `WATCH`. One honest
-      limit: the `ENTRIESREAD` option is not supported yet —
-      cinder does not track a per-group entries-read counter, so
-      `XGROUP SETID` with extra arguments is a wrong-number-of-
-      arguments error. The remaining `XGROUP` subcommands
-      (`DELCONSUMER`, `CREATECONSUMER`) arrived in 0.74.0 and
-      0.75.0.
+      not logged and does not invalidate a `WATCH`. The
+      `ENTRIESREAD` option arrived in 0.78.0. The remaining
+      `XGROUP` subcommands (`DELCONSUMER`, `CREATECONSUMER`)
+      arrived in 0.74.0 and 0.75.0.
 - [x] `XGROUP DESTROY` for consumer groups (0.73.0): `XGROUP
       DESTROY key group` drops a whole consumer group — its
       cursor, its consumers, and its pending list — and answers
@@ -1765,3 +1762,19 @@ make test   # builds, then runs tests/smoke.py: 30+ RESP checks, including
       `XADD`s only, so its groups (and their entries-read) come
       back only through the live command stream, not a fresh
       full sync.
+- [x] `XGROUP SETID ENTRIESREAD` for consumer groups (0.78.0):
+      `XGROUP SETID key group id [ENTRIESREAD entries-read]` sets
+      a group's entries-read counter as well as its last-delivered
+      ID, so a group rebuilt from a snapshot or a replica can be
+      given the count it had; without the option the counter is
+      unchanged, and a group that never read still reports nil in
+      `XINFO GROUPS`. A non-negative integer is required (a
+      negative or non-integer value is an error, as is any other
+      option name). A set that changes only the counter is still
+      a real write: it is AOF-logged with the full command and
+      replicated, invalidates a `WATCH`, and survives a restart
+      through the AOF and through version 5 RDB snapshots, which
+      already carried each group's entries-read since 0.77.0; a
+      set that changes neither the ID nor the counter changes
+      nothing, so it is not logged and does not invalidate a
+      `WATCH`. No snapshot format change was needed.

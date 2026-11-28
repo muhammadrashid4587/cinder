@@ -4775,15 +4775,17 @@ int store_xgroup_create(Store *s, const char *key, const char *group,
 }
 
 int store_xgroup_setid(Store *s, const char *key, const char *group,
-                       uint64_t ms, uint64_t seq) {
+                       uint64_t ms, uint64_t seq, long long entries_read) {
     Entry *e = store_find(s, key, NULL);
     if (!e) return -3;
     if (e->type != ENTRY_STREAM) return -1;
     StreamGroup *g = stream_group_find(e->stream, group);
     if (!g) return -3;
-    if (g->last_ms == ms && g->last_seq == seq) return 0;
+    if (g->last_ms == ms && g->last_seq == seq &&
+        (entries_read < 0 || entries_read == g->entries_read)) return 0;
     g->last_ms = ms;
     g->last_seq = seq;
+    if (entries_read >= 0) g->entries_read = entries_read;
     e->last_access = ++s->clock;
     entry_touch(s, e);
     return 1;
